@@ -518,6 +518,20 @@ final class SoftwarePlaybackHost {
         }
     }
 
+    func playCoordinated(rate newRate: Float, itemTime: CMTime, hostTime: CMTime) {
+        lastRate = newRate
+        pausedByHost = false
+        if !demuxLoopStarted, let output = audioOutput {
+            output.attachVideoLayer(renderer.displayLayer)
+            demuxLoopStarted = true
+            startDemuxLoop()
+        }
+        isPlaying = true
+        clockArmed = true
+        audioOutput?.setRate(newRate, time: itemTime, atHostTime: hostTime)
+        rate = newRate
+    }
+
     func seek(to seconds: Double) async {
         guard let dem = demuxer else { return }
         // Stop loop + bump generation to invalidate in-flight packets.

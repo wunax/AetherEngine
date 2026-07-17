@@ -62,7 +62,10 @@ public final class AetherEngine: ObservableObject {
     /// gate on this when you need to distinguish a stall from real playback (AetherEngine#35).
     /// Always false during initial load spin-up (`state == .loading`).
     @Published public internal(set) var isBuffering: Bool = false {
-        didSet { recomputePlaybackPhase() }
+        didSet {
+            recomputePlaybackPhase()
+            updateCoordinatedPlaybackStall(isBuffering)
+        }
     }
 
     /// True from seek entry until physical landing, covering both programmatic and native AVKit scrubs.
@@ -205,6 +208,22 @@ public final class AetherEngine: ObservableObject {
     /// Active playback backend: `.native` (AVPlayer) or `.software` (SoftwarePlaybackHost/dav1d/libavcodec).
     /// Exposed for diagnostic overlays; hosts should not branch on it.
     @Published public internal(set) var playbackBackend: PlaybackBackend = .none
+
+    /// Stable coordinator for the AetherEngine playback object. It deliberately sits above the active
+    /// backend so a native AVPlayerLayer/software AVSampleBufferDisplayLayer route change does not
+    /// register a second participant or drop the existing coordinated item.
+    public private(set) lazy var playbackCoordinator = AVDelegatingPlaybackCoordinator(
+        playbackControlDelegate: playbackCoordinationDelegate
+    )
+
+    @Published public internal(set) var isWaitingForCoordinatedPlayback = false
+    @Published public internal(set) var coordinatedPlaybackIntendedRate: Float = 0
+
+    lazy var playbackCoordinationDelegate = AetherEnginePlaybackCoordinationDelegate(engine: self)
+    var coordinatedPlaybackItemIdentifier: String?
+    var coordinatedPlaybackActive = false
+    var coordinatedPlaybackStallSuspension: AVCoordinatedPlaybackSuspension?
+    var coordinatedPlaybackInterruptionSuspension: AVCoordinatedPlaybackSuspension?
 
     /// iOS: master enable for background playback (PiP + background audio). Default on; no user setting yet.
     public var backgroundPlaybackEnabled = true
@@ -2966,6 +2985,7 @@ public final class AetherEngine: ObservableObject {
                 guard let self else { return }
                 let session = AVAudioSession.sharedInstance()
                 if began {
+                    self.beginCoordinatedPlaybackInterruption()
                     let intent = self.nativeHost?.transportIntentIsPlaying ?? (self.state == .playing)
                     let stateEligible: Bool
                     switch self.state {
@@ -2975,6 +2995,7 @@ public final class AetherEngine: ObservableObject {
                     self.resumeAfterInterruption = intent && stateEligible
                     EngineLog.emit("[AetherEngine] AVAudioSession interruption BEGAN reason=\(reason) resumeArmed=\(self.resumeAfterInterruption) otherAudio=\(session.isOtherAudioPlaying) silenceHint=\(session.secondaryAudioShouldBeSilencedHint)", category: .engine)
                 } else {
+                    self.endCoordinatedPlaybackInterruption()
                     let shouldResume = AVAudioSession.InterruptionOptions(rawValue: optionsRaw).contains(.shouldResume)
                     // Background: only audio backends may resume (video is torn down / must not restart unseen).
                     #if os(iOS)

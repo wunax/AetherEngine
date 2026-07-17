@@ -68,6 +68,17 @@ final class AudioOutput: @unchecked Sendable {
         synchronizer.setRate(rate, time: at)
     }
 
+    /// Establish a media-time/host-time relationship supplied by an
+    /// `AVDelegatingPlaybackCoordinator` command.
+    func setRate(_ rate: Float, time: CMTime, atHostTime hostTime: CMTime) {
+        EngineLog.emit(
+            "[AudioOutput] coordinated setRate \(rate) media=\(String(format: "%.3f", time.seconds)) "
+                + "host=\(String(format: "%.3f", hostTime.seconds))",
+            category: .swPlayback
+        )
+        synchronizer.setRate(rate, time: time, atHostTime: hostTime)
+    }
+
     /// Pause audio (and the master clock). Hosts resume via setRate (pausedByHost pattern); deliberately no resume() here.
     func pause() {
         let at = synchronizer.currentTime()
