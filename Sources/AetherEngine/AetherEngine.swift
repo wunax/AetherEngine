@@ -224,6 +224,9 @@ public final class AetherEngine: ObservableObject {
     var coordinatedPlaybackActive = false
     var coordinatedPlaybackStallSuspension: AVCoordinatedPlaybackSuspension?
     var coordinatedPlaybackInterruptionSuspension: AVCoordinatedPlaybackSuspension?
+    var coordinatedPlaybackStallGate = CoordinatedPlaybackStallGate()
+    var coordinatedPlaybackStallDebounceTask: Task<Void, Never>?
+    var coordinatedPlaybackSuppressionTimeoutTask: Task<Void, Never>?
 
     /// iOS: master enable for background playback (PiP + background audio). Default on; no user setting yet.
     public var backgroundPlaybackEnabled = true

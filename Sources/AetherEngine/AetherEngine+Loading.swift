@@ -197,6 +197,7 @@ extension AetherEngine {
                 self.isBuffering = self.state == .playing && status == .waitingToPlayAtSpecifiedRate
                 switch status {
                 case .playing:
+                    self.coordinatedTransportDidSettle()
                     if self.state != .playing { self.state = .playing }
                 case .waitingToPlayAtSpecifiedRate:
                     // Hold .loading through startup (hasStartedPlaying gate on the host side).
@@ -711,7 +712,10 @@ extension AetherEngine {
                 switch status {
                 case .paused:
                     if self.state != .paused { self.state = .paused }
-                case .playing, .waitingToPlayAtSpecifiedRate:
+                case .playing:
+                    self.coordinatedTransportDidSettle()
+                    if self.state != .playing { self.state = .playing }
+                case .waitingToPlayAtSpecifiedRate:
                     if self.state != .playing { self.state = .playing }
                 @unknown default:
                     break
@@ -1035,6 +1039,12 @@ extension AetherEngine {
             didReachEnd: host.$didReachEnd,
             storeIn: &audioNativeCancellables
         )
+        host.$timeControlStatus
+            .filter { $0 == .playing }
+            .sink { [weak self] _ in
+                self?.coordinatedTransportDidSettle()
+            }
+            .store(in: &audioNativeCancellables)
         // No timeControlStatus reconciliation on the audio path: all transport flows through engine play()/pause(). Feeding it back mis-latched a TRANSIENT .paused AVFoundation emits on background transition as a real pause, zeroing MPNowPlayingInfoPropertyPlaybackRate and breaking Now-Playing badge + Siri Remote routing.
 
         // No detached hop: AudioAVPlayerHost.load is MainActor + replaceCurrentItem-based (no blocking I/O), and the host is SHARED. Detaching opened a reorder window where a superseded load A's body ran after successor B, putting A's item back on the shared AVPlayer.

@@ -2,6 +2,108 @@ import AVFoundation
 import CoreMedia
 import Foundation
 
+struct CoordinatedPlaybackStallGate {
+    enum Action: Equatable {
+        case cancelDebounce
+        case cancelSuppressionTimeout
+        case scheduleDebounce(Int)
+        case scheduleSuppressionTimeout(Int)
+        case beginSuspension
+        case endSuspension(reapply: Bool)
+    }
+
+    private(set) var isSuppressingStalls = false
+    private(set) var hasActiveSuspension = false
+    private(set) var pendingDebounceGeneration: Int?
+    private(set) var suppressionGeneration: Int?
+    private var isBuffering = false
+    private var nextGeneration = 0
+
+    mutating func beginTransportCommand() -> [Action] {
+        var actions = cancelPendingActions()
+        nextGeneration += 1
+        isSuppressingStalls = true
+        suppressionGeneration = nextGeneration
+        actions.append(.scheduleSuppressionTimeout(nextGeneration))
+        return actions
+    }
+
+    mutating func transportDidSettle() -> [Action] {
+        guard isSuppressingStalls else { return [] }
+        isSuppressingStalls = false
+        suppressionGeneration = nil
+        var actions: [Action] = [.cancelSuppressionTimeout]
+        actions.append(contentsOf: scheduleDebounceIfNeeded())
+        return actions
+    }
+
+    mutating func updateBuffering(_ buffering: Bool) -> [Action] {
+        isBuffering = buffering
+        if !buffering {
+            var actions = cancelDebounce()
+            if hasActiveSuspension {
+                hasActiveSuspension = false
+                actions.append(.endSuspension(reapply: true))
+            }
+            return actions
+        }
+        return scheduleDebounceIfNeeded()
+    }
+
+    mutating func debounceDidFire(generation: Int) -> [Action] {
+        guard pendingDebounceGeneration == generation else { return [] }
+        pendingDebounceGeneration = nil
+        guard isBuffering, !isSuppressingStalls, !hasActiveSuspension else { return [] }
+        hasActiveSuspension = true
+        return [.beginSuspension]
+    }
+
+    mutating func suppressionTimeoutDidFire(generation: Int) -> [Action] {
+        guard suppressionGeneration == generation else { return [] }
+        suppressionGeneration = nil
+        isSuppressingStalls = false
+        return scheduleDebounceIfNeeded()
+    }
+
+    mutating func reset() -> [Action] {
+        var actions = cancelPendingActions()
+        if hasActiveSuspension {
+            hasActiveSuspension = false
+            actions.append(.endSuspension(reapply: false))
+        }
+        isBuffering = false
+        isSuppressingStalls = false
+        return actions
+    }
+
+    private mutating func scheduleDebounceIfNeeded() -> [Action] {
+        guard isBuffering,
+              !isSuppressingStalls,
+              !hasActiveSuspension,
+              pendingDebounceGeneration == nil
+        else { return [] }
+        nextGeneration += 1
+        pendingDebounceGeneration = nextGeneration
+        return [.scheduleDebounce(nextGeneration)]
+    }
+
+    private mutating func cancelPendingActions() -> [Action] {
+        cancelDebounce() + cancelSuppressionTimeout()
+    }
+
+    private mutating func cancelDebounce() -> [Action] {
+        guard pendingDebounceGeneration != nil else { return [] }
+        pendingDebounceGeneration = nil
+        return [.cancelDebounce]
+    }
+
+    private mutating func cancelSuppressionTimeout() -> [Action] {
+        guard suppressionGeneration != nil else { return [] }
+        suppressionGeneration = nil
+        return [.cancelSuppressionTimeout]
+    }
+}
+
 extension AetherEngine {
     /// Identifies the currently loaded item to AVFoundation and supplies a snapshot of its
     /// display-axis timing. Calling this with a new identifier keeps the same coordinator alive
@@ -11,6 +113,7 @@ extension AetherEngine {
         initialTime: Double = 0,
         initialRate: Float = 0
     ) {
+        resetCoordinatedPlaybackStallTracking()
         coordinatedPlaybackActive = identifier != nil
         coordinatedPlaybackItemIdentifier = identifier
         coordinatedPlaybackIntendedRate = initialRate
@@ -38,8 +141,7 @@ extension AetherEngine {
     }
 
     public func endCoordinatedPlayback() {
-        coordinatedPlaybackStallSuspension?.end()
-        coordinatedPlaybackStallSuspension = nil
+        resetCoordinatedPlaybackStallTracking()
         coordinatedPlaybackInterruptionSuspension?.end()
         coordinatedPlaybackInterruptionSuspension = nil
         coordinatedPlaybackActive = false
@@ -58,6 +160,11 @@ extension AetherEngine {
 
     func applyCoordinatedPause(expectedIdentifier: String, waiting: Bool) {
         guard coordinatedPlaybackCommandApplies(to: expectedIdentifier) else { return }
+        EngineLog.emit(
+            "[CoordinatedPlayback] pause command waiting=\(waiting)",
+            category: .engine
+        )
+        resetCoordinatedPlaybackStallTracking()
         coordinatedPlaybackIntendedRate = 0
         isWaitingForCoordinatedPlayback = waiting
         pause()
@@ -67,11 +174,19 @@ extension AetherEngine {
         guard coordinatedPlaybackCommandApplies(to: expectedIdentifier) else { return }
         let seconds = itemTime.seconds
         guard seconds.isFinite else { return }
+        EngineLog.emit(
+            "[CoordinatedPlayback] seek command itemTime=\(String(format: "%.3f", seconds))",
+            category: .engine
+        )
+        beginCoordinatedTransportCommand()
         pause()
         await seek(to: seconds)
         // Non-native hosts historically finalize a seek as playing. A coordinator seek must
         // remain paused until its subsequent play command arrives.
         pause()
+        if softwareHost != nil || audioHost != nil || (nativeHost == nil && !audioAVPlayerActive) {
+            coordinatedTransportDidSettle()
+        }
     }
 
     func applyCoordinatedPlay(
@@ -84,6 +199,11 @@ extension AetherEngine {
         let displaySeconds = itemTime.seconds
         guard displaySeconds.isFinite else { return }
 
+        EngineLog.emit(
+            "[CoordinatedPlayback] play command rate=\(rate) itemTime=\(String(format: "%.3f", displaySeconds))",
+            category: .engine
+        )
+        beginCoordinatedTransportCommand()
         pause()
         await seek(to: displaySeconds)
         pause()
@@ -99,10 +219,14 @@ extension AetherEngine {
             await host.playCoordinated(rate: rate, atHostTime: hostTime)
         } else if let host = audioHost {
             host.playCoordinated(rate: rate, itemTime: backendTime, hostTime: hostTime)
+            coordinatedTransportDidSettle()
         } else if let host = softwareHost {
             host.playCoordinated(rate: rate, itemTime: backendTime, hostTime: hostTime)
+            coordinatedTransportDidSettle()
         } else if let host = nativeHost {
             await host.playCoordinated(rate: rate, atHostTime: hostTime)
+        } else {
+            coordinatedTransportDidSettle()
         }
 
         coordinatedPlaybackIntendedRate = rate
@@ -121,13 +245,91 @@ extension AetherEngine {
 
     func updateCoordinatedPlaybackStall(_ buffering: Bool) {
         guard coordinatedPlaybackActive else { return }
-        if buffering {
-            guard coordinatedPlaybackStallSuspension == nil else { return }
-            coordinatedPlaybackStallSuspension = playbackCoordinator.beginSuspension(for: .stallRecovery)
-        } else if let suspension = coordinatedPlaybackStallSuspension {
-            coordinatedPlaybackStallSuspension = nil
-            suspension.end()
-            playbackCoordinator.reapplyCurrentItemStateToPlaybackControlDelegate()
+        EngineLog.emit(
+            "[CoordinatedPlayback] buffering changed buffering=\(buffering) "
+                + "suppressed=\(coordinatedPlaybackStallGate.isSuppressingStalls)",
+            category: .engine,
+            level: .verbose
+        )
+        performCoordinatedPlaybackStallActions(
+            coordinatedPlaybackStallGate.updateBuffering(buffering)
+        )
+    }
+
+    func coordinatedTransportDidSettle() {
+        performCoordinatedPlaybackStallActions(
+            coordinatedPlaybackStallGate.transportDidSettle()
+        )
+    }
+
+    private func beginCoordinatedTransportCommand() {
+        EngineLog.emit("[CoordinatedPlayback] suppressing command-induced stalls", category: .engine)
+        performCoordinatedPlaybackStallActions(
+            coordinatedPlaybackStallGate.beginTransportCommand()
+        )
+    }
+
+    private func resetCoordinatedPlaybackStallTracking() {
+        performCoordinatedPlaybackStallActions(coordinatedPlaybackStallGate.reset())
+    }
+
+    private func performCoordinatedPlaybackStallActions(
+        _ actions: [CoordinatedPlaybackStallGate.Action]
+    ) {
+        for action in actions {
+            switch action {
+            case .cancelDebounce:
+                coordinatedPlaybackStallDebounceTask?.cancel()
+                coordinatedPlaybackStallDebounceTask = nil
+                EngineLog.emit("[CoordinatedPlayback] stall debounce cancelled", category: .engine)
+            case .cancelSuppressionTimeout:
+                coordinatedPlaybackSuppressionTimeoutTask?.cancel()
+                coordinatedPlaybackSuppressionTimeoutTask = nil
+                EngineLog.emit("[CoordinatedPlayback] command stall suppression cleared", category: .engine)
+            case let .scheduleDebounce(generation):
+                EngineLog.emit("[CoordinatedPlayback] stall debounce started (500ms)", category: .engine)
+                coordinatedPlaybackStallDebounceTask?.cancel()
+                coordinatedPlaybackStallDebounceTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    guard !Task.isCancelled, let self else { return }
+                    self.performCoordinatedPlaybackStallActions(
+                        self.coordinatedPlaybackStallGate.debounceDidFire(generation: generation)
+                    )
+                }
+            case let .scheduleSuppressionTimeout(generation):
+                coordinatedPlaybackSuppressionTimeoutTask?.cancel()
+                coordinatedPlaybackSuppressionTimeoutTask = Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    guard !Task.isCancelled, let self else { return }
+                    EngineLog.emit(
+                        "[CoordinatedPlayback] command stall suppression timed out",
+                        category: .engine
+                    )
+                    self.performCoordinatedPlaybackStallActions(
+                        self.coordinatedPlaybackStallGate.suppressionTimeoutDidFire(
+                            generation: generation
+                        )
+                    )
+                }
+            case .beginSuspension:
+                guard coordinatedPlaybackStallSuspension == nil else { continue }
+                EngineLog.emit("[CoordinatedPlayback] beginning real stall suspension", category: .engine)
+                coordinatedPlaybackStallSuspension = playbackCoordinator.beginSuspension(
+                    for: .stallRecovery
+                )
+            case let .endSuspension(reapply):
+                guard let suspension = coordinatedPlaybackStallSuspension else { continue }
+                coordinatedPlaybackStallSuspension = nil
+                suspension.end()
+                EngineLog.emit(
+                    "[CoordinatedPlayback] stall suspension ended reapply=\(reapply)",
+                    category: .engine
+                )
+                if reapply {
+                    EngineLog.emit("[CoordinatedPlayback] reapplying coordinator state", category: .engine)
+                    playbackCoordinator.reapplyCurrentItemStateToPlaybackControlDelegate()
+                }
+            }
         }
     }
 

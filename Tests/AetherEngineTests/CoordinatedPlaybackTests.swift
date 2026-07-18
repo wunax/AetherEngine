@@ -61,4 +61,105 @@ final class CoordinatedPlaybackTests: XCTestCase {
             accuracy: 0.000_001,
         )
     }
+
+    func testCommandInducedBufferingDoesNotStartAStall() {
+        var gate = CoordinatedPlaybackStallGate()
+
+        let commandActions = gate.beginTransportCommand()
+        XCTAssertTrue(commandActions.contains { action in
+            if case .scheduleSuppressionTimeout = action { return true }
+            return false
+        })
+        XCTAssertEqual(gate.updateBuffering(true), [])
+        XCTAssertEqual(gate.updateBuffering(false), [])
+
+        XCTAssertEqual(gate.transportDidSettle(), [.cancelSuppressionTimeout])
+        XCTAssertFalse(gate.hasActiveSuspension)
+    }
+
+    func testShortBufferingTransitionOnlyCancelsDebounce() {
+        var gate = CoordinatedPlaybackStallGate()
+
+        let actions = gate.updateBuffering(true)
+        guard case let .scheduleDebounce(generation) = actions.first else {
+            return XCTFail("Expected a debounce to be scheduled")
+        }
+
+        XCTAssertEqual(gate.updateBuffering(false), [.cancelDebounce])
+        XCTAssertEqual(gate.debounceDidFire(generation: generation), [])
+        XCTAssertFalse(gate.hasActiveSuspension)
+    }
+
+    func testSustainedBufferingCreatesOneSuspensionAndReappliesOnce() {
+        var gate = CoordinatedPlaybackStallGate()
+
+        let actions = gate.updateBuffering(true)
+        guard case let .scheduleDebounce(generation) = actions.first else {
+            return XCTFail("Expected a debounce to be scheduled")
+        }
+
+        XCTAssertEqual(gate.debounceDidFire(generation: generation), [.beginSuspension])
+        XCTAssertEqual(gate.debounceDidFire(generation: generation), [])
+        XCTAssertTrue(gate.hasActiveSuspension)
+        XCTAssertEqual(gate.updateBuffering(true), [])
+        XCTAssertEqual(gate.updateBuffering(false), [.endSuspension(reapply: true)])
+        XCTAssertEqual(gate.updateBuffering(false), [])
+        XCTAssertFalse(gate.hasActiveSuspension)
+    }
+
+    func testReappliedCommandSuppressesItsTransientBuffering() {
+        var gate = CoordinatedPlaybackStallGate()
+        let initialActions = gate.updateBuffering(true)
+        guard case let .scheduleDebounce(generation) = initialActions.first else {
+            return XCTFail("Expected a debounce to be scheduled")
+        }
+        _ = gate.debounceDidFire(generation: generation)
+        _ = gate.updateBuffering(false)
+
+        _ = gate.beginTransportCommand()
+        XCTAssertEqual(gate.updateBuffering(true), [])
+        XCTAssertEqual(gate.updateBuffering(false), [])
+        XCTAssertEqual(gate.transportDidSettle(), [.cancelSuppressionTimeout])
+        XCTAssertFalse(gate.hasActiveSuspension)
+    }
+
+    func testItemTransitionAndEndResetCancelPendingWorkAndClearSuppression() {
+        var debounceGate = CoordinatedPlaybackStallGate()
+        _ = debounceGate.updateBuffering(true)
+        XCTAssertEqual(debounceGate.reset(), [.cancelDebounce])
+
+        var suppressionGate = CoordinatedPlaybackStallGate()
+        _ = suppressionGate.beginTransportCommand()
+        XCTAssertEqual(suppressionGate.reset(), [.cancelSuppressionTimeout])
+        XCTAssertFalse(suppressionGate.isSuppressingStalls)
+
+        var activeGate = CoordinatedPlaybackStallGate()
+        let actions = activeGate.updateBuffering(true)
+        guard case let .scheduleDebounce(generation) = actions.first else {
+            return XCTFail("Expected a debounce to be scheduled")
+        }
+        _ = activeGate.debounceDidFire(generation: generation)
+
+        XCTAssertEqual(activeGate.reset(), [.endSuspension(reapply: false)])
+        XCTAssertFalse(activeGate.hasActiveSuspension)
+    }
+
+    func testSuppressionTimeoutAllowsARealSustainedStall() {
+        var gate = CoordinatedPlaybackStallGate()
+        let commandActions = gate.beginTransportCommand()
+        guard case let .scheduleSuppressionTimeout(generation) = commandActions.last else {
+            return XCTFail("Expected a suppression timeout to be scheduled")
+        }
+
+        XCTAssertEqual(gate.updateBuffering(true), [])
+        let timeoutActions = gate.suppressionTimeoutDidFire(generation: generation)
+        guard case let .scheduleDebounce(debounceGeneration) = timeoutActions.first else {
+            return XCTFail("Expected buffering to be debounced after the safety timeout")
+        }
+
+        XCTAssertEqual(
+            gate.debounceDidFire(generation: debounceGeneration),
+            [.beginSuspension]
+        )
+    }
 }
