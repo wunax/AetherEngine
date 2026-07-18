@@ -1840,16 +1840,20 @@ public final class AetherEngine: ObservableObject {
         // warming and the served master resolves 0 tracks / fails -11819; a warm start (no switch) keeps
         // the unchanged immediate-play path.
         var didSwitchPanel = false
+        // #133: when apply() reports the criteria are already active (same-format zap), the panel never
+        // starts a switch, so the post-load play-gate waitForSwitch() below has nothing to settle and would
+        // otherwise burn its full ~3s cap on unobservable-DV panels. Skip it in exactly that case.
+        var criteriaUnchanged = false
         switch Self.loadDisplayCriteriaAction(suppressDisplayCriteria: options.suppressDisplayCriteria, audioOnlyPath: false) {
         case .applyFresh:
             let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
-            let willSwitch = displayCriteria.apply(
+            switch displayCriteria.apply(
                 format: effectiveFormat,
                 frameRate: snappedRate,
                 codecTag: codecTag,
                 omitColorExtensions: options.omitCriteriaColorExtensions
-            )
-            if willSwitch {
+            ) {
+            case .willSwitch:
                 didSwitchPanel = true
                 await displayCriteria.waitForSwitch()
                 // Superseded during panel handshake: close local probe and unwind.
@@ -1860,6 +1864,10 @@ public final class AetherEngine: ObservableObject {
                     }
                     try checkLoadCurrent(gen)
                 }
+            case .applied:
+                break
+            case .unchanged:
+                criteriaUnchanged = true
             }
         case .clearStale:
             // Suppressed host: the load seam preserved the criteria (#128 follow-up), and AVKit writes its
@@ -1915,6 +1923,25 @@ public final class AetherEngine: ObservableObject {
             fieldOrder: detectedFieldOrder,
             av1Available: VTCapabilityProbe.av1Available
         )
+        // #2: an H.264 / HEVC format AVPlayer accepts at the HLS CODECS level but VideoToolbox can't
+        // hardware-decode (H.264 High 4:2:2/4:4:4/High-10, HEVC Rext on Intel Macs / older Apple TV) reaches
+        // readyToPlay then renders nothing on the native path. QuickTime plays it via its own software decoder;
+        // there is no analogous fallback on the native route, so route it to the SoftwarePlaybackHost
+        // (libavcodec), which decodes these profiles. VOD only: forced-native live keeps its verified path, and
+        // broadcast H.264 / HEVC is HW-decodable. Apple Silicon HW-decodes these, so the probe keeps them native.
+        if !useSoftwarePath, !options.isLive, probeOpened,
+           let vStream = probe.stream(at: probe.videoStreamIndex),
+           let codecpar = vStream.pointee.codecpar,
+           VideoRoutingPolicy.forcesSoftwareForUndecodableFormat(
+               codecID: detectedCodecID,
+               canHardwareDecode: VTCapabilityProbe.canHardwareDecode(codecpar: codecpar)) {
+            useSoftwarePath = true
+            EngineLog.emit(
+                "[AetherEngine] codec=\(detectedCodecID.rawValue) not hardware-decodable by "
+                + "VideoToolbox; routing to the software path so it plays instead of a black screen (#2)",
+                category: .engine
+            )
+        }
         // Forward-only sources can't serve the native path's seeks (cue prewarm, segment seeks).
         // Covers custom readers AND URL sources whose AVIOReader resolved no size and degraded to
         // the forward-only streaming reader (#126: unknown-length HTTP MP4 produced zero segments).
@@ -2022,7 +2049,12 @@ public final class AetherEngine: ObservableObject {
                 // via private CoreMedia hooks). waitForSwitch Stage 1 gives AVKit time to fire that write;
                 // Stage 2 waits for the panel to settle so the first frame doesn't hit a mid-transition panel.
                 // Critical for DV P5 (no HDR10 base, requires immediate DV mode).
-                await displayCriteria.waitForSwitch()
+                // #133: unchanged criteria (same-format zap) mean the panel is already in the target mode and
+                // neither the engine nor AVKit will switch it, so there is nothing to settle here. Skipping
+                // avoids Stage 1's blind 1s (and, on unobservable-DV panels, the full ~3s cap) on every zap.
+                if !criteriaUnchanged {
+                    await displayCriteria.waitForSwitch()
+                }
                 try checkLoadCurrent(gen)
                 // automaticallyWaitsToMinimizeStalling=true (default) handles play-before-ready.
                 // #35: on a real SDR->HDR switch while serving a VOD master, drive the bounded

@@ -10,6 +10,108 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [5.8.6] - 2026-07-18
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.8.6))
+
+### Changed
+
+- **Cleared five Swift 6 `SendableClosureCaptures` warnings in the AVIO size-probe.** The staggered-concurrent open-time size probe (#107 follow-up) kept its `resolvedSize` / `outstanding` counters as mutable locals and passed each probe as a plain `() -> Int64` thunk, so Swift 6 flagged the `asyncAfter` `@Sendable` closures. The synchronisation was already correct (every touch guarded by one `NSCondition`); the shared state now lives in a condition-guarded `@unchecked Sendable` box and the probe thunk is `@Sendable`. No behaviour change; the package builds warning-free under Swift 6. Surfaced while sweeping build warnings for the Sodalite 1.0 release.
+
+## [5.8.5] - 2026-07-18
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.8.5))
+
+### Fixed
+
+- **Recurring green flicker mid-stream on live MPEG-TS channels whose encoder restarts or splices in place (#133 follow-up).** The #133 join gate covered joining a broadcast mid-stream, but the same "non-existing PPS/SPS referenced" decode condition recurred later in the same session on some UK terrestrial channels via Xtream, showing as green frames that came back throughout playback rather than only at tune-in. The fMP4 `avcC` (SPS/PPS) freezes at `avformat_write_header`, and the versioned-init rotation that re-establishes it only fired for an SSAI program switch on a new video PID. An in-band parameter-set change on the *same* PID (encoder restart or regional opt-out splice) forced only a discontinuity cut, so the panel kept decoding the new slices against the stale `avcC`. Each mid-stream keyframe now compares its in-band SPS/PPS against the sets backing the current `avcC` and, on a divergence, rotates the muxer through the same versioned EXT-X-MAP path, parsing the sets directly so it works whether or not the demuxer surfaces the change as side data. A same-PID change keeps the program's Dolby Vision / colour signaling; only an ad creative on a new PID drops it. Reported with precise logs by digilearn-dev. This build also adds diagnostics (per-epoch video PID, parameter-set-change counter, and DisplayCriteria skip-signature logging) to confirm the path on retest.
+
+## [5.8.4] - 2026-07-18
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.8.4))
+
+### Fixed
+
+- **Teletext captions no longer render a blank line between two lines placed on non-adjacent rows (#107).** libzvbi joins teletext rows with `\N`, so a two-line caption whose lines sit on non-adjacent rows (an empty middle row used only for vertical placement) arrived as `line1\n\nline2` and showed a blank line the broadcaster never intended. The 5.8.0 edge-trim only removed leading and trailing newlines; interior runs of consecutive newlines now fold to a single break too, on both the plain and coloured teletext paths. Single line breaks between adjacent rows are preserved. Reported by tresby, who device-verified the 801 page override and hardware deinterlace on real AU streams in the same pass.
+
+## [5.8.3] - 2026-07-18
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.8.3))
+
+### Fixed
+
+- **iOS / tvOS build fix for the #2 decodability probe.** `VTCapabilityProbe.canHardwareDecode` used `kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder` without the iOS 17 / tvOS 17 availability guard (the symbol did not exist on iOS before 17), so 5.8.2 compiled on macOS but failed the iOS / tvOS simulator build. Guarded the same way `HardwareVideoDecoder` does. No behavior change on shipping deployment targets. macOS (AetherPlayer) was unaffected in 5.8.2.
+
+## [5.8.2] - 2026-07-18
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.8.2))
+
+### Fixed
+
+- **H.264 / HEVC formats VideoToolbox cannot hardware-decode now fall back to software instead of a black screen (#2).** H.264 High 4:2:2 / 4:4:4 / High-10 and HEVC Rext are accepted by AVPlayer at the HLS CODECS level (the item reaches `readyToPlay`), but on hardware without a VideoToolbox decoder for the profile (Intel Macs, older Apple TV chips) the native path then renders nothing, while QuickTime plays the same file via its own software decoder. A per-format `VTDecompressionSession` probe at load (`VTCapabilityProbe.canHardwareDecode`) now routes these sources to the `SoftwarePlaybackHost` (libavcodec), which decodes them. Apple Silicon has hardware decoders for all of these and keeps them on the native path unchanged. Reported by DrHurt.
+
+## [5.8.1] - 2026-07-18
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.8.1))
+
+### Fixed
+
+- **Dolby Vision P7 conversion failures degrade to clean HDR10 instead of shipping mixed-profile DV (#135).** When libdovi cannot convert a P7 RPU to P8.1 on the loopback-HLS producer path, the offending RPU (and its enhancement-layer NAL) is now dropped rather than muxed through, so the affected frame plays as the clean HDR10 base instead of riding a P7 RPU inside a container already declared 8.1. Well-formed remuxes never reach this path and are unaffected. Field notes from rrgomes.
+
+### Added
+
+- **Full Enhancement Layer (FEL) sources are logged during P7 to P8.1 conversion (#135).** The first RPU's enhancement-layer type is probed once; a FEL source (whose enhancement layer is discarded in the single-layer conversion, unlike a MEL source where the drop is lossless) now emits a one-line log, so a flatter-looking FEL disc can be triaged against a native P7 player. Also surfaced on `DoviConvertProbeResult.enhancementLayerType` for `aetherctl dovitest` validation. Thanks to rrgomes.
+
+## [5.8.0] - 2026-07-18
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.8.0))
+
+### Added
+
+- **Hardware deinterlacing with smooth field-rate motion (#107).** Interlaced broadcast on the software-decode path (MPEG-2 / VC-1 / MPEG-4 and interlaced H.264) now deinterlaces on the GPU via `yadif_videotoolbox` (the yadif kernel as a Metal compute shader over VideoToolbox frames) and, by default, at field rate (`send_field`: 25i to 50p, 29.97i to 59.94p) for smooth motion on sport. `LoadOptions.deinterlaceMode` (default `.auto`) selects the hardware graph with a software bwdif fallback (no Metal device, an older linked FFmpeg, or a graph-build failure all fall back cleanly); `LoadOptions.deinterlaceFieldRate` (default `.field`) controls cadence. The hardware sink emits IOSurface-backed CVPixelBuffers copied GPU-side into the decoder's own pool, skipping the sws_scale copy. Requires FFmpegBuild 2.1.0 (pulled transitively), which also carries a patch balancing an over-release of the autoreleased Metal command-buffer/encoder in the upstream VT filter (a candidate for ffmpeg-devel). Adopts and thanks tresby (whose fork this ports) and nathanpiper.
+
+### Fixed
+
+- **Coloured teletext captions no longer render a leading blank line (#107).** libzvbi teletext ASS can prefix a row-positioning newline; the plain-text path trimmed it but the coloured (rich-text) path did not, so a coloured caption showed a blank line the same page without colour would not. The colour parser now edge-trims leading and trailing whitespace and newlines across the run sequence, matching the plain path (interior line breaks and colours preserved). Reported by tresby.
+
+## [5.7.0] - 2026-07-18
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.7.0))
+
+### Added
+
+- **Coloured DVB teletext captions (#107).** Teletext subtitles now decode through libzvbi as ASS (`txt_format=ass`) so the per-character colour broadcasters use to distinguish speakers survives to the overlay. A new `SubtitleCue.Body.richText([SubtitleTextRun])` carries the coloured runs (each run an RGB `SubtitleColor?`, nil meaning "use the host default"); `cue.text` still flattens rich cues to plain text so existing text consumers are unchanged, and an all-white page keeps emitting plain `.text`. Both reference hosts render the coloured runs. Thanks to tresby and nathanpiper.
+- **Teletext caption-page override (#107).** `LoadOptions.teletextPage` selects the teletext page libzvbi decodes (default nil = auto-detect the flagged subtitle page). Channels whose captions ride a page libzvbi does not flag as a subtitle page (for example Australian free-to-air on page 801) can now be targeted explicitly; the option threads through every subtitle tap site.
+
+### Fixed
+
+- **Coloured teletext cues are trimmed and de-duplicated in the retained store like plain ones (#107).** The teletext successor-trim and the live-DVR re-decode de-dupe were text-cue-only; coloured pages (now rich-text cues) are handled by both, so a coloured caption is closed by its successor instead of lingering to the page-hold cap, and does not duplicate across a live-DVR seek.
+
+## [5.6.2] - 2026-07-17
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.6.2))
+
+### Fixed
+
+- **Live H.264 channels joining mid-broadcast no longer green-flash or die with an empty playlist (#133).** On the MPEG-TS ingest path the video gate opened on any keyframe-flagged packet without confirming a decodable IDR access unit. Joining a running broadcast, that meant the decoder briefly rendered an uninitialized reference (green frame) until the real SPS/PPS/IDR arrived, or, when the probe joined before any SPS and left `codecpar` at 0x0, the first muxer allocation fed 0x0 dimensions into `avformat_write_header` (-22) and the channel produced an empty `#EXTM3U` that never recovered. A live-only pre-gate (H.264 with Annex-B framing) now withholds video until a packet carries in-band SPS + PPS and a true IDR slice, and reconstructs the muxer's dimensions from those in-band parameter sets when the probe left them unresolved. A miss is covered by the existing bounded live keyframe-gate timeout (reopen), not a terminal muxer failure. fMP4 live and VOD are unaffected.
+- **Same-format live zaps no longer pay the full display-mode settle cap (#133).** Zapping between two channels of the same format (e.g. two SDR 50 Hz channels) re-applied identical `AVDisplayCriteria`, which on unobservable-Dolby-Vision panels started a mode switch the app cannot observe and made the post-load settle wait burn its full ~3s cap on every zap. The engine now retains the last-applied criteria and skips both the redundant panel write and the settle wait when the incoming criteria are already active, cutting that redundant latency to zero. Any zap that actually changes format, rate, or dynamic range settles exactly as before. Thanks to digilearn-dev for the detailed report and reproduction.
+
+## [5.6.1] - 2026-07-17
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.6.1))
+
+### Fixed
+
+- **A diagnostics tick can no longer hang or kill the host app (#134).** On the native path the 1 Hz `LiveTelemetrySampler.tick` made up to six synchronous AVFoundation reads per second on the main actor; each is a sync XPC round-trip to mediaserverd, so a momentarily busy media server (a display-mode change on an HDR start, for example) parked the main thread in `mach_msg` and surfaced in production hosts as fully blocked app hangs and watchdog terminations. The reads now run as one coalesced batch (one `accessLog()`, one `currentTime()`) on a dedicated background queue, and a tick that resumes after a stop or reload seam drops its stale snapshot instead of publishing it into the new session. The same class of read existed in the 30 s memory probe (now hopped through the same helper) and in the host's `seekableEnd`, which live clock-tick sinks and the paused-live 1 Hz window timer read per call and is now a KVO mirror of `seekableTimeRanges`. As a side effect, the `[LagDiag]` line no longer pays any AVFoundation cost when verbose logging is disabled. Thanks to l984-451 for the Sentry-backed report, the exact read inventory, and the off-main fix proposal.
+
+## [5.6.0] - 2026-07-17
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.6.0))
+
+### Added
+
+- **A53/SEI-embedded CEA-608 captions are now extracted and rendered (#131).** US broadcast and cable-sourced feeds carry closed captions as ATSC A/53 `cc_data` inside the video bitstream rather than as a demuxable caption stream, so the #77 closed-caption tap never armed and captioned live channels played with no subtitle option. The segment producer now scans H.264/HEVC video packets for `user_data_registered_itu_t_t35` SEI (GA94), reorders the decode-order caption groups to presentation order, and feeds the existing line-21 decoder; the software-decode path (MPEG-2 and friends) feeds the same tap from `AV_FRAME_DATA_A53_CC` decoded-frame side data. A synthetic `eia_608` track surfaces lazily on the first real caption pair, so uncaptioned channels never show a dead menu entry and hosts need no changes. Overlay-only for now (no native WebVTT rendition); CEA-708 stays out of scope, matching #77's field-1/CC1 first cut. Thanks to dlev02 for the precise engine audit that scoped the fix.
+
 ## [5.5.1] - 2026-07-17
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.5.1))

@@ -137,6 +137,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var closedCaptionStreamIndexForSession: Int32 = -1
     var closedCaptionObserverForSession: (@Sendable (UnsafePointer<AVPacket>, AVRational) -> Void)?
 
+    /// #131: A53/SEI caption observer, re-threaded onto every producer like the #77 CC observer.
+    /// Set before start() when the source has no demuxable CC stream.
+    var a53CaptionObserverForSession: (@Sendable ([CCDataParser.CCTriplet], Int64, Int64, AVRational) -> Void)?
+
     /// Sodalite#32: ordinal-aligned source stream indices for the native subtitle cue stores (nil entry =
     /// no demuxable stream, e.g. a sidecar). Drives the producer's subtitle tap: the pump keeps these
     /// streams and hands their packets to the session tap, which decodes into the ordinal's store. Set
@@ -170,13 +174,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return EmbeddedSubtitleDecoder(stream: stream,
                                        sourceVideoWidth: w > 0 ? w : 1920,
                                        sourceVideoHeight: h > 0 ? h : 1080,
-                                       preserveASSMarkup: preserveASSMarkupForSubtitleTap)
+                                       preserveASSMarkup: preserveASSMarkupForSubtitleTap,
+                                       teletextPage: teletextPageForSubtitleTap)
     }
 
     /// Sodalite#32 Phase 2: tap decoders honor the host's markup preference so the overlay can render
     /// styled ASS from tap-fed cues; the WebVTT rendition strips the markup at serve time instead.
     /// Set before start() (AetherEngine+Loading).
     var preserveASSMarkupForSubtitleTap = false
+    var teletextPageForSubtitleTap: Int? = nil
 
     var subtitleTapActive: Bool {
         subtitleTapLock.lock(); defer { subtitleTapLock.unlock() }
@@ -188,8 +194,9 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return subtitleTapRoutes[idx] != nil
     }
 
-    /// Request the native mov_text track in the init moov (#55). Call before `start()`.
-    /// `aetherctl serve --native-subs N` uses this; a full session wires it automatically.
+    /// Enable the native WebVTT subtitle renditions for the session (#55). Call before `start()`
+    /// so the master playlist declares the SUBTITLES group. `aetherctl serve --native-subs` uses
+    /// this; a full session wires it via `LoadOptions.prepareNativeSubtitles`.
     public func requestNativeSubtitleTrack() {
         enableNativeSubtitleTrackForSession = true
     }
@@ -219,7 +226,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     @discardableResult
     public func attachAllNativeSubtitleStores() -> [String?] {
         // Decoder-name classifier: an exact-match Set of descriptor names here never matched TrackInfo.codec
-        // (the libavcodec decoder name), so bitmap tracks leaked into the native mov_text store set.
+        // (the libavcodec decoder name), so bitmap tracks leaked into the native subtitle store set.
         let text = (demuxer?.subtitleTrackInfos() ?? []).filter { !AetherEngine.isBitmapSubtitleCodec($0.codec) }
         let languages = text.map { $0.language }
         attachNativeSubtitleStores(count: text.count, languages: languages,
@@ -245,7 +252,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
                   let decoder = EmbeddedSubtitleDecoder(stream: stream,
                                                         sourceVideoWidth: w > 0 ? w : 1920,
                                                         sourceVideoHeight: h > 0 ? h : 1080,
-                                                        preserveASSMarkup: preserveASSMarkupForSubtitleTap)
+                                                        preserveASSMarkup: preserveASSMarkupForSubtitleTap,
+                                                        teletextPage: teletextPageForSubtitleTap)
             else { continue }
             subtitleTapRoutes[sidx] = (decoder, nativeSubtitleCueStoresForSession[ordinal])
         }
@@ -1622,6 +1630,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // slow high-bitrate DV master must not be misread as a wedge). Threaded onto every producer.
         prod.hasStartedRenderingProvider = hasStartedRenderingProvider
         prod.closedCaptionObserver = closedCaptionObserverForSession   // #77
+        prod.a53CaptionObserver = a53CaptionObserverForSession   // #131
         // Sodalite#32: build the tap routes lazily on the first producer that has stores + stream
         // indices (the host sets both before start()), then wire the tap onto every producer.
         subtitleTapLock.lock()

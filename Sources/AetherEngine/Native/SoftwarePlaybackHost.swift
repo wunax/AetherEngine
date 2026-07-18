@@ -48,6 +48,9 @@ final class SoftwarePlaybackHost {
     /// upgrade the published `videoFormat` from `.hdr10` → `.hdr10Plus`.
     nonisolated(unsafe) var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
 
+    /// #131: forwarded from the video decoder; decoded-frame A53 cc_data triplets, presentation order.
+    nonisolated(unsafe) var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
+
     // MARK: - Output
 
     /// The display layer the engine attaches to the bound `AetherPlayerView`.
@@ -320,9 +323,15 @@ final class SoftwarePlaybackHost {
             category: .swPlayback
         )
 
-        // HEVC -> VTDecompressionSession (HW); everything else -> libavcodec. Replace wholesale to prevent state bleed.
+        // HEVC -> VTDecompressionSession (HW) when VideoToolbox can HW-decode this exact format; everything
+        // else -> libavcodec. Replace wholesale to prevent state bleed. #2: HardwareVideoDecoder requires a
+        // HW decoder and has no software fallback, so an HEVC Rext (4:2:2/4:4:4/12-bit) stream routed here on
+        // hardware without a HW decoder (Intel Macs / older Apple TV) would fail VT session creation and show a
+        // black screen. Route those to libavcodec instead, which decodes them. Apple Silicon HW-decodes them,
+        // so the probe keeps HardwareVideoDecoder there.
         if let codecpar = vStream.pointee.codecpar,
-           codecpar.pointee.codec_id == AV_CODEC_ID_HEVC {
+           codecpar.pointee.codec_id == AV_CODEC_ID_HEVC,
+           VTCapabilityProbe.canHardwareDecode(codecpar: codecpar) {
             videoDecoder.close()
             videoDecoder = HardwareVideoDecoder()
             EngineLog.emit(
@@ -332,6 +341,11 @@ final class SoftwarePlaybackHost {
         } else if !(videoDecoder is SoftwareVideoDecoder) {
             videoDecoder.close()
             videoDecoder = SoftwareVideoDecoder()
+            EngineLog.emit(
+                "[SWHost] selected SoftwareVideoDecoder (libavcodec) for codec_id="
+                + "\(vStream.pointee.codecpar?.pointee.codec_id.rawValue ?? 0)",
+                category: .swPlayback
+            )
         }
 
         // Flip display layer into HDR mode before frames arrive; without this preferredDynamicRange stays .standard and PQ/HLG renders desaturated.
@@ -346,6 +360,9 @@ final class SoftwarePlaybackHost {
                 )
             }
         }
+
+        // Applied here (not init) so it also covers a decoder replaced above.
+        (videoDecoder as? SoftwareVideoDecoder)?.deinterlaceConfig = deinterlaceConfig
 
         try videoDecoder.open(stream: vStream) { [weak self] pixelBuffer, pts, hdr10PlusData in
             // Decoder callback is off-main; SampleBufferRenderer is internally locked.
@@ -364,6 +381,9 @@ final class SoftwarePlaybackHost {
         }
         videoDecoder.onFirstHDR10PlusDetected = { [weak self] in
             self?.onFirstHDR10PlusDetected?()
+        }
+        videoDecoder.onA53Captions = { [weak self] triplets, pts in
+            self?.onA53Captions?(triplets, pts)
         }
 
         let resolvedAudioIdx: Int32 = audioSourceStreamIndex ?? dem.audioStreamIndex
@@ -466,6 +486,8 @@ final class SoftwarePlaybackHost {
 
     /// Host's ASS markup preference for overlay decoders (mirrors the HLS session flag).
     var preserveASSMarkupForSubtitleTap = false
+    var teletextPageForSubtitleTap: Int? = nil
+    var deinterlaceConfig = DeinterlaceConfig()
 
     /// #112 rework: build an overlay decoder for any embedded subtitle stream, seeded from the
     /// session's video dims like the HLS tap routes. The drainer owns the returned decoder.
@@ -477,7 +499,8 @@ final class SoftwarePlaybackHost {
         return EmbeddedSubtitleDecoder(stream: stream,
                                        sourceVideoWidth: w > 0 ? w : 1920,
                                        sourceVideoHeight: h > 0 ? h : 1080,
-                                       preserveASSMarkup: preserveASSMarkupForSubtitleTap)
+                                       preserveASSMarkup: preserveASSMarkupForSubtitleTap,
+                                       teletextPage: teletextPageForSubtitleTap)
     }
 
     func pause() {
