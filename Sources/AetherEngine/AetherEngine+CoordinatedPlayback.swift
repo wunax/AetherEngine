@@ -160,10 +160,6 @@ extension AetherEngine {
 
     func applyCoordinatedPause(expectedIdentifier: String, waiting: Bool) {
         guard coordinatedPlaybackCommandApplies(to: expectedIdentifier) else { return }
-        EngineLog.emit(
-            "[CoordinatedPlayback] pause command waiting=\(waiting)",
-            category: .engine
-        )
         resetCoordinatedPlaybackStallTracking()
         coordinatedPlaybackIntendedRate = 0
         isWaitingForCoordinatedPlayback = waiting
@@ -174,10 +170,6 @@ extension AetherEngine {
         guard coordinatedPlaybackCommandApplies(to: expectedIdentifier) else { return }
         let seconds = itemTime.seconds
         guard seconds.isFinite else { return }
-        EngineLog.emit(
-            "[CoordinatedPlayback] seek command itemTime=\(String(format: "%.3f", seconds))",
-            category: .engine
-        )
         beginCoordinatedTransportCommand()
         pause()
         await seek(to: seconds)
@@ -199,10 +191,6 @@ extension AetherEngine {
         let displaySeconds = itemTime.seconds
         guard displaySeconds.isFinite else { return }
 
-        EngineLog.emit(
-            "[CoordinatedPlayback] play command rate=\(rate) itemTime=\(String(format: "%.3f", displaySeconds))",
-            category: .engine
-        )
         beginCoordinatedTransportCommand()
         pause()
         await seek(to: displaySeconds)
@@ -245,12 +233,6 @@ extension AetherEngine {
 
     func updateCoordinatedPlaybackStall(_ buffering: Bool) {
         guard coordinatedPlaybackActive else { return }
-        EngineLog.emit(
-            "[CoordinatedPlayback] buffering changed buffering=\(buffering) "
-                + "suppressed=\(coordinatedPlaybackStallGate.isSuppressingStalls)",
-            category: .engine,
-            level: .verbose
-        )
         performCoordinatedPlaybackStallActions(
             coordinatedPlaybackStallGate.updateBuffering(buffering)
         )
@@ -263,7 +245,6 @@ extension AetherEngine {
     }
 
     private func beginCoordinatedTransportCommand() {
-        EngineLog.emit("[CoordinatedPlayback] suppressing command-induced stalls", category: .engine)
         performCoordinatedPlaybackStallActions(
             coordinatedPlaybackStallGate.beginTransportCommand()
         )
@@ -281,13 +262,10 @@ extension AetherEngine {
             case .cancelDebounce:
                 coordinatedPlaybackStallDebounceTask?.cancel()
                 coordinatedPlaybackStallDebounceTask = nil
-                EngineLog.emit("[CoordinatedPlayback] stall debounce cancelled", category: .engine)
             case .cancelSuppressionTimeout:
                 coordinatedPlaybackSuppressionTimeoutTask?.cancel()
                 coordinatedPlaybackSuppressionTimeoutTask = nil
-                EngineLog.emit("[CoordinatedPlayback] command stall suppression cleared", category: .engine)
             case let .scheduleDebounce(generation):
-                EngineLog.emit("[CoordinatedPlayback] stall debounce started (500ms)", category: .engine)
                 coordinatedPlaybackStallDebounceTask?.cancel()
                 coordinatedPlaybackStallDebounceTask = Task { @MainActor [weak self] in
                     try? await Task.sleep(nanoseconds: 500_000_000)
@@ -301,10 +279,6 @@ extension AetherEngine {
                 coordinatedPlaybackSuppressionTimeoutTask = Task { @MainActor [weak self] in
                     try? await Task.sleep(nanoseconds: 1_000_000_000)
                     guard !Task.isCancelled, let self else { return }
-                    EngineLog.emit(
-                        "[CoordinatedPlayback] command stall suppression timed out",
-                        category: .engine
-                    )
                     self.performCoordinatedPlaybackStallActions(
                         self.coordinatedPlaybackStallGate.suppressionTimeoutDidFire(
                             generation: generation
@@ -313,7 +287,6 @@ extension AetherEngine {
                 }
             case .beginSuspension:
                 guard coordinatedPlaybackStallSuspension == nil else { continue }
-                EngineLog.emit("[CoordinatedPlayback] beginning real stall suspension", category: .engine)
                 coordinatedPlaybackStallSuspension = playbackCoordinator.beginSuspension(
                     for: .stallRecovery
                 )
@@ -321,12 +294,7 @@ extension AetherEngine {
                 guard let suspension = coordinatedPlaybackStallSuspension else { continue }
                 coordinatedPlaybackStallSuspension = nil
                 suspension.end()
-                EngineLog.emit(
-                    "[CoordinatedPlayback] stall suspension ended reapply=\(reapply)",
-                    category: .engine
-                )
                 if reapply {
-                    EngineLog.emit("[CoordinatedPlayback] reapplying coordinator state", category: .engine)
                     playbackCoordinator.reapplyCurrentItemStateToPlaybackControlDelegate()
                 }
             }
