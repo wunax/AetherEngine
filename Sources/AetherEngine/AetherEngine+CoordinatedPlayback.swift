@@ -2,6 +2,30 @@ import AVFoundation
 import CoreMedia
 import Foundation
 
+enum CoordinatedAVPlayerStartStrategy: Equatable {
+    case scheduled
+    case immediate
+
+    static func resolve(itemTime: CMTime, hostTime: CMTime) -> Self {
+        itemTime.isNumeric && hostTime.isNumeric ? .scheduled : .immediate
+    }
+}
+
+@MainActor
+func startAVPlayerCoordinated(
+    _ player: AVPlayer,
+    rate: Float,
+    atHostTime hostTime: CMTime
+) {
+    let itemTime = player.currentTime()
+    switch CoordinatedAVPlayerStartStrategy.resolve(itemTime: itemTime, hostTime: hostTime) {
+    case .scheduled:
+        player.setRate(rate, time: itemTime, atHostTime: hostTime)
+    case .immediate:
+        player.playImmediately(atRate: rate)
+    }
+}
+
 struct CoordinatedPlaybackStallGate {
     enum Action: Equatable {
         case cancelDebounce
@@ -204,7 +228,7 @@ extension AetherEngine {
         let backendTime = CMTime(seconds: max(0, clockSeconds), preferredTimescale: 600)
 
         if audioAVPlayerActive, let host = audioAVPlayerHost {
-            await host.playCoordinated(rate: rate, atHostTime: hostTime)
+            host.playCoordinated(rate: rate, atHostTime: hostTime)
         } else if let host = audioHost {
             host.playCoordinated(rate: rate, itemTime: backendTime, hostTime: hostTime)
             coordinatedTransportDidSettle()
@@ -212,7 +236,7 @@ extension AetherEngine {
             host.playCoordinated(rate: rate, itemTime: backendTime, hostTime: hostTime)
             coordinatedTransportDidSettle()
         } else if let host = nativeHost {
-            await host.playCoordinated(rate: rate, atHostTime: hostTime)
+            host.playCoordinated(rate: rate, atHostTime: hostTime)
         } else {
             coordinatedTransportDidSettle()
         }

@@ -4,6 +4,33 @@ import XCTest
 
 @MainActor
 final class CoordinatedPlaybackTests: XCTestCase {
+    func testAVPlayerStartUsesHostClockSchedulingForNumericTimes() {
+        let itemTime = CMTime(seconds: 42, preferredTimescale: 600)
+        let hostTime = CMTime(seconds: 100, preferredTimescale: 1_000_000_000)
+
+        XCTAssertEqual(
+            CoordinatedAVPlayerStartStrategy.resolve(itemTime: itemTime, hostTime: hostTime),
+            .scheduled
+        )
+    }
+
+    func testAVPlayerStartFallsBackToImmediatePlaybackForInvalidTimes() {
+        let numericTime = CMTime(seconds: 42, preferredTimescale: 600)
+
+        XCTAssertEqual(
+            CoordinatedAVPlayerStartStrategy.resolve(itemTime: .invalid, hostTime: numericTime),
+            .immediate
+        )
+        XCTAssertEqual(
+            CoordinatedAVPlayerStartStrategy.resolve(itemTime: numericTime, hostTime: .invalid),
+            .immediate
+        )
+        XCTAssertEqual(
+            CoordinatedAVPlayerStartStrategy.resolve(itemTime: .indefinite, hostTime: numericTime),
+            .immediate
+        )
+    }
+
     func testCoordinatorIsRetainedAcrossItemTransitions() throws {
         let engine = try AetherEngine()
         let coordinator = engine.playbackCoordinator

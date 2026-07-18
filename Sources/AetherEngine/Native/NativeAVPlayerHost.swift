@@ -638,15 +638,10 @@ final class NativeAVPlayerHost {
 
     /// Starts the AVPlayer at the host-clock deadline negotiated by a delegating
     /// playback coordinator. The caller performs the item-time seek first.
-    func playCoordinated(rate: Float, atHostTime hostTime: CMTime) async {
+    func playCoordinated(rate: Float, atHostTime hostTime: CMTime) {
         playIntent = true
-        let now = CMClockGetTime(CMClockGetHostTimeClock())
-        let delay = CMTimeSubtract(hostTime, now).seconds
-        if delay.isFinite, delay > 0 {
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-        }
         guard !Task.isCancelled else { return }
-        avPlayer.playImmediately(atRate: rate)
+        startAVPlayerCoordinated(avPlayer, rate: rate, atHostTime: hostTime)
     }
 
     /// Resolve only when the seek physically lands (loopback source lands seeks seconds after the call; issue #37).

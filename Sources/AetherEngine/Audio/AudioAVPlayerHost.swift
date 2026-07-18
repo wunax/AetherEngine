@@ -279,15 +279,10 @@ final class AudioAVPlayerHost {
         rate = 0
     }
 
-    func playCoordinated(rate coordinatedRate: Float, atHostTime hostTime: CMTime) async {
+    func playCoordinated(rate coordinatedRate: Float, atHostTime hostTime: CMTime) {
         lastRate = coordinatedRate
-        let now = CMClockGetTime(CMClockGetHostTimeClock())
-        let delay = CMTimeSubtract(hostTime, now).seconds
-        if delay.isFinite, delay > 0 {
-            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
-        }
         guard !Task.isCancelled else { return }
-        avPlayer.playImmediately(atRate: coordinatedRate)
+        startAVPlayerCoordinated(avPlayer, rate: coordinatedRate, atHostTime: hostTime)
         rate = coordinatedRate
     }
 
