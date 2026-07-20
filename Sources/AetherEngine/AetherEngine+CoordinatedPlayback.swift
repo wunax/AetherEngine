@@ -12,6 +12,14 @@ enum CoordinatedAVPlayerStartStrategy: Equatable {
 }
 
 @MainActor
+func prepareAVPlayerForHostClockScheduling(_ player: AVPlayer) {
+    // AVPlayer raises NSInvalidArgumentException if host-clock scheduling is requested
+    // while automatic stall waiting is enabled. Precise coordinated starts require the
+    // player clock to advance at the negotiated deadline instead of AVPlayer delaying it.
+    player.automaticallyWaitsToMinimizeStalling = false
+}
+
+@MainActor
 func startAVPlayerCoordinated(
     _ player: AVPlayer,
     rate: Float,
@@ -20,6 +28,7 @@ func startAVPlayerCoordinated(
     let itemTime = player.currentTime()
     switch CoordinatedAVPlayerStartStrategy.resolve(itemTime: itemTime, hostTime: hostTime) {
     case .scheduled:
+        prepareAVPlayerForHostClockScheduling(player)
         player.setRate(rate, time: itemTime, atHostTime: hostTime)
     case .immediate:
         player.playImmediately(atRate: rate)
@@ -138,6 +147,9 @@ extension AetherEngine {
         initialRate: Float = 0
     ) {
         resetCoordinatedPlaybackStallTracking()
+        if identifier == nil {
+            restoreAutomaticStallWaitingAfterCoordinatedPlayback()
+        }
         coordinatedPlaybackActive = identifier != nil
         coordinatedPlaybackItemIdentifier = identifier
         coordinatedPlaybackIntendedRate = initialRate
@@ -166,6 +178,7 @@ extension AetherEngine {
 
     public func endCoordinatedPlayback() {
         resetCoordinatedPlaybackStallTracking()
+        restoreAutomaticStallWaitingAfterCoordinatedPlayback()
         coordinatedPlaybackInterruptionSuspension?.end()
         coordinatedPlaybackInterruptionSuspension = nil
         coordinatedPlaybackActive = false
@@ -176,6 +189,11 @@ extension AetherEngine {
             withIdentifier: nil,
             proposingInitialTimingBasedOn: nil
         )
+    }
+
+    private func restoreAutomaticStallWaitingAfterCoordinatedPlayback() {
+        audioAVPlayerHost?.restoreAutomaticStallWaiting()
+        nativeHost?.restoreAutomaticStallWaiting()
     }
 
     func coordinatedPlaybackCommandApplies(to identifier: String) -> Bool {

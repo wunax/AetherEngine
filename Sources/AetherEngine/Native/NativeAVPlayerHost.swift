@@ -659,6 +659,10 @@ final class NativeAVPlayerHost {
         startAVPlayerCoordinated(avPlayer, rate: rate, atHostTime: hostTime)
     }
 
+    func restoreAutomaticStallWaiting() {
+        avPlayer.automaticallyWaitsToMinimizeStalling = true
+    }
+
     /// Resolve only when the seek physically lands (loopback source lands seeks seconds after the call; issue #37).
     /// seekInFlight suppresses the periodic observer across the wait; only the latest seekGeneration clears it.
     func seek(to seconds: Double) async {

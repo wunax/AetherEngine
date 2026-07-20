@@ -31,6 +31,15 @@ final class CoordinatedPlaybackTests: XCTestCase {
         )
     }
 
+    func testAVPlayerStartDisablesAutomaticStallWaitingForHostClockScheduling() {
+        let player = AVPlayer()
+        XCTAssertTrue(player.automaticallyWaitsToMinimizeStalling)
+
+        prepareAVPlayerForHostClockScheduling(player)
+
+        XCTAssertFalse(player.automaticallyWaitsToMinimizeStalling)
+    }
+
     func testCoordinatorIsRetainedAcrossItemTransitions() throws {
         let engine = try AetherEngine()
         let coordinator = engine.playbackCoordinator

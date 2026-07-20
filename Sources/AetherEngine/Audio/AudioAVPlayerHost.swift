@@ -286,6 +286,10 @@ final class AudioAVPlayerHost {
         rate = coordinatedRate
     }
 
+    func restoreAutomaticStallWaiting() {
+        avPlayer.automaticallyWaitsToMinimizeStalling = true
+    }
+
     func setRate(_ newRate: Float) {
         lastRate = newRate
         if avPlayer.timeControlStatus != .paused {
