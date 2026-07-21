@@ -11,6 +11,7 @@ final class CoordinatedPlaybackTests: XCTestCase {
         XCTAssertEqual(
             CoordinatedAVPlayerStartStrategy.resolve(
                 playerStatus: .readyToPlay,
+                itemStatus: .readyToPlay,
                 itemTime: itemTime,
                 hostTime: hostTime
             ),
@@ -25,6 +26,7 @@ final class CoordinatedPlaybackTests: XCTestCase {
         XCTAssertEqual(
             CoordinatedAVPlayerStartStrategy.resolve(
                 playerStatus: .unknown,
+                itemStatus: .unknown,
                 itemTime: itemTime,
                 hostTime: hostTime
             ),
@@ -33,6 +35,31 @@ final class CoordinatedPlaybackTests: XCTestCase {
         XCTAssertEqual(
             CoordinatedAVPlayerStartStrategy.resolve(
                 playerStatus: .failed,
+                itemStatus: .failed,
+                itemTime: itemTime,
+                hostTime: hostTime
+            ),
+            .immediate
+        )
+    }
+
+    func testAVPlayerStartFallsBackWhileReplacementItemIsNotReady() {
+        let itemTime = CMTime(seconds: 42, preferredTimescale: 600)
+        let hostTime = CMTime(seconds: 100, preferredTimescale: 1_000_000_000)
+
+        XCTAssertEqual(
+            CoordinatedAVPlayerStartStrategy.resolve(
+                playerStatus: .readyToPlay,
+                itemStatus: .unknown,
+                itemTime: itemTime,
+                hostTime: hostTime
+            ),
+            .immediate
+        )
+        XCTAssertEqual(
+            CoordinatedAVPlayerStartStrategy.resolve(
+                playerStatus: .readyToPlay,
+                itemStatus: nil,
                 itemTime: itemTime,
                 hostTime: hostTime
             ),
@@ -46,6 +73,7 @@ final class CoordinatedPlaybackTests: XCTestCase {
         XCTAssertEqual(
             CoordinatedAVPlayerStartStrategy.resolve(
                 playerStatus: .readyToPlay,
+                itemStatus: .readyToPlay,
                 itemTime: .invalid,
                 hostTime: numericTime
             ),
@@ -54,6 +82,7 @@ final class CoordinatedPlaybackTests: XCTestCase {
         XCTAssertEqual(
             CoordinatedAVPlayerStartStrategy.resolve(
                 playerStatus: .readyToPlay,
+                itemStatus: .readyToPlay,
                 itemTime: numericTime,
                 hostTime: .invalid
             ),
@@ -62,6 +91,7 @@ final class CoordinatedPlaybackTests: XCTestCase {
         XCTAssertEqual(
             CoordinatedAVPlayerStartStrategy.resolve(
                 playerStatus: .readyToPlay,
+                itemStatus: .readyToPlay,
                 itemTime: .indefinite,
                 hostTime: numericTime
             ),

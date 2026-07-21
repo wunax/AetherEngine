@@ -8,10 +8,16 @@ enum CoordinatedAVPlayerStartStrategy: Equatable {
 
     static func resolve(
         playerStatus: AVPlayer.Status,
+        itemStatus: AVPlayerItem.Status?,
         itemTime: CMTime,
         hostTime: CMTime
     ) -> Self {
-        guard playerStatus == .readyToPlay else { return .immediate }
+        // AVPlayer.status can briefly remain ready while replaceCurrentItem(with:)
+        // installs an item whose own status is still unknown. AVFoundation rejects
+        // host-clock scheduling during that window with an NSInvalidArgumentException,
+        // so require both sides of the item transition to be ready.
+        guard playerStatus == .readyToPlay,
+              itemStatus == .readyToPlay else { return .immediate }
         return itemTime.isNumeric && hostTime.isNumeric ? .scheduled : .immediate
     }
 }
@@ -33,6 +39,7 @@ func startAVPlayerCoordinated(
     let itemTime = player.currentTime()
     switch CoordinatedAVPlayerStartStrategy.resolve(
         playerStatus: player.status,
+        itemStatus: player.currentItem?.status,
         itemTime: itemTime,
         hostTime: hostTime
     ) {
