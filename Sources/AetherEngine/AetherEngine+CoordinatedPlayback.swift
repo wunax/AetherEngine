@@ -6,8 +6,13 @@ enum CoordinatedAVPlayerStartStrategy: Equatable {
     case scheduled
     case immediate
 
-    static func resolve(itemTime: CMTime, hostTime: CMTime) -> Self {
-        itemTime.isNumeric && hostTime.isNumeric ? .scheduled : .immediate
+    static func resolve(
+        playerStatus: AVPlayer.Status,
+        itemTime: CMTime,
+        hostTime: CMTime
+    ) -> Self {
+        guard playerStatus == .readyToPlay else { return .immediate }
+        return itemTime.isNumeric && hostTime.isNumeric ? .scheduled : .immediate
     }
 }
 
@@ -26,11 +31,19 @@ func startAVPlayerCoordinated(
     atHostTime hostTime: CMTime
 ) {
     let itemTime = player.currentTime()
-    switch CoordinatedAVPlayerStartStrategy.resolve(itemTime: itemTime, hostTime: hostTime) {
+    switch CoordinatedAVPlayerStartStrategy.resolve(
+        playerStatus: player.status,
+        itemTime: itemTime,
+        hostTime: hostTime
+    ) {
     case .scheduled:
         prepareAVPlayerForHostClockScheduling(player)
         player.setRate(rate, time: itemTime, atHostTime: hostTime)
     case .immediate:
+        // A coordinator command can race AVPlayerItem readiness after a load or item swap.
+        // setRate(_:time:atHostTime:) raises NSInvalidArgumentException in that state, while
+        // immediate playback is safe and also gives AVPlayer the intent it may need to finish
+        // preparing the item. The coordinator can subsequently correct the shared timeline.
         player.playImmediately(atRate: rate)
     }
 }

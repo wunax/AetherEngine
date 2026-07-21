@@ -9,8 +9,34 @@ final class CoordinatedPlaybackTests: XCTestCase {
         let hostTime = CMTime(seconds: 100, preferredTimescale: 1_000_000_000)
 
         XCTAssertEqual(
-            CoordinatedAVPlayerStartStrategy.resolve(itemTime: itemTime, hostTime: hostTime),
+            CoordinatedAVPlayerStartStrategy.resolve(
+                playerStatus: .readyToPlay,
+                itemTime: itemTime,
+                hostTime: hostTime
+            ),
             .scheduled
+        )
+    }
+
+    func testAVPlayerStartFallsBackToImmediatePlaybackUntilPlayerIsReady() {
+        let itemTime = CMTime(seconds: 42, preferredTimescale: 600)
+        let hostTime = CMTime(seconds: 100, preferredTimescale: 1_000_000_000)
+
+        XCTAssertEqual(
+            CoordinatedAVPlayerStartStrategy.resolve(
+                playerStatus: .unknown,
+                itemTime: itemTime,
+                hostTime: hostTime
+            ),
+            .immediate
+        )
+        XCTAssertEqual(
+            CoordinatedAVPlayerStartStrategy.resolve(
+                playerStatus: .failed,
+                itemTime: itemTime,
+                hostTime: hostTime
+            ),
+            .immediate
         )
     }
 
@@ -18,15 +44,27 @@ final class CoordinatedPlaybackTests: XCTestCase {
         let numericTime = CMTime(seconds: 42, preferredTimescale: 600)
 
         XCTAssertEqual(
-            CoordinatedAVPlayerStartStrategy.resolve(itemTime: .invalid, hostTime: numericTime),
+            CoordinatedAVPlayerStartStrategy.resolve(
+                playerStatus: .readyToPlay,
+                itemTime: .invalid,
+                hostTime: numericTime
+            ),
             .immediate
         )
         XCTAssertEqual(
-            CoordinatedAVPlayerStartStrategy.resolve(itemTime: numericTime, hostTime: .invalid),
+            CoordinatedAVPlayerStartStrategy.resolve(
+                playerStatus: .readyToPlay,
+                itemTime: numericTime,
+                hostTime: .invalid
+            ),
             .immediate
         )
         XCTAssertEqual(
-            CoordinatedAVPlayerStartStrategy.resolve(itemTime: .indefinite, hostTime: numericTime),
+            CoordinatedAVPlayerStartStrategy.resolve(
+                playerStatus: .readyToPlay,
+                itemTime: .indefinite,
+                hostTime: numericTime
+            ),
             .immediate
         )
     }
