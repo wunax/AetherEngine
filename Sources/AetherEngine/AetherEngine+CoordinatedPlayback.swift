@@ -296,27 +296,13 @@ extension AetherEngine {
     private func waitUntilReadyForCoordinatedCommand(
         expectedIdentifier: String
     ) async -> Bool {
-        let retained = !isSessionReady
-        if retained {
-            EngineLog.emit(
-                "[SharePlay] retaining command for item=\(expectedIdentifier) until transport is ready",
-                category: .engine
-            )
-        }
         while !isSessionReady {
             guard coordinatedPlaybackCommandApplies(to: expectedIdentifier),
                   !Task.isCancelled
             else { return false }
             try? await Task.sleep(nanoseconds: 50_000_000)
         }
-        let applies = coordinatedPlaybackCommandApplies(to: expectedIdentifier)
-        if retained, applies {
-            EngineLog.emit(
-                "[SharePlay] applying retained command for ready item=\(expectedIdentifier)",
-                category: .engine
-            )
-        }
-        return applies
+        return coordinatedPlaybackCommandApplies(to: expectedIdentifier)
     }
 
     func waitUntilReadyForCoordinatedPlayback(dueDate: Date?) async {
