@@ -154,6 +154,100 @@ final class CoordinatedPlaybackTests: XCTestCase {
         XCTAssertFalse(engine.isWaitingForCoordinatedPlayback)
     }
 
+    func testTransportPlaybackClearsStaleCoordinationWait() throws {
+        let engine = try AetherEngine()
+        engine.transitionToCoordinatedPlaybackItem(
+            identifier: "replacement",
+            initialTime: 0,
+        )
+        XCTAssertTrue(engine.isWaitingForCoordinatedPlayback)
+
+        engine.coordinatedPlaybackTransportDidStart()
+
+        XCTAssertFalse(engine.isWaitingForCoordinatedPlayback)
+    }
+
+    func testCoordinatedPlayWaitsForReplacementTransportReadiness() async throws {
+        let engine = try AetherEngine()
+        engine.transitionToCoordinatedPlaybackItem(
+            identifier: "replacement",
+            initialTime: 0,
+        )
+        var commandCompleted = false
+
+        let command = Task { @MainActor in
+            await engine.applyCoordinatedPlay(
+                expectedIdentifier: "replacement",
+                rate: 1,
+                itemTime: CMTime(seconds: 42, preferredTimescale: 600),
+                hostTime: .invalid
+            )
+            commandCompleted = true
+        }
+
+        await Task.yield()
+        XCTAssertFalse(commandCompleted)
+        XCTAssertEqual(engine.coordinatedPlaybackIntendedRate, 0)
+
+        engine.isSessionReady = true
+        await command.value
+
+        XCTAssertTrue(commandCompleted)
+        XCTAssertEqual(engine.coordinatedPlaybackIntendedRate, 1)
+    }
+
+    func testCoordinatedSeekWaitsForReplacementTransportReadiness() async throws {
+        let engine = try AetherEngine()
+        engine.transitionToCoordinatedPlaybackItem(
+            identifier: "replacement",
+            initialTime: 0,
+        )
+        var commandCompleted = false
+
+        let command = Task { @MainActor in
+            await engine.applyCoordinatedSeek(
+                expectedIdentifier: "replacement",
+                itemTime: CMTime(seconds: 42, preferredTimescale: 600)
+            )
+            commandCompleted = true
+        }
+
+        await Task.yield()
+        XCTAssertFalse(commandCompleted)
+
+        engine.isSessionReady = true
+        await command.value
+
+        XCTAssertTrue(commandCompleted)
+    }
+
+    func testReplacementCancelsCommandForPreviousItem() async throws {
+        let engine = try AetherEngine()
+        engine.transitionToCoordinatedPlaybackItem(
+            identifier: "episode-1",
+            initialTime: 0,
+        )
+
+        let command = Task { @MainActor in
+            await engine.applyCoordinatedPlay(
+                expectedIdentifier: "episode-1",
+                rate: 1,
+                itemTime: CMTime(seconds: 42, preferredTimescale: 600),
+                hostTime: .invalid
+            )
+        }
+
+        await Task.yield()
+        engine.transitionToCoordinatedPlaybackItem(
+            identifier: "episode-2",
+            initialTime: 0,
+        )
+        await command.value
+
+        XCTAssertTrue(engine.coordinatedPlaybackCommandApplies(to: "episode-2"))
+        XCTAssertEqual(engine.coordinatedPlaybackIntendedRate, 0)
+    }
+
     func testPresentationAxisRoundTripsCoordinatorItemTime() {
         let sourceTime = 109.5
         let origin = 100.25

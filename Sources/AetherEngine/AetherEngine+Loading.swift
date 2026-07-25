@@ -197,7 +197,7 @@ extension AetherEngine {
                 self.isBuffering = self.state == .playing && status == .waitingToPlayAtSpecifiedRate
                 switch status {
                 case .playing:
-                    self.coordinatedTransportDidSettle()
+                    self.coordinatedPlaybackTransportDidStart()
                     if self.state != .playing { self.state = .playing }
                 case .waitingToPlayAtSpecifiedRate:
                     // Hold .loading through startup (hasStartedPlaying gate on the host side).
@@ -717,7 +717,7 @@ extension AetherEngine {
                 case .paused:
                     if self.state != .paused { self.state = .paused }
                 case .playing:
-                    self.coordinatedTransportDidSettle()
+                    self.coordinatedPlaybackTransportDidStart()
                     if self.state != .playing { self.state = .playing }
                 case .waitingToPlayAtSpecifiedRate:
                     if self.state != .playing { self.state = .playing }
@@ -1070,7 +1070,7 @@ extension AetherEngine {
         host.$timeControlStatus
             .filter { $0 == .playing }
             .sink { [weak self] _ in
-                self?.coordinatedTransportDidSettle()
+                self?.coordinatedPlaybackTransportDidStart()
             }
             .store(in: &audioNativeCancellables)
         // No timeControlStatus reconciliation on the audio path: all transport flows through engine play()/pause(). Feeding it back mis-latched a TRANSIENT .paused AVFoundation emits on background transition as a real pause, zeroing MPNowPlayingInfoPropertyPlaybackRate and breaking Now-Playing badge + Siri Remote routing.
