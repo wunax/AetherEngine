@@ -118,6 +118,18 @@ struct DemuxerOpenProfile: Sendable {
         profile.skipStreamInfo = true
         return profile
     }
+
+    /// Open profile for the `LoadOptions.confirmAtmos` side demuxer (#214 follow-up). The pass needs only
+    /// `codec_id` / `codec_type` on the audio streams, which `avformat_open_input` resolves from the
+    /// container header (matroska CodecID, MP4 sample entry, MPEG-TS PMT), so `find_stream_info` would be
+    /// pure cost on a remote source for a background enrichment nobody is waiting on. Keeps the playback
+    /// AVIO tuning: the pass does sustained paced reads until it has enough audio packets, not a one-shot
+    /// fetch, and `boundedInitialFetch` stays nil because reaching the audio in an interleaved UHD remux
+    /// can span well past any header-sized bound.
+    static func atmosConfirmationDemuxer(callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?)
+        -> DemuxerOpenProfile {
+        subtitleSideDemuxer(callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration)
+    }
 }
 
 /// AVFormatContext wrapper. HTTP(S) uses custom AVIO via URLSession (no built-in
@@ -605,6 +617,56 @@ public final class Demuxer: @unchecked Sendable {
     /// authoring: PCS|WDS|PDS|ODS|END as separate PES packets, some without a PTS); Matroska
     /// carries one complete set per packet and must NOT be assembled (converters there strip
     /// the trailing END, which the decoder's synthetic-END flush rescues per packet).
+    /// #151: every AVMEDIA_TYPE_SUBTITLE stream index; the forward prefetcher's route + keep set.
+    func subtitleStreamIndices() -> Set<Int32> {
+        guard let ctx = formatContext else { return [] }
+        var indices: Set<Int32> = []
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let stream = ctx.pointee.streams[i],
+                  let codecpar = stream.pointee.codecpar,
+                  codecpar.pointee.codec_type == AVMEDIA_TYPE_SUBTITLE else { continue }
+            indices.insert(Int32(i))
+        }
+        return indices
+    }
+
+    /// #230: the stream whose packets pace the subtitle side reader's forward park, or -1.
+    ///
+    /// The park can only be evaluated on a packet the loop actually receives, and with every
+    /// non-subtitle stream on `AVDISCARD_ALL` the only packets that arrive are subtitle packets.
+    /// Between two cues the reader therefore has no control point at all: a single `av_read_frame`
+    /// call walks however many bytes lie between them, and on a sparse or forced track that is the
+    /// rest of the file. Delivering one non-subtitle stream at `AVDISCARD_NONKEY` restores a
+    /// control point without restoring the payload: video yields one packet per IRAP, which is the
+    /// natural granularity for a 60 s park window.
+    ///
+    /// Video is preferred because `AVDISCARD_NONKEY` genuinely thins it; audio (where every packet
+    /// is a keyframe, so nothing is thinned) is the fallback, and its packets are small. Selection
+    /// walks `codec_type` rather than `av_find_best_stream` because the side demuxer opts out of
+    /// `find_stream_info` (#87), so codecpar may be incomplete and cover art is still typed as
+    /// video (`reclassifyAttachedPictures` does not run either). A cover-art stream would deliver
+    /// exactly one packet and pace nothing, so it is excluded by disposition.
+    func prefetchPacingStreamIndex() -> Int32 {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let ctx = formatContext else { return -1 }
+        var audioFallback: Int32 = -1
+        for i in 0..<Int(ctx.pointee.nb_streams) {
+            guard let stream = ctx.pointee.streams[i],
+                  let codecpar = stream.pointee.codecpar,
+                  !Self.isAttachedPicture(disposition: stream.pointee.disposition) else { continue }
+            switch codecpar.pointee.codec_type {
+            case AVMEDIA_TYPE_VIDEO:
+                return Int32(i)
+            case AVMEDIA_TYPE_AUDIO where audioFallback < 0:
+                audioFallback = Int32(i)
+            default:
+                continue
+            }
+        }
+        return audioFallback
+    }
+
     func splitDisplaySetSubtitleStreamIndices() -> Set<Int32> {
         guard let ctx = formatContext,
               let formatName = ctx.pointee.iformat?.pointee.name,
@@ -782,16 +844,23 @@ public final class Demuxer: @unchecked Sendable {
     /// cluster blocks for all streams on every video packet and queues unused PGS
     /// bitmaps and audio frames. AVDISCARD_ALL drops before AVPacket alloc, eliminating
     /// that cycle. Call after open, before readPacket. Safe to call multiple times.
-    func discardAllStreamsExcept(_ keep: Set<Int32>) {
+    /// `pacing`, when >= 0 and not already in `keep`, is delivered at `AVDISCARD_NONKEY` instead of
+    /// being dropped: keyframes only, enough to give a side reader a read-position control point
+    /// between sparse target packets (#230). -1 keeps the original all-or-nothing behavior.
+    func discardAllStreamsExcept(_ keep: Set<Int32>, pacing: Int32 = -1) {
         accessLock.lock()
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return }
         for i in 0..<Int32(ctx.pointee.nb_streams) {
             guard let stream = ctx.pointee.streams[Int(i)] else { continue }
-            // AVDISCARD_DEFAULT = 0 (= passthrough), AVDISCARD_ALL = 48.
-            stream.pointee.discard = keep.contains(i)
-                ? AVDISCARD_DEFAULT
-                : AVDISCARD_ALL
+            // AVDISCARD_DEFAULT = 0 (= passthrough), AVDISCARD_NONKEY = 32, AVDISCARD_ALL = 48.
+            if keep.contains(i) {
+                stream.pointee.discard = AVDISCARD_DEFAULT
+            } else if i == pacing {
+                stream.pointee.discard = AVDISCARD_NONKEY
+            } else {
+                stream.pointee.discard = AVDISCARD_ALL
+            }
         }
     }
 
@@ -918,6 +987,33 @@ public final class Demuxer: @unchecked Sendable {
         }
         avformat_flush(ctx)  // prevents assertion failures in matroskadec.c
         lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
+    }
+
+    /// Seek on one stream's native timestamp axis, never before `timestamp`.
+    @discardableResult
+    func seek(to timestamp: Int64, streamIndex: Int32) -> Bool {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let ctx = formatContext,
+              streamIndex >= 0,
+              streamIndex < Int32(ctx.pointee.nb_streams) else { return false }
+        let ret = avformat_seek_file(
+            ctx,
+            streamIndex,
+            timestamp,
+            timestamp,
+            Int64.max,
+            0
+        )
+        if ret < 0 {
+            EngineLog.emit(
+                "[Demuxer] Seek to stream \(streamIndex) timestamp \(timestamp) failed: \(ret)",
+                category: .demux
+            )
+        }
+        avformat_flush(ctx)
+        lastReadClipIdx = -1
+        return ret >= 0
     }
 
     /// #112 round 10: latched by the side reader once a timestamp positioning seek timed out or failed on this

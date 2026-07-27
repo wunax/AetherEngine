@@ -175,8 +175,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 
     // MARK: - Persistent Mode (single forward-streaming connection, playback path)
 
-    // Backpressure: pause delivery above highWater; peak resident window ~22 MB.
+    // Backpressure: suspend the persistent task above highWater, resume below lowWater
+    // (#174). Suspend/resume is the only contractual flow control; blocking the delegate
+    // callback leaves the socket read running on TLS/H2 transports, and the undelivered
+    // body then accumulates in unbounded URLSession-internal allocations until jetsam.
+    // Peak resident window ~= highWater + transport in-flight (a few MB).
     private static let winHighWater = 16 * 1024 * 1024
+    private static let winLowWater = 8 * 1024 * 1024
     // Keep this many bytes behind the cursor for small matroska backward re-reads.
     private static let winLookback = 2 * 1024 * 1024
     // Trim in batches to avoid O(n^2) memmove storm on every 256 KB read.
@@ -245,6 +250,18 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var connGeneration = 0
     private var activeSession: URLSession?
     private var activeTask: URLSessionDataTask?
+    // #174: true while the persistent task is suspended for window backpressure.
+    // winCond-guarded; every suspend/resume transition goes through this flag so the
+    // task's suspend count stays balanced.
+    private var persistentTaskSuspended = false
+
+    /// #174: winCond-guarded snapshot of the suspend state, internal so the task-level
+    /// backpressure is unit-tested against a loopback origin without private state access.
+    var persistentTaskIsSuspendedForTesting: Bool {
+        winCond.lock()
+        defer { winCond.unlock() }
+        return persistentTaskSuspended
+    }
     // #93 restart latency diagnostics (winCond-guarded): bytes dropped by the stale-generation
     // guard, plus per-generation time-to-first-data tracking.
     private var staleGenDroppedBytes: Int64 = 0
@@ -363,13 +380,38 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             // probeFileSize() round-trip (and its HEAD fallback, the request some origins 429).
             startPersistentConnection(at: 0, boundedTo: boundedInitialFetch)
             let gotData = awaitFirstPersistentData()
+            // AE#140: an HLS playlist URL misrouted onto the raw-byte live path. A live origin serves the
+            // finite #EXTM3U body at HTTP 200 and closes the connection; the endless-feed reader then
+            // re-fetches that body forever. Those reconnects look PRODUCTIVE (a full body at 200, and every
+            // find_stream_info probe seek resets the unproductive streak via seekReconnect), so the #71
+            // give-up counters never trip, avformat_open_input never returns, and load() hangs with no
+            // terminal state. Fail closed here, before the reconnect loop is ever entered: a raw media
+            // container never begins with '#' (TS syncs on 0x47; MP4/MKV open with binary box/EBML markers),
+            // so an #EXTM3U prefix is an unambiguous misroute. The host is pointed at the HLS entry points.
+            if isLive, gotData, Self.bodyBeginsWithHLSPlaylistTag(firstWindowPrefix()) {
+                EngineLog.emit("[AVIOReader] HLS playlist body on the raw live path (AE#140); failing closed. Use LoadOptions.nativeRemoteHLS or HLSLiveIngestReader for m3u8 sources.", category: .demux)
+                markClosed()
+                close()
+                throw AVIOReaderError.hlsPlaylistOnRawLivePath
+            }
+            // AE#154: same classification on the non-live path. FFmpeg (--disable-network) can
+            // neither probe an m3u8 behind a custom pb (no extension / MIME hint reaches the hls
+            // probe) nor fetch a variant, so avformat_open_input dies with AVERROR_INVALIDDATA.
+            // Fail typed instead; load() reroutes the URL onto the native remote-HLS bypass.
+            if !isLive, gotData, Self.bodyBeginsWithHLSPlaylistTag(firstWindowPrefix()) {
+                EngineLog.emit("[AVIOReader] HLS playlist body on the VOD loopback path (AE#154); rerouting to the native remote-HLS bypass.", category: .demux)
+                markClosed()
+                close()
+                throw AVIOReaderError.hlsPlaylistOnVODPath
+            }
             var tookFallback = false
             if !isLive {
                 // Atomically decide, under winCond, whether the optimistic connection resolved
                 // a size; if not, abandon it (generation bump ignores a size landing in the
                 // race window). fileSize is read under the lock because the delegate thread now
                 // writes it (issue #70 review #4/#5).
-                let (haveSize, abandoned) = resolveOptimisticOpen()
+                let (haveSize, abandoned, abandonedTask, wasSuspended) = resolveOptimisticOpen()
+                if wasSuspended { abandonedTask?.resume() }
                 abandoned?.invalidateAndCancel()
                 if !haveSize {
                     // The data connection resolved no size (no-length origin, a transient 429,
@@ -436,6 +478,31 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return gotData
     }
 
+    /// Snapshot up to `max` leading bytes of the first window (open-time, before any read has consumed
+    /// it, so `winStart == 0`). winCond-guarded like every other window access. Used only by the AE#140
+    /// misroute check; returns [] if no data has arrived.
+    private func firstWindowPrefix(max: Int = 16) -> [UInt8] {
+        winCond.lock()
+        defer { winCond.unlock() }
+        let n = Swift.min(max, window.count)
+        return n > 0 ? Array(window.prefix(n)) : []
+    }
+
+    /// True when a body's leading bytes are the HLS playlist tag `#EXTM3U`, tolerating a UTF-8 BOM and
+    /// leading ASCII whitespace. A raw media container never opens with '#', so this is an unambiguous
+    /// signal that an m3u8 playlist was handed to the raw-byte reader (AE#140). Static + internal so the
+    /// classifier is unit-tested without a live origin.
+    static func bodyBeginsWithHLSPlaylistTag(_ bytes: [UInt8]) -> Bool {
+        var i = 0
+        if bytes.count >= 3, bytes[0] == 0xEF, bytes[1] == 0xBB, bytes[2] == 0xBF { i = 3 }
+        while i < bytes.count, bytes[i] == 0x20 || bytes[i] == 0x09 || bytes[i] == 0x0A || bytes[i] == 0x0D {
+            i += 1
+        }
+        let tag = Array("#EXTM3U".utf8)
+        guard bytes.count - i >= tag.count else { return false }
+        return Array(bytes[i..<(i + tag.count)]) == tag
+    }
+
     /// Under a single winCond critical section: snapshot whether the optimistic open-time
     /// connection resolved a size (fileSize > 0, written by the delegate thread in
     /// persistentReceivedResponse), and if not, atomically abandon that connection so the
@@ -443,18 +510,21 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// the read means a size that lands in the race window is ignored rather than racing a
     /// half-done teardown (issue #70 review #4/#5). Returns the session to cancel outside
     /// the lock. Demux thread, open-time only; leaves the AVIO context intact (unlike close()).
-    private func resolveOptimisticOpen() -> (haveSize: Bool, abandoned: URLSession?) {
+    private func resolveOptimisticOpen() -> (haveSize: Bool, abandoned: URLSession?, abandonedTask: URLSessionDataTask?, wasSuspended: Bool) {
         winCond.lock()
         defer { winCond.unlock() }
-        if fileSize > 0 { return (true, nil) }
+        if fileSize > 0 { return (true, nil, nil, false) }
         connGeneration &+= 1
         let session = activeSession
+        let task = activeTask
+        let suspended = persistentTaskSuspended
+        persistentTaskSuspended = false
         activeSession = nil
         activeTask = nil
         window = Data()
         connEnded = true
         winCond.broadcast()
-        return (false, session)
+        return (false, session, task, suspended)
     }
 
     // Close flags written on the teardown thread (markClosed / fullyClose) and read on the demux
@@ -544,11 +614,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // is released. Grab under winCond, invalidate outside it (mirrors close()).
         let session = activeSession
         let task = activeTask
+        let persistentWasSuspended = persistentTaskSuspended
+        persistentTaskSuspended = false
         activeSession = nil
         activeTask = nil
         connEnded = true
         winCond.broadcast()
         winCond.unlock()
+        if persistentWasSuspended { task?.resume() }
         task?.cancel()
         session?.invalidateAndCancel()
     }
@@ -598,17 +671,23 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         connGeneration &+= 1
         connEnded = true
         let session = activeSession
+        let task = activeTask
+        let persistentWasSuspended = persistentTaskSuspended
+        persistentTaskSuspended = false
         activeSession = nil
         activeTask = nil
         window = Data()
         winCond.broadcast()
         winCond.unlock()
+        if persistentWasSuspended { task?.resume() }
         session?.invalidateAndCancel()
     }
 
     // MARK: - Read (called by FFmpeg on demux thread)
 
-    fileprivate func read(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
+    // Internal (not fileprivate) so the #174 backpressure tests can drive the consumer
+    // side directly; production entry stays the C read callback below.
+    func read(into buf: UnsafeMutablePointer<UInt8>, size: Int32) -> Int32 {
         guard !isClosed else { return -1 }
         if readDeadlinePassedOrAborted { readDeadlineFired = true; return -1 }
         // Check usePersistentReader before isStreaming: live feeds without
@@ -834,8 +913,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             if readDeadlinePassedOrAborted { readDeadlineFired = true; return totalRead > 0 ? Int32(totalRead) : -1 }
 
             // #93/#96 residual: time the loop-head lock acquisition. A delegate thread holding winCond
-            // across its copy + backpressure window blocks the read HERE with nothing to show for it, so
-            // this turns that invisible wait into `lockWait=`.
+            // across its window copy blocks the read HERE with nothing to show for it, so this turns
+            // that invisible wait into `lockWait=`.
             let lockWaitStart = DispatchTime.now()
             winCond.lock()
             diag.recordLockWait(ms: msSince(lockWaitStart))
@@ -923,8 +1002,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 unproductiveReconnects = 0      // real progress
                 rateLimitStreak = 0             // real progress clears the 429 give-up streak (#71)
                 emitNetworkPhase(.flowing)      // recovered: source delivering again (#85)
-                winCond.broadcast()              // window may have shrunk: wake backpressure
+                // #174: resume the suspended transfer once the drain crosses lowWater.
+                var toResume: URLSessionDataTask?
+                if persistentTaskSuspended,
+                   window.count - max(0, Int(position - winStart)) <= Self.winLowWater {
+                    persistentTaskSuspended = false
+                    toResume = activeTask
+                }
+                winCond.broadcast()
                 winCond.unlock()
+                toResume?.resume()
                 continue
             }
 
@@ -967,6 +1054,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             }
 
             if !ended {
+                // #174: a suspended task never delivers; resume before waiting (mirrors
+                // readStreaming). Reached when a within-window forward seek lands at the
+                // frontier while the transfer is parked above lowWater.
+                if persistentTaskSuspended {
+                    persistentTaskSuspended = false
+                    let toResume = activeTask
+                    winCond.unlock()
+                    toResume?.resume()
+                    continue
+                }
                 // Wait for the live connection to fill forward. A false return
                 // means connStallTimeout elapsed with no data (socket stall).
                 let waitStart = DispatchTime.now()
@@ -1221,12 +1318,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         connStartedAt = DispatchTime.now()   // #93: time-to-first-data per generation
         connFirstDataSeen = false
         let oldSession = activeSession
+        let oldTask = activeTask
+        let oldSuspended = persistentTaskSuspended
+        persistentTaskSuspended = false
         activeSession = nil
         activeTask = nil
-        // Wake a backpressure-blocked old-gen delegate so it sees it is stale.
         winCond.broadcast()
         winCond.unlock()
 
+        // #174: balance a pending suspend before cancel (mirrors the streaming teardown).
+        if oldSuspended { oldTask?.resume() }
         oldSession?.invalidateAndCancel()
 
         if isClosed { return }
@@ -1273,8 +1374,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     }
 
     /// Force-copies `data` into the sliding window and applies backpressure by
-    /// blocking until the consumer drains below winHighWater. Force-copy releases
-    /// source dispatch_data per delivery (same leak control as the chunk path).
+    /// suspending the task once the window exceeds winHighWater (#174); readPersistent
+    /// resumes it when the consumer drains below winLowWater. Never blocks: parking this
+    /// delegate callback has no flow-control contract (TLS/H2 transports keep reading at
+    /// line rate into unbounded internal buffers, the #174 EXC_RESOURCE). Force-copy
+    /// releases source dispatch_data per delivery (same leak control as the chunk path).
     fileprivate func appendPersistentData(_ data: Data, generation: Int) {
         winCond.lock()
         guard generation == connGeneration, !isFullyClosed else {
@@ -1301,13 +1405,17 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         }
         addBytesFetched(count)
         winCond.broadcast()
-        // Backpressure: 0.2s timeout is belt-and-suspenders; correctness from broadcasts.
-        while generation == connGeneration && !isClosed {
-            let ahead = window.count - max(0, Int(position - winStart))
-            if ahead <= Self.winHighWater { break }
-            _ = winCond.wait(until: Date(timeIntervalSinceNow: 0.2))
+        // Deliveries already dispatched before the suspend takes effect still land here
+        // (flag already set, no double-suspend), so the window can overshoot highWater by
+        // the transport's in-flight amount; the suspend count stays balanced via the flag.
+        var toSuspend: URLSessionDataTask?
+        let ahead = window.count - max(0, Int(position - winStart))
+        if ahead > Self.winHighWater, !persistentTaskSuspended, !isClosed {
+            persistentTaskSuspended = true
+            toSuspend = activeTask
         }
         winCond.unlock()
+        toSuspend?.suspend()
         if let firstDataMs {
             // #93/#96 residual: a slow first-data gap is release-visible so a device trace can pair it
             // with the response-header timing above. Small header gap + large first-data gap = the body
@@ -2249,12 +2357,21 @@ enum AVIOReaderError: Error, CustomStringConvertible {
     case allocationFailed
     case noResponse
     case requestTimeout
+    /// AE#140: an HLS playlist body arrived on the raw-byte live reader (misroute). Surfaced to load()
+    /// so it can fail closed with a typed rejection instead of looping the endless-feed reconnect.
+    case hlsPlaylistOnRawLivePath
+    /// AE#154: an HLS playlist body arrived on the non-live loopback reader. FFmpeg (built with
+    /// --disable-network) can never demux it; surfaced to load() so it reroutes the source onto the
+    /// native remote-HLS bypass instead of dying with a bare AVERROR_INVALIDDATA.
+    case hlsPlaylistOnVODPath
 
     var description: String {
         switch self {
         case .allocationFailed: return "Failed to allocate AVIO buffer"
         case .noResponse: return "No response from server"
         case .requestTimeout: return "Request timed out"
+        case .hlsPlaylistOnRawLivePath: return "HLS playlist supplied to the raw live path"
+        case .hlsPlaylistOnVODPath: return "HLS playlist supplied to the VOD loopback path"
         }
     }
 }

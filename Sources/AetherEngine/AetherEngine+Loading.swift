@@ -110,7 +110,9 @@ extension AetherEngine {
                     self.state = .paused
                 }
                 // #127: replay the latest host seek that arrived while the item was pre-ready.
-                if ready, let pending = self.pendingPreReadySeekSeconds {
+                // #178: not while still .loading (autostart paths hold .loading past readiness);
+                // replaying now would just re-stash. The state didSet resolves that case.
+                if ready, self.state != .loading, let pending = self.pendingPreReadySeekSeconds {
                     self.pendingPreReadySeekSeconds = nil
                     EngineLog.emit("[AetherEngine] replaying deferred pre-ready seek to \(String(format: "%.2f", pending))s (#127)", category: .engine)
                     Task { @MainActor in await self.seek(to: pending) }
@@ -128,8 +130,12 @@ extension AetherEngine {
     }
 
     /// Lean native-HLS live path: AVPlayerItem from the remote URL on the reused NativeAVPlayerHost. No Demuxer, no HLSVideoEngine, no loopback, no display-criteria handshake (AVKit drives match-content). Live-window surfaces come from `host.seekableEnd`.
-    func loadRemoteHLS(url: URL, options: LoadOptions) async throws {
+    /// `startPosition` (AE#154): resume anchor for VOD playlists on the loopback reroute; nil keeps
+    /// the historical no-initial-seek behavior every live caller relies on.
+    func loadRemoteHLS(url: URL, options: LoadOptions, startPosition: Double? = nil) async throws {
         playbackBackend = .native
+        // #168 follow-up: detect a superseding load()/stop() between the carriage verdict and the reroute.
+        let bypassGeneration = loadGeneration
 
         let host: NativeAVPlayerHost
         if let existing = nativeHost {
@@ -174,6 +180,35 @@ extension AetherEngine {
                 self?.renderedPositionMirror.set(value)
             }
             .store(in: &nativeCancellables)
+        // #168: mirror the item's parsed dynamic range into the published format AND program the panel.
+        // This bypass runs no libav probe, so without this both fields stayed at the `.sdr` reset default
+        // even for HDR10 / Dolby Vision streams (the reporter's `fmt=sdr` on 4K50 HDR10), and more
+        // importantly nothing ever programmed preferredDisplayCriteria, so an HDR item was handed to a bare
+        // AVPlayerLayer with the panel in SDR and AVPlayer presented no video (audio-only, black).
+        // sourceVideoFormat = what the stream carries; videoFormat = the effective badge.
+        host.$detectedVideoFormat
+            .compactMap { $0 }
+            .sink { [weak self] fmt in
+                guard let self else { return }
+                self.sourceVideoFormat = fmt
+                self.videoFormat = fmt
+                if let rate = self.nativeHost?.detectedVideoFrameRate { self.sourceVideoFrameRate = rate }
+                self.applyRemoteHLSDisplayCriteria(format: fmt, options: options)
+            }
+            .store(in: &nativeCancellables)
+        // #168 follow-up: an advertised video rendition that never builds an item track means HEVC carried
+        // in MPEG-TS segments, which AVFoundation's HLS demuxer does not support (audio-only, black). The
+        // loopback ingest remuxes TS to fMP4 and plays the same stream, so reroute there transparently.
+        host.$remoteHLSVideoCarriageRejected
+            .filter { $0 }
+            .prefix(1)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                Task { @MainActor in
+                    await self.rerouteRemoteHLSOntoLiveIngest(url: url, expectedGeneration: bypassGeneration)
+                }
+            }
+            .store(in: &nativeCancellables)
         startLiveWindowTimer(host: host)
         // settlePausedAtReadiness off when autostarting: the terminal host.play() runs, so readyToPlay is only a waypoint. Flipping to .paused here would drop the spinner during Jellyfin's ~10 s transcode spin-up. timeControlStatus sink holds .loading until AVPlayer renders.
         // #124: a paused mount (autoplay=false) skips that play(), so the readiness sink settles .loading -> .paused.
@@ -216,14 +251,24 @@ extension AetherEngine {
         // User-Agent / Authorization headers, so LoadOptions.httpHeaders rides into the AVURLAsset (#119).
         // forwardBufferDuration: 0 = system-adaptive; the 4 s VOD floor caused a 3-4 s black screen on live startup.
         host.load(url: url,
-                  startPosition: nil,
+                  startPosition: startPosition,
                   perFrameHDR: true,
-                  skipInitialSeek: true,
+                  // AE#154: a VOD resume anchor seeks; nil keeps the live no-initial-seek contract.
+                  skipInitialSeek: startPosition == nil,
                   forwardBufferDuration: 0,
                   // This lean path has no live-reopen / readiness watchdog; let AVPlayer's "gave up"
                   // signal surface a dead upstream (segment 404 / token expiry) so the host can retune.
                   surfaceEndFailures: true,
-                  httpHeaders: options.httpHeaders)
+                  httpHeaders: options.httpHeaders,
+                  // #168 follow-up: live-only (VOD remote HLS is the AE#154 reroute target; ingesting it
+                  // back would ping-pong), and hosts can opt out via LoadOptions.
+                  armVideoCarriageWatchdog: RemoteHLSIngestFallback.shouldArm(
+                      isLive: options.isLive, fallbackEnabled: options.nativeRemoteHLSIngestFallback))
+
+        // AE#154: surface the item's legible AVMediaSelectionGroup as `subtitleTracks` so hosts with
+        // their own picker see the external WebVTT renditions AVPlayer renders on this bypass.
+        // Selection routes back through `selectSubtitleTrack(index:)` / `clearSubtitle()`.
+        publishRemoteHLSSubtitleTracks(host: host)
 
         // VOD path triggers play() at the tail of load(); this lean path early-returns, so self-start here. AVKit drives match-content; automaticallyWaitsToMinimizeStalling handles play-before-ready. Without this call the item reaches readyToPlay but timeControlStatus stays .paused.
         // State stays .loading; flips to .playing only when timeControlStatus sink sees AVPlayer rendering.
@@ -233,6 +278,56 @@ extension AetherEngine {
         }
         startMemoryProbe()
         // No startLiveTelemetrySampler: all sampler counters read the loopback pipeline (demuxer / producer / cache / server), none of which exists on this bypass.
+    }
+
+    /// #168: program `preferredDisplayCriteria` for an HDR range detected on the probe-free nativeRemoteHLS
+    /// bypass. The loopback path applies criteria before item load from its libav probe; this path has no
+    /// probe, so it applies late, once AVPlayer's parsed video-track format resolves the range. Without the
+    /// panel switch a bare AVPlayerLayer presents no HDR video (audio-only, black; the reporter's symptom).
+    /// SDR needs no switch, and a sole-writer host (`suppressDisplayCriteria`) is left untouched. No-op off
+    /// tvOS (apply() returns .applied there) and where Match Content is off (apply() skips the write).
+    @MainActor
+    private func applyRemoteHLSDisplayCriteria(format: VideoFormat, options: LoadOptions) {
+        guard RemoteHLSFormatDetection.shouldApplyDisplayCriteria(
+            format: format, suppressDisplayCriteria: options.suppressDisplayCriteria) else { return }
+        _ = displayCriteria.apply(
+            format: format,
+            frameRate: nativeHost?.detectedVideoFrameRate,
+            codecTag: nil,
+            omitColorExtensions: options.omitCriteriaColorExtensions
+        )
+    }
+
+    /// AetherEngine#168 follow-up: reload the current live remote-HLS source through the loopback ingest
+    /// path (`HLSLiveIngestReader` remuxes TS to fMP4), because AVPlayer reached readyToPlay without ever
+    /// building a video track for a master that advertises one (HEVC-in-MPEG-TS carriage). The rerouted
+    /// session runs the full loopback pipeline, including the probe-time display-criteria handshake the
+    /// bypass lacks. `LoadOptions.httpHeaders` ride onto the ingest fetches so header-enforcing origins
+    /// keep working (#119). The generation guard drops a verdict that a newer load()/stop() has outrun.
+    @MainActor
+    private func rerouteRemoteHLSOntoLiveIngest(url: URL, expectedGeneration: UInt64) async {
+        guard loadGeneration == expectedGeneration else {
+            EngineLog.emit("[AetherEngine] #168: ingest reroute dropped (session superseded)", category: .engine)
+            return
+        }
+        EngineLog.emit(
+            "[AetherEngine] #168: nativeRemoteHLS built no video track for a master that advertises video; "
+            + "rerouting onto the live-ingest loopback path (TS -> fMP4 remux)",
+            category: .engine
+        )
+        // #199: remember the verdict so the next load of this master (host retune after an ingest
+        // death, zap-back) skips the doomed native mount and its watchdog grace entirely.
+        rerouteVerdictMemory.record(url, now: Date())
+        var options = loadedOptions
+        options.nativeRemoteHLS = false
+        let reader = HLSLiveIngestReader(playlistURL: url, httpHeaders: options.httpHeaders)
+        do {
+            _ = try await load(source: .custom(reader, formatHint: "mpegts"), options: options)
+        } catch is CancellationError {
+        } catch {
+            // load() has already surfaced .error state on its failure paths; nothing to add here.
+            EngineLog.emit("[AetherEngine] #168: ingest reroute load failed: \(error)", category: .engine)
+        }
     }
 
     func loadNative(
@@ -250,11 +345,34 @@ extension AetherEngine {
         preopenedDemuxer: Demuxer? = nil,
         generation: UInt64
     ) async throws {
-        // Both values are set by the reader's resolver before any main-stream byte flows, so they are final by the time loadNative runs.
-        // HLSVideoEngine uses liveSourceCadenceHint for playlist shaping (TARGETDURATION floor, blocking-reload eligibility).
-        // companionAudioReader: side demuxer for demuxed-audio ingest; nil means muxed audio.
-        let liveSourceCadenceHint = (customReader as? LiveIngestSourceInfo)?.upstreamTargetDuration
-        let companionAudioReader = (customReader as? LiveIngestSourceInfo)?.companionAudioReader
+        // companionAudioReader is set by the reader's resolver before any main-stream byte flows, so it is
+        // final by the time loadNative runs; nil means muxed audio.
+        let liveIngest = customReader as? LiveIngestSourceInfo
+        let companionAudioReader = liveIngest?.companionAudioReader
+        // Observed-cadence closure for live-ingest LL-HLS shaping (AetherEngine#167): read per manifest
+        // render, so the engine reacts to how the origin ACTUALLY delivers segments rather than trusting its
+        // self-reported TARGETDURATION. weak so it never retains the host-owned reader past teardown. The
+        // self-reported TARGETDURATION rides along only as a valid lower bound on the floor.
+        let liveCadenceObservation: (@Sendable () -> Double?)?
+        if let liveIngest {
+            liveCadenceObservation = { [weak liveIngest] in liveIngest?.observedLiveCadenceSeconds }
+        } else {
+            liveCadenceObservation = nil
+        }
+        let initialTargetDurationFloor = liveIngest?.upstreamTargetDuration
+        // #199: in-engine reopen transport for live ingest sessions. Only HLSLiveIngestReader main
+        // readers are reconstructible blind (immutable URL + headers, hint always "mpegts"); the
+        // demuxed-audio shape is excluded because a reopen would also have to rebuild the side audio
+        // demuxer over the fresh companion. Other custom readers (disc, SMB) have no transport and
+        // keep the host-retune contract.
+        let ingestReopenFactory: HLSVideoEngine.CustomSourceReopenFactory?
+        if isLive, let ingestReader = customReader as? HLSLiveIngestReader, companionAudioReader == nil {
+            ingestReopenFactory = {
+                ingestReader.makeFreshMainReader().map { (reader: $0 as IOReader, formatHint: "mpegts") }
+            }
+        } else {
+            ingestReopenFactory = nil
+        }
         let session = HLSVideoEngine(
             url: url,
             sourceHTTPHeaders: sourceHTTPHeaders,
@@ -267,9 +385,15 @@ extension AetherEngine {
             audioBridgeMode: audioBridgeMode,
             isLiveSession: isLive,
             dvrWindowSeconds: dvrWindowSeconds,
-            liveSourceCadenceHint: liveSourceCadenceHint,
+            // AE#195/#208: the session resolves the cut target and enables the bounded first-manifest
+            // path only for the host's explicit fastZap profile.
+            liveJoinProfile: loadedOptions.liveJoinProfile,
+            blockingReloadOverride: loadedOptions.liveBlockingReload,
+            liveCadenceObservation: liveCadenceObservation,
+            initialTargetDurationFloor: initialTargetDurationFloor,
             preopenedDemuxer: preopenedDemuxer,
             sourceReopenableByURL: !isCustomSource,
+            customSourceReopenFactory: ingestReopenFactory,
             companionAudioReader: companionAudioReader,
             // Caller-bounded probe budget (#68) for the fallback open / live reopen; the happy path reuses preopenedDemuxer.
             probesize: loadedOptions.probesize,
@@ -455,7 +579,14 @@ extension AetherEngine {
         // Rendition metadata built ONCE (unique NAMEs + FORCED); the published track list and the
         // master's EXT-X-MEDIA tags must agree, and duplicate names collapse AVFoundation's
         // legible options (device: 3 declared renditions, 2 options, wrong-language selection).
-        let renditionInfos = Self.nativeSubtitleRenditionInfos(for: nativeSubtitleTrackTable)
+        // Phase D: bitmap tracks (PGS/DVB/DVD) become OCR-fed renditions, appended AFTER the
+        // text and CC entries so existing ordinals stay byte-stable. Unique NAMEs are computed
+        // over text+bitmap together: a same-language pair must get the numbered suffix, or
+        // AVFoundation collapses the legible options.
+        let bitmapEntries = Self.bitmapOCRSubtitleEntries(from: subtitleTracks, isLive: loadedOptions.isLive)
+        let combinedInfos = Self.nativeSubtitleRenditionInfos(for: nativeSubtitleTrackTable + bitmapEntries)
+        let renditionInfos = Array(combinedInfos.prefix(nativeSubtitleTrackTable.count))
+        let bitmapInfos = Array(combinedInfos.suffix(bitmapEntries.count))
         nativeSubtitleTracks = renditionInfos.enumerated().map { ordinal, info in
             NativeSubtitleTrack(ordinal: ordinal, language: info.language, displayName: info.name)
         }
@@ -466,13 +597,15 @@ extension AetherEngine {
         // after a no-reprobe reload (e.g. an audio switch), a plain codec match here would flip
         // this true and arm a #98 rendition bound to nonexistent stream 99608.
         let hasCC608 = demuxableClosedCaptionTrack != nil
-        session.enableNativeSubtitleTrackForSession = loadedOptions.prepareNativeSubtitles && (hasTextSubtitleTrack || hasCC608)
+        let hasBitmapOCRTrack = !bitmapEntries.isEmpty
+        session.enableNativeSubtitleTrackForSession = loadedOptions.prepareNativeSubtitles
+            && (hasTextSubtitleTrack || hasCC608 || hasBitmapOCRTrack)
         // Sodalite#32 Phase 2: tap decoders honor the host's markup preference (overlay renders styled
         // ASS; the WebVTT rendition strips at serve). #112 rework: the overlay itself is fed by the
         // packet-store drainer, not by tap-event forwarding.
         session.preserveASSMarkupForSubtitleTap = loadedOptions.preserveASSMarkup
         session.teletextPageForSubtitleTap = loadedOptions.teletextPage
-        EngineLog.emit("[AetherEngine] native subtitles: prepare=\(loadedOptions.prepareNativeSubtitles) eager=\(loadedOptions.eagerNativeSubtitleReaders) textTracks=\(nativeSubtitleTrackTable.count) enable=\(session.enableNativeSubtitleTrackForSession)", category: .engine)
+        EngineLog.emit("[AetherEngine] native subtitles: prepare=\(loadedOptions.prepareNativeSubtitles) eager=\(loadedOptions.eagerNativeSubtitleReaders) textTracks=\(nativeSubtitleTrackTable.count) bitmapOCR=\(bitmapEntries.count) enable=\(session.enableNativeSubtitleTrackForSession)", category: .engine)
 
         // #77: arm the in-band CC tap before start() so the first producer keeps the CC stream.
         setupClosedCaptionTapIfNeeded(session: session)
@@ -480,7 +613,8 @@ extension AetherEngine {
         // #15: create the native subtitle cue stores BEFORE start() so the VideoSegmentProvider receives the
         // references at init (the WebVTT rendition master tags + /subs endpoints read them; readers fill them
         // lazily on selection). The shift is applied after start() once the playlist shift is known.
-        if session.enableNativeSubtitleTrackForSession, (!nativeSubtitleTrackTable.isEmpty || hasCC608) {
+        if session.enableNativeSubtitleTrackForSession,
+           (!nativeSubtitleTrackTable.isEmpty || hasCC608 || hasBitmapOCRTrack) {
             session.nativeSubtitleCueStoresForSession = nativeSubtitleTrackTable.map { _ in NativeSubtitleCueStore() }
             session.nativeSubtitleLanguagesForSession = nativeSubtitleTrackTable.map { $0.language }
             session.nativeSubtitleRenditionInfosForSession = renditionInfos
@@ -519,6 +653,20 @@ extension AetherEngine {
                 nativeSubtitleTracks.append(
                     NativeSubtitleTrack(ordinal: ccOrdinal, language: ccTrack.language, displayName: ccName))
             }
+            // Phase D: append the bitmap OCR renditions last. Stores stay empty until the OCR
+            // worker (embedded) or the sidecar OCR fill (external .sup) recognizes cues. The tap
+            // index is nil ON PURPOSE: the pump tap decodes inline on the pump thread, where
+            // bitmap decode + OCR must never run; the worker reads the packet store instead.
+            for (i, entry) in bitmapEntries.enumerated() {
+                let ordinal = session.nativeSubtitleCueStoresForSession.count
+                session.nativeSubtitleCueStoresForSession.append(NativeSubtitleCueStore())
+                session.nativeSubtitleLanguagesForSession.append(entry.language)
+                session.nativeSubtitleRenditionInfosForSession.append(bitmapInfos[i])
+                session.nativeSubtitleSourceStreamIndicesForSession.append(nil)
+                nativeSubtitleTrackTable.append(entry)
+                nativeSubtitleTracks.append(NativeSubtitleTrack(
+                    ordinal: ordinal, language: entry.language, displayName: bitmapInfos[i].name))
+            }
             // Sodalite#32: with eager readers the whole cue set is available up front, so serve the rendition as
             // one whole-program .vtt (the AVPlayer-reliable shape). VOD only (a live program has no fixed end).
             // Sodalite#32: whole-program renders reliably but is anchored to the stream start, so it breaks on
@@ -539,23 +687,19 @@ extension AetherEngine {
         var playbackURL = try await Task.detached(priority: .userInitiated) { [session] in
             try session.start()
         }.value
-        #if os(iOS)
-        // AirPlay (#86): while external playback is active, serve the loopback over the device's LAN IP and
-        // force the media playlist, so the receiver reaches the engine-processed stream (DV/Atmos/subtitles
-        // preserved) and isn't handed a DV/HDR master it rejects on an SDR panel (DrHurt). Reverts on the
-        // reload when AirPlay ends.
-        if airPlayActive, let lanURL = airPlayPlaybackURL(base: playbackURL) {
-            EngineLog.emit("[AirPlay] loadNative serving via \(lanURL.absoluteString)", category: .engine)
-            playbackURL = lanURL
-        }
-        #endif
+        // AirPlay (#86): while external playback is active, serve the loopback over the device's LAN IP so
+        // the receiver reaches the engine-processed stream (DV/Atmos/subtitles preserved). An HDR/DV master
+        // is downgraded to the media playlist there (an SDR receiver rejects it, DrHurt); an SDR master is
+        // kept so its subtitle renditions survive the trip (#227). Reverts on the reload when AirPlay ends.
+        let served = airPlayAdjustedPlayback(url: playbackURL, session: session)
+        playbackURL = served.url
         // Superseded while starting: stop and unwind before touching shared state.
         if loadGeneration != generation {
             session.stop()
             try checkLoadCurrent(generation)
         }
         self.nativeVideoSession = session
-        nativeSubtitleRenditionsServed = session.servingMasterPlaylist
+        nativeSubtitleRenditionsServed = served.subtitleRenditionsServed
         extractorYieldState.activate(session: session)
 
         // #15: the stores were created before start() (above) so the VideoSegmentProvider got the references at
@@ -631,12 +775,17 @@ extension AetherEngine {
                 // reaches its neighbourhood) or goes stale (organic progress far from it, i.e.
                 // AVPlayer abandoned the seek and playback runs elsewhere).
                 if let pending = self.pendingRecoverySeekClockTarget {
-                    if !self.settleRecoveryClockIfRenderedTargetLanded(
+                    if self.settleRecoveryClockIfRenderedTargetLanded(
                         rendered: value,
                         shift: shift,
                         completionRenderedTimePublished:
                             self.nativeHost?.latestSeekRenderedTimePublished ?? false
                     ) {
+                        // A late landing settled the clock onto the target; if the deadline loop held the
+                        // clock at the target and returned without finalizing (slow-source spinner path),
+                        // leave `.seeking` now that the frame is presented.
+                        self.finalizeLateRecoverySeekLanding()
+                    } else {
                         let prev = self.lastRenderedForPendingSeek
                         if value > prev, value - prev < 1.0 {
                             self.pendingSeekProgressAccum += (value - prev)
@@ -648,6 +797,14 @@ extension AetherEngine {
                                     category: .engine
                                 )
                                 self.setPendingRecoverySeekTarget(nil)
+                                // Deliberately does NOT finalize the programmatic seek here. This branch
+                                // only proves "organic playback moved on", which is also true while a seek
+                                // is legitimately still suspended in its initial budget or an extension
+                                // window (a slow source drains the old-position buffer for seconds while
+                                // the seek is pending). Clearing `programmaticSeekInFlight` from here would
+                                // drop `isSeeking` and the host's spinner mid-recovery, and the loop's own
+                                // idempotent clear means it would never come back. The deadline loop owns
+                                // that state on every one of its exits, including the parked give-up.
                             }
                         }
                         self.lastRenderedForPendingSeek = value
@@ -656,13 +813,15 @@ extension AetherEngine {
                 // #65: mirror AVPlayer's rendered (playlist-axis) position for off-main wedge re-anchoring.
                 self.renderedPositionMirror.set(value)
                 self.clock.sourceTime = value + shift
-                // bufferedPosition = the disk SegmentCache read-ahead frontier (origin -> disk), which is
-                // what the Network Buffer setting controls, expressed on the display axis as the playhead
-                // plus the seconds of contiguously cached-ahead content. Replaces AVPlayer's shallow ~4 s
+                // bufferedPosition = the end of the contiguous safe range (origin -> disk), expressed on
+                // the display axis as the playhead plus contiguously available seconds ahead of it: the
+                // segments AVPlayer already fetched, plus the disk SegmentCache band above them, which is
+                // what the Network Buffer setting controls. Replaces AVPlayer's shallow ~4 s
                 // loadedTimeRanges end (pinned by preferredForwardBufferDuration), which did not move with
                 // the setting. readAhead >= 0 keeps the #54 contract that bufferedPosition never trails the
                 // rendered frame. Drawn against the 0-based duration, so map onto the display axis to keep
-                // the buffer bar aligned with currentTime (0 off disc). AE#105. See docs issue #33 follow-up.
+                // the buffer bar aligned with currentTime (0 off disc). AE#105, #207 follow-up.
+                // See docs issue #33 follow-up.
                 let renderedDisplay = PresentationAxis.display(
                     sourcePTS: value + shift, origin: self.sourcePresentationOrigin)
                 let readAhead = self.nativeVideoSession?
@@ -826,25 +985,44 @@ extension AetherEngine {
         // forwardBufferDuration default (4 s): deep buffer lets AVPlayer race to the live edge and hit the transcode warm-up gap head-on (-12888); 4 s PACES consumption. Verified: 8 s worsened startup pause (8-10 s vs ~1 s).
         // Live REJOIN: skip initial seek so AVPlayer picks edge-minus-holdback instead; seek-to-0 against the re-served backlog wedged the reloaded item in waitingToPlay (device repro: tvOS 26, Jellyfin stream.ts). See LiveReloadPolicy.
         lastNativeVideoStartPosition = startPosition ?? 0
+        // AE#158: consume-and-reset so only the load() that armed the handover swaps in place; audio-switch
+        // and recovery reloads keep their own contracts.
+        let inPlaceHandover = pendingInPlaceItemHandover
+        pendingInPlaceItemHandover = false
         host.load(url: playbackURL,
                   startPosition: startPosition,
                   perFrameHDR: true,
                   skipInitialSeek: LiveReloadPolicy.skipInitialSeek(
-                      isLive: isLive, isRejoin: liveRejoin))
+                      isLive: isLive, isRejoin: liveRejoin),
+                  inPlaceSwap: inPlaceHandover)
         forceNativeLegibleDeselectedUntilHostSelects()
     }
 
     /// Activate AVAudioSession for renderer paths (SoftwarePlaybackHost, audio hosts) that have no AVPlayerViewController. Native path deliberately skips this: AVKit activates per playback so tvOS can auto-negotiate the HDMI route (issue #24).
-    private func activateRendererAudioSession() {
+    private func activateRendererAudioSession(audioSourceStreamIndex: Int32? = nil) {
         #if os(iOS) || os(tvOS)
         let session = AVAudioSession.sharedInstance()
         do { try session.setActive(true) }
         catch {
             EngineLog.emit("[AetherEngine] activateRendererAudioSession error: \(error)", category: .engine)
         }
+        
+        // Resolve the active audio track's channel count from the already-published track list.
+        // so the HDMI / AirPlay link negotiates at the correct channel count.
+        // Accept an explicit stream index parameter because during a reload (track change)
+        // `activeAudioTrackIndex` is temporarily nil (cleared by stopInternal), so the
+        // published property cannot be relied on here.
+        let lookupIndex = audioSourceStreamIndex.flatMap { Int(exactly: $0) } ?? activeAudioTrackIndex
+        let sourceChannels: Int? = if let index = lookupIndex, let track = audioTracks.first(where: { $0.id == index }), track.channels > 0 {
+            track.channels
+        } else {
+            nil
+        }
+        
         let maxCh = session.maximumOutputNumberOfChannels
-        if maxCh > 2 { try? session.setPreferredOutputNumberOfChannels(maxCh) }
-        EngineLog.emit("[AetherEngine] renderer audio session active: maxChannels=\(maxCh) preferred=\(session.preferredOutputNumberOfChannels) output=\(session.outputNumberOfChannels)", category: .engine)
+        let prefCh = min(sourceChannels ?? maxCh, maxCh)
+        try? session.setPreferredOutputNumberOfChannels(prefCh) 
+        EngineLog.emit("[AetherEngine] renderer audio session active: sourceCh=\(sourceChannels?.formatted() ?? "unknown") maxChannels=\(maxCh) preferred=\(session.preferredOutputNumberOfChannels) output=\(session.outputNumberOfChannels)", category: .engine)
         #endif
     }
 
@@ -858,7 +1036,26 @@ extension AetherEngine {
         preopenedDemuxer: Demuxer?,
         generation: UInt64
     ) async throws {
-        activateRendererAudioSession()
+        let deinterlaceMode = loadedOptions.deinterlaceMode
+        let waitStarted = DispatchTime.now()
+        if let outcome = await DeinterlaceHardwareWarmup.shared.waitIfNeeded(
+            for: deinterlaceMode
+        ) {
+            try checkLoadCurrent(generation)
+            let elapsed = Double(
+                DispatchTime.now().uptimeNanoseconds - waitStarted.uptimeNanoseconds
+            ) / 1_000_000_000
+            if elapsed >= 0.05 {
+                EngineLog.emit(
+                    "[AetherEngine] software load waited "
+                    + "\(String(format: "%.3f", elapsed))s for hardware "
+                    + "deinterlace warm-up (\(outcome.rawValue))",
+                    category: .swPlayback
+                )
+            }
+        }
+
+        activateRendererAudioSession(audioSourceStreamIndex: audioSourceStreamIndex)
         let host = SoftwarePlaybackHost()
         host.deinterlaceConfig = DeinterlaceConfig(
             mode: loadedOptions.deinterlaceMode,
@@ -872,6 +1069,17 @@ extension AetherEngine {
             self?.publishLiveWindow(edgeSessionTime: edge)
         }
         self.softwareHost = host
+        // SW-PiP: publish the bridge once the session owns its layer (the layer object is stable for
+        // the session; the host attaches it to the view and, on PiP start, to the system window).
+        softwarePiPSource = SoftwarePiPSource(layer: host.displayLayer, isLive: isLive, engine: self)
+        // SW-PiP Phase C: mirror the published cues (primary + secondary) into the renderer's frame
+        // compositor; the PiP flag gates actual drawing (fullscreen stays host-overlay-only).
+        Publishers.CombineLatest($subtitleCues, $secondarySubtitleCues)
+            .sink { [weak self, weak host] primary, secondary in
+                guard let self, let host else { return }
+                host.updateSubtitleCompositor(cues: primary + secondary, enabled: self.pictureInPictureActive)
+            }
+            .store(in: &softwareCancellables)
         // #131: no demuxable CC track on the SW path either: arm an A53 tap fed by decoded-frame
         // side data. Same lazy synthetic-track surfacing as the producer path.
         // Same synthetic-entry exclusion as setupClosedCaptionTapIfNeeded (via `demuxableClosedCaptionTrack`):
@@ -973,7 +1181,7 @@ extension AetherEngine {
         preopenedDemuxer: Demuxer?,
         generation: UInt64
     ) async throws {
-        activateRendererAudioSession()
+        activateRendererAudioSession(audioSourceStreamIndex: audioSourceStreamIndex)
         let host = AudioPlaybackHost()
         self.audioHost = host
         applyDesiredVolume(to: host)
@@ -1089,6 +1297,7 @@ extension AetherEngine {
         let sideTracks = session.companionAudioTracks
         if !sideTracks.isEmpty {
             audioTracks = sideTracks
+            applyConfirmedAtmos()   // #214 follow-up: a whole-list swap must not drop confirmed JOC
         }
         let active = session.activeAudioSourceStreamIndex
         let resolved: Int? = active >= 0 ? Int(active) : nil
@@ -1125,6 +1334,13 @@ extension AetherEngine {
         let sidecarToResume: URL? = isSubtitleActive && activeEmbeddedSubtitleStreamIndex < 0
             ? loadedSidecarURL
             : nil
+        // #170: stopInternal wipes the native-rendition pick; snapshot it for a post-reload
+        // replay (mirroring the #65 recovery), or an audio switch during PiP/AirPlay strands
+        // the receiver without subtitles. The active track id also routes an external (#88)
+        // selection back through its synthetic id (the registry survives stopInternal here).
+        let activeTrackToResume = activeSubtitleTrackIndex
+        let reapplyOrdinalToRestore = nativeSubtitleReapplyOrdinal
+        let reapplyMatchesActiveTrack = currentReapplyOrdinalMatchesActiveTrack()
         // #112 full umbau: an audio-track switch does not move the playhead, so the PGS line already on screen is
         // still valid. Snapshot the visible bitmap cues before stopInternal wipes them; they are restored after the
         // subtitle re-arm so the line stays up while the re-armed reader re-primes forward (old path reconstructed
@@ -1353,6 +1569,7 @@ extension AetherEngine {
             // not reconcile tracks post-load, needs the probe-derived lists re-applied here.
             if wasOnSoftwarePath {
                 audioTracks = reopenedAudioTracks
+                applyConfirmedAtmos()   // #214 follow-up: a title switch re-applies probe lists
                 subtitleTracks = reopenedSubtitleTracks
             }
         } else {
@@ -1361,7 +1578,14 @@ extension AetherEngine {
 
         // Re-arm subtitle: sidecar branch wins because loadedSidecarURL is set only for sidecar sources.
         if let sidecar = sidecarToResume {
-            selectSidecarSubtitle(url: sidecar)
+            // #170: an active external track (#88) re-arms through its synthetic id so the
+            // published selection stays on the track (the registry survives stopInternal on this
+            // path); one-shot sidecar selections keep the URL-only route.
+            if let active = activeTrackToResume, externalSubtitleRegistry[active] != nil {
+                selectSubtitleTrack(index: active, startAt: preSwitchSourceTime)
+            } else {
+                selectSidecarSubtitle(url: sidecar)
+            }
         } else if embeddedStreamToResume >= 0 {
             // #112 (audio-switch reanchor): pass the pre-stopInternal source PTS explicitly; the parameterless form
             // reads the live sourceTime, which has collapsed to the playlist axis here (shift reset, not yet
@@ -1379,6 +1603,22 @@ extension AetherEngine {
         } else if secondaryEmbeddedToResume >= 0 {
             // #112 (audio-switch reanchor): same collapsed-sourceTime slip on the secondary channel.
             selectSecondarySubtitleTrack(index: Int(secondaryEmbeddedToResume), startAt: preSwitchSourceTime)
+        }
+        // #170: replay the native-rendition pick onto the rebuilt item, the way the #65 recovery
+        // does; the table was rebuilt from the preserved track list, so a rendering-derived
+        // ordinal recomputes to the same rendition and a host-positional one replays as-is.
+        if let ordinal = Self.nativeOrdinalToReplay(
+            previousOrdinal: reapplyOrdinalToRestore,
+            matchesActiveTrack: reapplyMatchesActiveTrack,
+            previousActiveTrack: activeTrackToResume,
+            currentOrdinal: nativeSubtitleReapplyOrdinal,
+            table: nativeSubtitleTrackTable
+        ) {
+            EngineLog.emit(
+                "[AetherEngine] #170 re-applying native subtitle ordinal=\(ordinal) after audio-switch reload",
+                category: .engine
+            )
+            setNativeSubtitleSelected(track: ordinal)
         }
     }
 
