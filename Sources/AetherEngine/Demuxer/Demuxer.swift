@@ -41,6 +41,20 @@ struct DemuxerOpenProfile: Sendable {
     /// ~300 ms). nil keeps the open-ended behaviour for every other path (playback streams from 0).
     var boundedInitialFetch: Int64? = nil
 
+    /// #240: what to call this demuxer's network reader in the log. Several readers run against the
+    /// same origin at once (the pump, the subtitle forward prefetcher, the native subtitle readers),
+    /// and a connection line without a name cannot say which one opened it: the reporter of #240 read
+    /// one reader's generation counter as several concurrent connections, because nothing in the line
+    /// distinguished them. Defaults to the pump, since every other path builds its profile explicitly.
+    var readerLabel: String = "pump"
+
+    /// A copy of `self` under a different reader name, for two call sites that share a profile.
+    func withReaderLabel(_ label: String) -> DemuxerOpenProfile {
+        var copy = self
+        copy.readerLabel = label
+        return copy
+    }
+
     static let playback = DemuxerOpenProfile(
         probesize: 50 * 1024 * 1024,
         maxAnalyzeDuration: 60 * 1_000_000,
@@ -58,7 +72,8 @@ struct DemuxerOpenProfile: Sendable {
         avioChunkSize: 1 * 1024 * 1024,
         avioRequestTimeout: 8,
         avioMaxRetries: 1,
-        skipStreamInfo: false
+        skipStreamInfo: false,
+        readerLabel: "extract"
     )
 
     /// A copy of `self` with only the open-time probe budget overridden (#68).
@@ -116,6 +131,7 @@ struct DemuxerOpenProfile: Sendable {
         let analyze = min(callerMaxAnalyzeDuration ?? analyzeCeiling, analyzeCeiling)
         var profile = playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: analyze)
         profile.skipStreamInfo = true
+        profile.readerLabel = "subs"
         return profile
     }
 
@@ -170,6 +186,13 @@ public final class Demuxer: @unchecked Sendable {
     /// Jellyfin transcode respawn. See `AVIOReader.lastUnplannedReconnectAt`.
     var lastUnplannedSourceReconnectAt: Date? {
         (avioProvider as? AVIOReader)?.lastUnplannedReconnectAt
+    }
+
+    /// #220: sliding-window snapshot of this demuxer's network reader, nil for disc / custom /
+    /// file providers that have no window. Surfaced per demuxer (pump and subtitle side reader
+    /// are separate readers against the same origin) in the periodic memprobe.
+    var ioWindowDiagnostics: (windowBytes: Int, aheadBytes: Int, suspended: Bool, postSuspendBytes: Int64)? {
+        (avioProvider as? AVIOReader)?.windowDiagnostics
     }
 
     /// Forwarded to the playback `AVIOReader` so source stall/reconnect transitions reach the engine (#85).
@@ -365,6 +388,7 @@ public final class Demuxer: @unchecked Sendable {
         let reader = AVIOReader(
             url: url,
             extraHeaders: extraHeaders,
+            label: openProfile.readerLabel,
             chunkSize: openProfile.avioChunkSize,
             prefetchEnabled: openProfile.avioPrefetch,
             isLive: isLive,
@@ -411,6 +435,10 @@ public final class Demuxer: @unchecked Sendable {
         formatContext = ctxPtr  // avformat_open_input may reallocate
 
         try probeStreams(ctxPtr!)
+        // #281: every parse seek this open performs has happened by now, so the provider can drop
+        // the cold-start state that only exists to serve them. Deliberately after probeStreams:
+        // find_stream_info is where the trailing-index ping-pong lives, not avformat_open_input.
+        avioProvider?.markOpenPhaseFinished()
     }
 
     /// Default 5 MB/5s budgets miss sparse PGS/DVB tracks on 10-20 GB Blu-ray rips.
@@ -525,6 +553,11 @@ public final class Demuxer: @unchecked Sendable {
     }
 
     var duration: Double {
+        if let duration = (avioProvider as? CustomIOReaderBridge)?
+            .timeSeekableReader?.mediaDuration,
+           duration > 0 {
+            return duration
+        }
         let container: Double = {
             guard let ctx = formatContext else { return 0 }
             let dur = ctx.pointee.duration
@@ -695,6 +728,75 @@ public final class Demuxer: @unchecked Sendable {
             albumArtist: metadataValue(dict, key: "album_artist"),
             artworkData: attachedPictureData()
         )
+    }
+
+    /// One container chapter as read off `AVChapter`, decoupled from the C struct so the mapping
+    /// below is a pure function.
+    struct RawContainerChapter: Equatable {
+        let start: Double
+        let end: Double
+        let title: String?
+    }
+
+    /// Map raw container chapters onto the public model: sorted by start, re-ided sequentially so ids
+    /// stay stable list indices for hosts, untitled entries numbered "Chapter N" (matching the disc
+    /// naming).
+    ///
+    /// A chapter's declared end is never trusted for its duration when a successor exists, because
+    /// real-world MKV muxes routinely write `end == start`; the duration runs to the next chapter's
+    /// start instead. The last entry has no successor, so it falls back to its declared end, and
+    /// then to the container duration when that end is degenerate too, which is the same mux bug
+    /// landing on the one chapter the next-start rule cannot cover.
+    static func chapterInfos(from raw: [RawContainerChapter], containerDuration: Double?) -> [ChapterInfo] {
+        let sorted = raw.sorted { $0.start < $1.start }
+        return sorted.enumerated().map { i, ch in
+            let end: Double
+            if i + 1 < sorted.count {
+                end = sorted[i + 1].start
+            } else if ch.end > ch.start {
+                end = ch.end
+            } else if let duration = containerDuration, duration > ch.start {
+                end = duration
+            } else {
+                end = ch.start
+            }
+            let trimmed = ch.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let name = (trimmed?.isEmpty == false) ? trimmed! : "Chapter \(i + 1)"
+            return ChapterInfo(id: i, name: name,
+                               startSeconds: ch.start,
+                               durationSeconds: Swift.max(0, end - ch.start))
+        }
+    }
+
+    /// Container (Matroska/MP4) chapters mapped to the public model. Empty when the container declares
+    /// none. Disc sources keep their playlist/IFO chapters via `discChapterInfos`; both can coexist and
+    /// the engine picks. See `chapterInfos(from:containerDuration:)` for the id, naming and duration rules.
+    func mediaChapterInfos() -> [ChapterInfo] {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let ctx = formatContext,
+              ctx.pointee.nb_chapters > 0,
+              let chapterList = ctx.pointee.chapters else { return [] }
+
+        var raw: [RawContainerChapter] = []
+        raw.reserveCapacity(Int(ctx.pointee.nb_chapters))
+        for i in 0..<Int(ctx.pointee.nb_chapters) {
+            guard let chapter = chapterList[i]?.pointee else { continue }
+            let tb = chapter.time_base
+            // num == 0 would scale every timestamp to zero, collapsing the whole list onto 0 s.
+            guard tb.den > 0, tb.num > 0, chapter.start != Int64.min else { continue }
+            let scale = Double(tb.num) / Double(tb.den)
+            let start = Swift.max(0, Double(chapter.start) * scale)
+            let end = chapter.end != Int64.min ? Double(chapter.end) * scale : start
+            raw.append(RawContainerChapter(
+                start: start,
+                end: end,
+                title: metadataValue(chapter.metadata, key: "title")
+            ))
+        }
+        let declared = ctx.pointee.duration
+        let containerDuration = declared > 0 ? Double(declared) / Double(AV_TIME_BASE) : nil
+        return Self.chapterInfos(from: raw, containerDuration: containerDuration)
     }
 
     private func attachedPictureData() -> Data? {
@@ -978,6 +1080,11 @@ public final class Demuxer: @unchecked Sendable {
         accessLock.lock()
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return }
+        if let reader = timeSeekableReader {
+            guard repositionTimeSeekable(reader, toSourceSeconds: seconds, streamIndex: -1) else { return }
+            resetAfterTimeSeek(ctx)
+            return
+        }
         let timestamp = Int64(seconds * Double(AV_TIME_BASE))
         let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, Int64.max, 0)
         if ret < 0 {
@@ -997,6 +1104,18 @@ public final class Demuxer: @unchecked Sendable {
         guard let ctx = formatContext,
               streamIndex >= 0,
               streamIndex < Int32(ctx.pointee.nb_streams) else { return false }
+        if let reader = timeSeekableReader,
+           let stream = ctx.pointee.streams[Int(streamIndex)] {
+            let timeBase = stream.pointee.time_base
+            guard timeBase.num > 0, timeBase.den > 0 else { return false }
+            let seconds = Double(timestamp) * Double(timeBase.num)
+                / Double(timeBase.den)
+            guard repositionTimeSeekable(reader, toSourceSeconds: seconds, streamIndex: streamIndex) else {
+                return false
+            }
+            resetAfterTimeSeek(ctx)
+            return true
+        }
         let ret = avformat_seek_file(
             ctx,
             streamIndex,
@@ -1016,6 +1135,53 @@ public final class Demuxer: @unchecked Sendable {
         return ret >= 0
     }
 
+    private func resetAfterTimeSeek(_ ctx: UnsafeMutablePointer<AVFormatContext>) {
+        if let pb = ctx.pointee.pb {
+            avio_flush(pb)
+            pb.pointee.eof_reached = 0
+            pb.pointee.error = 0
+        }
+        avformat_flush(ctx)
+        lastReadClipIdx = -1
+    }
+
+    /// #268: the source reader repositions itself on segmented sources whose natural axis is time.
+    var timeSeekableReader: TimeSeekableIOReader? {
+        (avioProvider as? CustomIOReaderBridge)?.timeSeekableReader
+    }
+
+    /// Every engine seek target is an ABSOLUTE source PTS, while a `TimeSeekableIOReader` addresses
+    /// elapsed media time (for HLS: the EXTINF sum in front of a segment). MPEG-TS carries an
+    /// arbitrary PTS origin, so the two axes differ by that origin: ffmpeg writes 1.4 s by default and
+    /// broadcast-derived VOD routinely starts hours in. Handing the raw target to the reader sent a
+    /// seek to item second 5 of a 1000 s-origin source to the LAST segment of its playlist, and the
+    /// session clock left the item's own duration (measured on `hls-hevc-vod-long-offset`).
+    private func repositionTimeSeekable(
+        _ reader: TimeSeekableIOReader,
+        toSourceSeconds seconds: Double,
+        streamIndex: Int32
+    ) -> Bool {
+        reader.seek(to: max(0, seconds - sourcePTSOriginSeconds(streamIndex: streamIndex)))
+    }
+
+    /// PTS origin of the source axis in seconds: the anchoring stream's own `start_time` when it has
+    /// one (a stream-anchored seek is measured against exactly that stream), else the container's.
+    /// Unknown origins resolve to 0, which keeps the mapping identical to the pre-#268 behaviour.
+    private func sourcePTSOriginSeconds(streamIndex: Int32) -> Double {
+        guard let ctx = formatContext else { return 0 }
+        if streamIndex >= 0, streamIndex < Int32(ctx.pointee.nb_streams),
+           let stream = ctx.pointee.streams[Int(streamIndex)] {
+            let start = stream.pointee.start_time
+            let timeBase = stream.pointee.time_base
+            if start != Int64.min, timeBase.num > 0, timeBase.den > 0 {
+                return Double(start) * Double(timeBase.num) / Double(timeBase.den)
+            }
+        }
+        let start = ctx.pointee.start_time
+        guard start != Int64.min else { return 0 }
+        return Double(start) / Double(AV_TIME_BASE)
+    }
+
     /// #112 round 10: latched by the side reader once a timestamp positioning seek timed out or failed on this
     /// container (index-less MPEG-TS: read_timestamp binary search is either wedged or broken). Later re-arms on
     /// a reused demuxer skip straight to the byte estimate instead of paying the seek budget per positioning.
@@ -1028,28 +1194,110 @@ public final class Demuxer: @unchecked Sendable {
         timestampSeekUnreliable = true
     }
 
+    /// The stream libavformat would measure a `-1` seek against, or -1 when there is no context.
+    ///
+    /// Exposed because that choice is not stable across a session: `av_find_default_stream_index`
+    /// scores `discard != AVDISCARD_ALL` at +200, so which stream anchors a seek changes with the
+    /// discard configuration (#234).
+    func defaultSeekReferenceStreamIndex() -> Int32 {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let ctx = formatContext else { return -1 }
+        return av_find_default_stream_index(ctx)
+    }
+
     /// Seek with AVIO read deadline. Returns true if completed; false if aborted.
     /// Needed for VOD cue prewarm: missing/truncated MKV Cues causes matroska to
     /// degrade from "1-2 byte-range reads" into a linear half-file scan on a remote
     /// 70+ GB source (de-facto hang). Only AVIOReader honours the deadline.
+    ///
+    /// `anchorStreamIndex` names the stream the target is measured against. -1, the default, hands
+    /// that choice to libavformat, which scores `discard != AVDISCARD_ALL` at +200 and therefore
+    /// re-decides it whenever the discard configuration changes: a side reader that discarded
+    /// everything but its subtitle stream was anchored on that stream by accident, and #230's
+    /// pacing stream silently moved the anchor onto video keyframes (#234). A caller that reads one
+    /// sparse stream wants its own axis, so it says so. An index outside the source falls back to
+    /// the default rather than failing the seek.
     @discardableResult
-    func seekBounded(to seconds: Double, timeout: TimeInterval) -> Bool {
+    func seekBounded(to seconds: Double, anchorStreamIndex: Int32 = -1,
+                     timeout: TimeInterval) -> Bool {
         accessLock.lock()
         defer { accessLock.unlock() }
         guard let ctx = formatContext else { return false }
+        // #268: a time-seekable source repositions itself instead of paying libavformat's byte-space
+        // binary search, which on an index-less MPEG-TS is either wedged or broken (round 10 below) and
+        // over HTTP would additionally be a request storm. No read deadline is armed: the reader's
+        // reposition is a bookkeeping operation, the refetch happens behind the FIFO.
+        if let reader = timeSeekableReader {
+            guard repositionTimeSeekable(reader, toSourceSeconds: seconds, streamIndex: anchorStreamIndex) else {
+                return false
+            }
+            resetAfterTimeSeek(ctx)
+            return true
+        }
         // #112 round 9: the deadline lives on the provider protocol. Casting to AVIOReader here left a
         // disc-adapter source (CustomIOReaderBridge over HTTPDiscIOReader) unbounded: one positioning
         // seek on a remote ISO sat wedged ~230 s and every later re-arm queued behind it.
         avioProvider?.beginReadDeadline(secondsFromNow: timeout)
         defer { avioProvider?.endReadDeadline() }
-        let timestamp = Int64(seconds * Double(AV_TIME_BASE))
-        let ret = avformat_seek_file(ctx, -1, Int64.min, timestamp, Int64.max, 0)
+        // A stream-anchored seek carries the target in that stream's own time base; only the -1
+        // form is expressed in AV_TIME_BASE units.
+        var anchor: Int32 = -1
+        var timestamp = Int64(seconds * Double(AV_TIME_BASE))
+        if anchorStreamIndex >= 0, anchorStreamIndex < Int32(ctx.pointee.nb_streams),
+           let tb = ctx.pointee.streams[Int(anchorStreamIndex)]?.pointee.time_base,
+           tb.num > 0, tb.den > 0 {
+            anchor = anchorStreamIndex
+            timestamp = Int64(seconds * Double(tb.den) / Double(tb.num))
+        }
+        let ret = avformat_seek_file(ctx, anchor, Int64.min, timestamp, Int64.max, 0)
         avformat_flush(ctx)
         lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
         // matroska may return success with a partial index after abort; deadline flag
         // is authoritative, not ret.
         let capped = avioProvider?.readDeadlineFired ?? false
         return ret >= 0 && !capped
+    }
+
+    /// How an off-actor reposition ended (#254). Named to mirror `SeekEvent.Outcome` so the engine's
+    /// mapping onto the public seek-event stream is one line.
+    enum RepositionOutcome: Sendable, Equatable {
+        /// `avformat_seek_file` completed inside the budget; the read position is at the target.
+        case landed
+        /// The reposition did not complete: the read deadline fired, `avformat_seek_file` failed, or
+        /// there was no open format context. The read position is undefined.
+        case stalled
+        /// A newer seek arrived before this one reached the demuxer, so it never ran.
+        case superseded
+    }
+
+    /// `seekBounded` off the caller's actor (#254).
+    ///
+    /// `readPacket` holds `accessLock` for the whole of `av_read_frame`, so the `accessLock.lock()`
+    /// inside every seek first waits out whatever read is in flight, up to `AVIOReader.connStallTimeout`
+    /// (20 s), BEFORE the deadline armed inside `seekBounded` starts counting. A `@MainActor` host that
+    /// calls the synchronous form therefore blocks the main thread for the length of one remote read;
+    /// the field saw 4.4 s and 5.2 s "Fully Blocked" App Hangs on a WAN source that way. The deadline
+    /// on its own does not fix that class, because it is armed on the far side of the lock.
+    ///
+    /// `queue` must be serial, so repositions stay in issue order, and must not be the queue the
+    /// caller's demux loop occupies (that block never returns, so the seek would never run).
+    /// `isSuperseded` is evaluated ON that queue, immediately before the FFmpeg call: a scrub burst
+    /// then collapses onto its last target instead of paying one lock wait per seek.
+    func seekBounded(to seconds: Double, anchorStreamIndex: Int32 = -1, timeout: TimeInterval,
+                     on queue: DispatchQueue,
+                     isSuperseded: (@Sendable () -> Bool)? = nil) async -> RepositionOutcome {
+        await withCheckedContinuation { continuation in
+            queue.async { [self] in
+                guard isSuperseded?() != true else {
+                    continuation.resume(returning: .superseded)
+                    return
+                }
+                let completed = seekBounded(to: seconds, anchorStreamIndex: anchorStreamIndex,
+                                            timeout: timeout)
+                continuation.resume(returning: completed ? .landed : .stalled)
+            }
+        }
     }
 
     /// #112 round 8/10: byte-position seek for an index-less container. On a remote MPEG-TS with no index, a
@@ -1286,8 +1534,21 @@ public final class Demuxer: @unchecked Sendable {
     }
 }
 
-enum DemuxerError: Error {
+enum DemuxerError: Error, CustomStringConvertible, LocalizedError {
     case openFailed(code: Int32)
     case streamInfoFailed(code: Int32)
     case readFailed(code: Int32)
+
+    /// AE#283: this is the most common error at the load boundary, and the AVERROR code is the whole
+    /// diagnosis (INVALIDDATA vs a POSIX errno vs EOF). Rendering it keeps a refused transcode
+    /// distinguishable from a corrupt file.
+    var description: String {
+        switch self {
+        case .openFailed(let code): "Demuxer: open failed (\(FFmpegErr.text(for: code)))"
+        case .streamInfoFailed(let code): "Demuxer: stream info failed (\(FFmpegErr.text(for: code)))"
+        case .readFailed(let code): "Demuxer: read failed (\(FFmpegErr.text(for: code)))"
+        }
+    }
+
+    var errorDescription: String? { description }
 }

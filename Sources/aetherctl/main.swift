@@ -453,14 +453,30 @@ if first == "play" {
     let subsPick = takeStringFlag("--subs", from: &rest)
     let hostCalls = takeStringFlag("--host-calls", from: &rest).map { $0.split(separator: ",").map(String.init) } ?? []
     let audioStats = takeFlag("--audio-stats", from: &rest)
+    let seekEvery = takeDoubleFlag("--seek-every", from: &rest)
+    // #240: absolute far-seek targets, cycled one per --seek-every tick (e.g. 600,30,302,640).
+    let seekPattern = takeStringFlag("--seek-pattern", from: &rest)
+        .map { $0.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) } } ?? []
+    let mallocCensus = takeFlag("--malloc-census", from: &rest)
+    let playForceSW = takeFlag("--sw", from: &rest)
+    let censusThresholdMB = takeIntFlag("--census-threshold-mb", from: &rest)
+    let censusHz = takeDoubleFlag("--census-hz", from: &rest)
+    // Slow-CDN simulation, same hook as `serve` / `seektest`: a local file lets the producer race
+    // minutes ahead, which is the one regime where producer scheduling cannot matter (AE#286).
+    let playThrottleKbps = takeIntFlag("--throttle-kbps", from: &rest)
     rejectStrayFlags(rest, subcommand: "play")
+    if let playThrottleKbps {
+        AetherEngine.setSourceThrottleKbpsForTesting(playThrottleKbps)
+        print("[aetherctl] source throttle: \(playThrottleKbps) kbit/s (slow-CDN simulation)")
+    }
     guard let urlArg = rest.first else {
         print("ERROR: play requires a <url> argument")
         print("")
         printUsage()
         exit(64)
     }
-    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats))
+    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, mallocCensus: mallocCensus, forceSoftware: playForceSW,
+                 censusThresholdMB: censusThresholdMB, censusHz: censusHz))
 }
 
 if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].contains(first) {

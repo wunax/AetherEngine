@@ -10,6 +10,684 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [6.5.5] - 2026-08-03
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.5.5))
+
+### Fixed
+
+- **The retained file head now survives to serve playback's first read.** It was
+  released when the demuxer finished parsing, on the reasoning that a far seek
+  from there on is a scrub. After a trailing-index parse the anchored connection
+  sits at the END of the file, so playback's first read is a backward one, and it
+  lands at the head: measured landings of 48 and 263303 under `aetherctl` and
+  5752 in a field trace, where it cost a fresh connection whose first byte took
+  865 ms. No `probe`-based measurement could see it, because `probe` exits at
+  exactly that call. Against a 300 ms origin on a fragmented fixture, playback's
+  first read becomes a copy out of the head and the next connection is deferred
+  by 3.93 MB of already-resident bytes. The head is released instead by the first
+  post-open read it cannot answer.
+- **An origin that declines suffix ranges is asked once per session, not once per
+  open.** Some origins answer `bytes=-65536` with a 200 and the whole file. That
+  body was already refused at the response header, but the request itself was
+  re-issued on every open: a second connection opened at the same instant as the
+  data connection whose first byte is the cold start, sharing the same uplink,
+  against a server that had already shown it cannot serve it. Its answer is now
+  remembered per origin. Only the origin's own answer latches immediately; a
+  transport failure takes two, since a link bad enough to lose this request loses
+  others.
+
+## [6.5.4] - 2026-08-03
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.5.4))
+
+### Changed
+
+- **The HLS segment pump runs at the efficiency QoS whenever nothing is waiting
+  on it.** Its queue was pinned to `.userInitiated` for the whole session, which
+  is right for the windows where AVPlayer is blocked on a segment that has not
+  been cut yet and wrong for the steady state, where the producer is minutes of
+  content ahead and parked on backpressure. It cannot simply be demoted either:
+  `HLSLocalServer` answers segment requests from a `.userInitiated` work queue
+  and a cache miss parks that thread in `cache.fetch` until the pump produces the
+  segment, a dependency dispatch has no way to see. Pinned to `.utility` on a
+  fully saturated M1, filling the forward window took 1.21 s against 0.16 s and
+  time to first frame rose from 0.14 s to 0.24 s; on an idle box the two are
+  indistinguishable, which is why a single measurement on a device with thermal
+  headroom cannot settle it. The pump therefore owns its thread now and retunes
+  its own class as it runs: responsive until the consumer has started rendering
+  and while the consumer sits within 16 s of content of what this pump has
+  produced, `.utility` beyond that. Over a 120 s steady-state window that leaves
+  it in the efficiency class for 416 ms of CPU against 419 ms for a build pinned
+  to `.utility`. Live is unchanged, its production is source-paced and the
+  blocking reload holds an AVPlayer request open on the very next segment.
+  Reported and measured on iOS by edde746 (#286).
+
+## [6.5.3] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.5.3))
+
+### Fixed
+
+- **A session that starts on a panel already in HDR is no longer routed as SDR.**
+  `UIScreen.currentEDRHeadroom` is not a readout of the panel's HDMI mode. It is
+  raised around a dynamic-range transition and decays back to 1.0 while the panel
+  keeps presenting HDR, measured on an HDR10+ panel as a fall from 1.20 to 1.00
+  thirteen seconds into a confirmed HDR10 session with no mode switch in progress.
+  A replay that begins before the TV has dropped back to SDR therefore makes no
+  transition at all, so the single read taken after `waitForSwitch` concluded that
+  the panel was SDR. On tvOS that one boolean is the whole master-vs-media routing
+  gate, so every such session was served media-direct with no HDR signaling and
+  labelled SDR while the TV itself reported HDR. The reading now counts only as a
+  positive; its absence is answered by whether a criteria write has ever
+  demonstrably driven this display into HDR.
+
+- **The settle diagnostics stop accusing a panel that was already in HDR.** Both
+  the Stage 2 WARN and the cap line read headroom 1.0 after an HDR write as a
+  refusal, which is indistinguishable from a panel that needed no transition.
+  They now separate the two, and an unproven panel still names the real
+  candidates.
+
+## [6.5.2] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.5.2))
+
+### Fixed
+
+- **A range that finished delivering is now read out of the window instead of
+  fetched again.** A completed range clears `activeTask` exactly as a dropped
+  one does, and the no-connection branch reconnected at the READ position
+  regardless, which resets `winStart` and drops everything still resident. A
+  consumer slower than the transfer, which is what the parse pass is (one 256 KB
+  AVIO buffer at a time), therefore re-fetched what it had just been handed.
+  Measured with aetherctl against a Range-logging origin: a 764450 B trailing
+  `moov` cost three connections and 1506918 delivered bytes, 1.97x its own size.
+  It now costs one. Serving what is in hand first also lets the #220 frontier
+  refill run, which it could not while this branch preempted it on every
+  completed range.
+
+- **A read at the end of the file no longer opens a connection for it.** The EOF
+  decision sat below the reconnect, so a position at exactly `fileSize` first
+  issued `bytes=<fileSize>-` and took an empty 206 whose reconnect reset
+  `winStart` past the last byte, dropping a window the parse was still reading.
+  On the same trailing-`moov` measurement that was one of the three connections.
+
+- **The head of the file is retained across the open phase, so the return trip
+  after a parse excursion is a copy.** #281 parked the open window at seek time,
+  cut from `winStart`, on the reasoning that the demuxer returns to the window's
+  start. It returns to the FILE's start: landings of 48, 1161, 5752 and 265159
+  across four MP4 layouts and a field trace. Those coincide only when the parse
+  seeks away before reading anything. A fragmented MP4 reads 33 MB first, so
+  `winStart` has long left the head and the parked copy covers nothing that is
+  asked for. The head is now collected as the data connection delivers it, which
+  is the only point at which it can be, since `trimWindowLocked` drops it as the
+  parse moves forward. Measured with aetherctl against an origin with 300 ms of
+  latency per request: opening a fragmented fixture went from 1732 ms and four
+  requests to 1219 ms and three. The parked window is gone: across six container
+  layouts (four MP4, two MKV) it served no read that the retained head does not.
+
+## [6.5.1] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.5.1))
+
+### Fixed
+
+- **The speculative tail fetch now removes the round trip it was added for.**
+  6.4.5 issued a 64 KB suffix range alongside the open and let nothing wait on
+  it, on the reasoning that a fetch landing late costs no more than the
+  reconnect it failed to save. That reasoning was wrong about the timing, and
+  the reporter's retest measured it: the demuxer reaches the trailing object
+  within microseconds of the data connection's first byte, and the speculative
+  fetch pays the same round trip plus a body, so on any origin whose first byte
+  costs anything it is still on the wire at that moment. It never once served
+  the read it exists for, it only added a request. A read landing in the
+  fetched range now waits for it, bounded by what a round trip against this
+  origin was measured to cost (the data connection's own time to first data),
+  so waiting can never be the more expensive choice, and an origin that
+  declines suffix ranges falls straight back to a reconnect. Only a loopback
+  origin, which answers before the race can be lost, made the first version
+  look like it worked, so the regression test models an origin whose first byte
+  costs something.
+
+### Changed
+
+- The cold-start paths now say what they did. `tail prefetch issued`, then
+  `installed` or `rejected` with the reason (status, disagreeing
+  `Content-Range`, short body), and one line per span when it serves a read
+  that would otherwise have reconnected. The advertised way to verify #281 was
+  to look for a `bytes=-65536` request, which the engine never printed, so its
+  absence from a log was not evidence of anything. Slow-read summaries gained
+  `tailWaits=`.
+
+## [6.5.0] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.5.0))
+
+### Fixed
+
+- **A terminal error now says what went wrong instead of "The operation
+  couldn't be completed."** The engine publishes its terminal states as
+  `state = .error("Failed to load: \(error.localizedDescription)")`, and its own
+  error enums were only `CustomStringConvertible`. `localizedDescription` does
+  not reach `description`, so Foundation's generic bridge answered "The
+  operation couldn't be completed. (HLSIngestError error 0.)" and the HTTP
+  status the ingest reader had already resolved was dropped at that boundary:
+  an origin refusing a transcode with 500 was indistinguishable from a corrupt
+  file. Every error type the engine can throw now conforms to `LocalizedError`
+  with `errorDescription` returning the description it already computes, which
+  fixes the reload, audio-track-switch and mid-session playback boundaries in
+  the same move rather than the three load-path call sites alone.
+  `DemuxerError` is the most common failure at that boundary and carried no
+  description at all; it now renders its AVERROR code with libavutil's own
+  text, so `INVALIDDATA` reads as itself rather than as an error number 0.
+  Reported by @edde746, traced to the boundary (#283).
+
+### Added
+
+- **`LocalizedError` conformance on the public error types.** A minor rather
+  than a patch: `HLSIngestError`, `PacketTimingProbe.ProbeError`,
+  `AudioTapProbe.ProbeError` and the two `AetherEngineSMB` error structs gain
+  public conformance and an `errorDescription`, and an adopter that renders a
+  caught error with `localizedDescription` sees different text on this version
+  than it did on 6.4.x. The text is the `description` those types already
+  published, so anything already logging `"\(error)"` is unchanged.
+
+## [6.4.7] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.4.7))
+
+### Fixed
+
+- **A live DVR rewind deeper than about 40 s no longer asks for a segment the
+  cache has already deleted.** A live session resolved a segment retention
+  budget of 0, on the reasoning that the sliding playlist had already dropped
+  everything behind the window so retention would serve nothing. That had it
+  backwards: the playlist window is the looser bound (300 segments for a 600 s
+  DVR window at a 2 s cadence), while `pruneOutsideWindow` with a 0 budget
+  takes its hard-window branch and cuts at `currentTargetIndex -
+  backwardWindow`, i.e. 20 segments. Live therefore retained ~42 s no matter
+  what `dvrWindowSeconds` asked for, while the playlist and the published
+  `liveSeekableRange` advertised the whole window, and live has no
+  `restartHandler` to re-produce a segment that is gone. Measured on the
+  engine before the fix: `cacheCount` pinned at 21 for a whole 150 s session
+  with `dvrWindowSeconds: 600`. Live now resolves the same volume-aware budget
+  as VOD (2 GiB, clamped to a quarter of free space), which is the mechanism
+  built for exactly this, so the retained history tracks the advertised window
+  and stays bounded by it. `backwardWindow` keeps its own job as the
+  Continuous-Audio handover floor. The producer-side prefetch park the budget
+  also feeds is VOD-only, so live cannot park on it.
+
+## [6.4.6] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.4.6))
+
+### Fixed
+
+- **Live sessions no longer freeze 6-8 s at a time when the producer's
+  backpressure park meets an LL-HLS blocking reload.** The advance park
+  released only on a client segment GET, while the client's held
+  `?_HLS_msn=` reload was only satisfiable by a producer cut, and the held
+  reload occupies the serialized keep-alive connection, starving the very
+  segment GET that would release the park. The 18 s hold then expired into
+  `503 unsatisfiable` long after AVPlayer's ~4 s forward buffer had drained
+  into `playbackStalled`. Live production is source-paced now: the advance
+  and versioned-init parks are VOD-only, replaced on live by a logged
+  resident-segment runaway guard set far above the steady-state window, so
+  only a consumer that has already stopped polling can reach it (a live park
+  is a diagnostic, never steady state). Three aggravators fixed alongside:
+  the sliding window is sized by the observed segment cadence instead of the
+  cut target (fastZap's 0.5 s target vs ~2 s GOPs inflated the window 4x,
+  pinning MEDIA-SEQUENCE at 0 and deferring `evictBelow` for minutes), the
+  stall-recovery item reload now honors `LiveReloadPolicy` (live rejoin: no
+  stale-clock resume, no zero-tolerance initial seek), and the
+  blocking-reload hold is bounded by `3 x` the sealed TARGETDURATION
+  (= the advertised HOLD-BACK) instead of a hardcoded 18 s. VOD paths are
+  byte-identical. Reported and fixed by @tschuegy in #280.
+
+### Changed
+
+- **A live playlist whose sliding window overtakes the consumer's fetch point
+  now says so.** The removed advance park capped the producer 10 segments
+  ahead of that point, so the window could never pass it. Source-paced live
+  cannot get there, but an origin handing over more than one window of
+  backlog faster than the consumer drains it can, and the consumer then asks
+  for a segment `evictBelow` has already deleted. That reads downstream as a
+  cache miss or a live-edge jump with nothing naming the cause, so the
+  playlist builder logs `live window slid past the consumer` once per
+  excursion.
+
+## [6.4.5] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.4.5))
+
+### Fixed
+
+- **A non-faststart MP4 cold start no longer pays three sequential round trips
+  before the frame rate is known.** Opening one costs a data connection from
+  byte zero, a seek to the trailing `moov`, and a return to the first sample.
+  The third was self-inflicted: the seek to the tail discarded the window that
+  already held the bytes the return trip went back for, so the reader
+  re-fetched what it had just thrown away. That window is now kept for the
+  duration of the demuxer's open pass and serves the return trip as a copy.
+  Alongside it, `open()` issues one speculative 64 KB suffix range (`bytes=-n`,
+  which needs no size and therefore runs in parallel with the very first
+  request), covering the small trailing objects an open actually reads: `mfra`
+  on fragmented MP4, and a trailing `moov` whose sample tables fit. On a 51 MB
+  moov-at-end file the open goes from three sequential requests to two
+  concurrent ones. A feature-length file's `moov` is far larger than 64 KB and
+  still costs its own request, by design: fetching megabytes on a guess would
+  compete with playback bytes on exactly the slow links this helps. Reported
+  with before/after traces in #281.
+
+- **Display-criteria settle times in the log are measured now, instead of
+  having the Stage 1 budget added back in.** Stage 2 reported
+  `startGrace.ticks * 10 + stage2Ticks * 50`, which counts Stage 1's entire
+  blind-poll budget whether or not it was spent, so a rate switch that settled
+  one 50 ms tick after a start the gate saw immediately logged `~1050ms`. Every
+  settle time in every log collected so far reads up to a full second slow,
+  including the ones the `.brief` play-gate budget (#274) was reasoned about.
+  The line now carries the real numbers plus how Stage 1 learned of the switch:
+  `start pre-gate after 0ms, total 90ms`, where `pre-gate` means the panel was
+  already switching when the gate opened (so the switch began during the load
+  that built the AVPlayerItem) and `in-gate` means it started inside the gate.
+  That distinction is the ordering question these logs were added for and could
+  not answer. The Stage 2 cap also stops attributing every unobservable switch
+  to an unobservable DV panel: it reads the same attribution the settle branch
+  got in #274, so an engine rate-only write that never reports an end says so
+  rather than claiming DV. Measured from the logs on Sodalite#49.
+
+## [6.4.4] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.4.4))
+
+### Added
+
+- **The `#250 subtitle-resolution` statement now states the determination span
+  it retains across a seek, as `retainedFrom=`.** `coveredFrom` is the last
+  reset's window start, so after a far seek it reads `target - 15` and can
+  neither affirm nor refute that determination still reaches back to track
+  start. That left one truth class inexpressible: "empty because nothing was
+  ever authored before this point", which needs coverage back to the earliest
+  point that could change the answer. The pre-seek line does carry the bound,
+  but under the previous `seekGen`, and combining across the fence is what the
+  fence exists to forbid. The engine now reconciles the runs itself: a
+  post-seek reset folds its window into the retained run instead of
+  overwriting it, and the line states that run's floor alongside the reset
+  window. `coveredFrom` is unchanged; the two are separate claims. The runs
+  join only when the new window opens inside the retained span, so a forward
+  seek past the determined end and a backward seek starting below the floor
+  both restart the run rather than span the hole. Requested by @cmcpherson274
+  (#276).
+
+## [6.4.3] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.4.3))
+
+### Fixed
+
+- **The post-load play-gate only pays the Dolby Vision cold-start budget when a
+  dynamic-range switch can still reach the session.** The gate blind-polls up to
+  1000 ms for a panel switch to *start*, a budget sized for the one case that
+  needs it: a sole-writer host (`LoadOptions.suppressDisplayCriteria`) whose
+  criteria write lands during the load, from AVKit's auto path. Every other
+  session paid the same wait for a switch that could not arrive. Sessions where
+  the engine wrote the criteria itself (synchronously, before the item loads, and
+  already settled in the pre-flight for an HDR write) and sessions on SDR content,
+  which no dynamic-range write can follow, now take a 200 ms budget instead, the
+  value that was in place before the AVKit-sole-writer architecture raised it. A
+  switch that has genuinely started still settles in Stage 2 unchanged, and a
+  failed probe keeps the full budget because the source range is then unknown.
+  Reported and measured by @digilearn-dev (#274).
+
+- **A panel switch the engine did not initiate is no longer logged as a failed
+  HDR handshake.** When a sole-writer host's own criteria write settled with EDR
+  headroom at 1.0, the settle classification read `didApply == false` as the HDR
+  branch and emitted `WARN ... panel stayed SDR despite HDR criteria` for what
+  was a correct SDR rate-only switch. The engine has no target range to compare
+  against for a write it never made, and now says so (#274).
+
+## [6.4.2] - 2026-08-02
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.4.2))
+
+### Fixed
+
+- **A seekable HEVC-in-MPEG-TS HLS VOD plans its segments on the playlist's own
+  boundaries.** MPEG-TS carries no upfront keyframe table, so the plan fell back
+  to a synthetic uniform 4 s grid. On a source that carries one I-frame per 10 s
+  segment only every fifth grid boundary is a random-access point, so a restart
+  at any other index made the producer's scan-forward gate open up to 8 s late.
+  That overshoot rode in the producer's timeline shift, where the video cutter
+  and the audio index mapping folded it back on two different axes, and AVPlayer
+  was left waiting on a segment that never arrived at the position it asked for
+  (`CoreMediaErrorDomain -12889`). A seekable source now plans on the boundaries
+  it declares, each backed off half a segment (0.5 s cap) so manifest-versus-PTS
+  rounding cannot put a boundary past its own IRAP. Measured over five scattered
+  seeks on a 10 s-GOP fixture, the per-restart gate overshoot goes from
+  0/4/0/2/6 s to a flat 0.5 s. Reported and device-tested by @qoli (#268).
+
+- **The VOD segment cutter compares on the item axis.** Packets reach it with the
+  producer's shift already subtracted, while the plan boundaries are source PTS,
+  so every cut landed one PTS origin late on any source that does not start at
+  zero, and against boundaries that are themselves the source's IRAPs it would
+  never have cut at all. The audio index mapping folds back the plan anchor
+  rather than the shift for the same reason, and a restart's first `tfdt` is the
+  segment's advertised start rather than its seek boundary (#268).
+
+## [6.4.1] - 2026-08-01
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.4.1))
+
+### Changed
+
+- **`$subtitleCues` publishes once per drain tick instead of once per decoded
+  subtitle packet.** Every publication carries the whole cumulative cue array,
+  and a snapshot cannot tell a consumer which of its elements are new, so each
+  one cost every subscriber a full walk: O(n) per packet, O(n²) per drain
+  window. On a typeset ASS track that was 104 publications and 608,608 cue
+  visits per second in a single consumer, none of which found new work. The
+  tick now binds the channel's array once, applies the whole batch of decoded
+  events to it, and publishes only when the batch actually changed something.
+  The retained-store insert also looks up same-start cues by binary search
+  rather than scanning the whole array. Reported and measured by @edde746
+  (#271).
+
+### Fixed
+
+- **One drain tick no longer decodes an unbounded number of subtitle packets.**
+  The drain window is bounded in seconds of content (backscan plus lead), never
+  in packets, so its size was set by the file's subtitle density while the
+  decode loop ran synchronously on the main actor with no suspension point. It
+  is now capped per tick, with the boundary extended to the end of the run
+  sharing the last packet's PTS: the drain cursor is a bare PTS advanced past
+  what it decoded, so a cut inside a same-PTS run would skip the remainder
+  rather than resume it on the next tick. Dense ASS deliberately keeps hundreds
+  of distinct payloads on one timestamp. The subtitle OCR worker's existing cap
+  gets the same PTS-boundary correction (#271).
+- **A slow drain tick no longer reads its own duration as a seek.** The plan
+  compared the live playhead against the playhead captured at the previous
+  tick's start, so a tick lasting longer than the 2.5 s jump threshold made the
+  next one reset onto a fresh, disjoint window: a positive feedback loop, since
+  the reset window is the expensive one. Forward drift is now forgiven up to
+  the wall time the previous tick consumed. Backward drift is not, because
+  playback never moves the playhead backwards (#271).
+
+## [6.4.0] - 2026-07-31
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.4.0))
+
+### Added
+
+- `HLSVideoEngine.sourceStartSeconds`, the source PTS the container's own
+  timeline starts at. The engine folds it out of the published playhead; a host
+  driving `HLSVideoEngine` directly can read it to do the same.
+
+### Fixed
+
+- **Finite HEVC-in-MPEG-TS HLS VOD no longer reaches AVPlayer's audio-only,
+  black native path.** A bounded content probe now confirms the playlist is
+  finite, its segments are MPEG-TS, and its PMT declares HEVC before selecting
+  a seekable TS-to-fMP4 ingest. Direct media playlists and master playlists are
+  both covered; URL, HTTP headers, duration, resume position, and forward or
+  backward seek semantics are preserved. H.264, fMP4, live, audio-only, and
+  inconclusive HLS inputs keep their existing route. The ingest is addressed on
+  elapsed media time, so a source whose MPEG-TS PTS origin is not zero
+  (broadcast-derived VOD routinely starts hours in) still lands where the host
+  asked. (#268, PR #269, reported and implemented by @qoli)
+- **A VOD source whose container starts at a non-zero PTS now publishes its
+  playhead on the same 0-based axis as its duration.** The display origin was
+  anchored for disc titles only, so a transport stream muxed with a 60 s origin
+  opened its scrubber at 1:02 of a ten-minute item, and at broadcast scale a
+  seek target computed on that axis resolved outside the item and landed at the
+  start of the file. Sources that already start at 0, which is every MP4, are
+  unaffected. (#270)
+
+## [6.3.0] - 2026-07-31
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.3.0))
+
+### Added
+
+- **`ExternalSubtitleTrack.sourceStreamIndex`, so an external subtitle URL can be a container rather than a sidecar.** An external track's URL may hold several subtitle streams (an MKV with English, English SDH and Spanish), and a host would register one track per stream against that same URL. The sidecar decoder stopped at the container's first subtitle stream and the descriptor carried no index, so every such track decoded that same stream and the host got three selectable tracks rendering identical cues. The new field names the stream to decode as an absolute `AVStream` index inside the container, matching the convention that embedded track ids are stream indices; nil keeps decoding the first subtitle stream. An index that is out of range or names a non-subtitle stream fails the decode rather than falling back to the first subtitle stream, because a silent fallback is indistinguishable from the behaviour the index exists to escape. Reported by edde746. (#266)
+
+### Changed
+
+- **External tracks sharing a container are now filled from a single pass over it.** Each load-declared external track used to be decoded by its own whole-file read, so three tracks pointing at one MKV meant three full downloads at load, and `AVDISCARD_ALL` cannot shorten them (a Matroska demuxer reads every discarded byte anyway). Tracks sharing a URL and headers are now decoded together in one pass, one stream decoder per requested stream. Since a pass covering several streams fails as a whole, a failure retries the targets individually, so one host-side index mistake cannot blank the container's other tracks; a store that still could not be filled stays unfinished rather than serving a complete but blank rendition.
+
+## [6.2.1] - 2026-07-30
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.2.1))
+
+### Fixed
+
+- **An ASS track that declares its play resolution with CRLF line endings is no longer read as declaring none.** The header arrives as codec extradata byte for byte as the muxer stored it, and muxed ASS is conventionally CRLF, so the line is `PlayResX: 718\r`. The trim used `CharacterSet.whitespaces`, which is space and tab but not CR, so the CR survived and `Double("718\r")` returned nil. Both lookups failed, the header was reported as declaring nothing, and every `\pos` on the track normalized against libavcodec's 384x288 default instead of the declared space. On a 718x480 script `{\an1\pos(298,432)}` reached the host at (0.776, 1.500) rather than (0.415, 0.900), which is off-picture and indistinguishable from a cue that never arrived. Header lines now split on any newline (CRLF, LF or lone CR) and trim newline-inclusive. Tracks that declare no play resolution are unaffected, since 384x288 is then the correct basis. Reported by rrgomes, traced to the line. (#261)
+
+### Changed
+
+- `SubtitleTextPlacement.position` no longer documents a [0, 1] range. A script may anchor outside the frame on purpose, so that is a range the engine cannot guarantee, and clamping or dropping such an anchor engine-side would hide the next wrong normalization basis the way #261 hid. Hosts that cannot draw off-picture should decide for themselves what to do with such a cue. No behaviour change.
+
+## [6.2.0] - 2026-07-30
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.2.0))
+
+### Added
+
+- **The native path now states the relation between its two time axes, instead of leaving a host to infer it.** Cue times, chapter marks and `sourceTime` are source PTS; `AVPlayerItem.currentTime()` and its timebase are the axis the producer muxes into the segments. They differ by the producer shift, and nothing published closed that gap for a host compositing its own overlay: adding `playlistShiftSeconds` is correct only until the next producer epoch, the clock ticks at ~10 Hz and a clock reading is not a frame boundary, and the per-segment pair is a genuine pair but six seconds apart. `player.presentationAxisMap` converts either way at any position and is readable off the main actor, and `setNativeVideoFrameTimeObserver` reports both axes for every muxed frame, with its segment index, keyframe flag and producer epoch. Frames arrive in decode order, so `source` is not monotonic under B-frames. Both surfaces answer nothing rather than zero when no axis has been established, since at the call site a defaulted shift is indistinguishable from a measured one, which is what #259 cost. `player.currentAVPlayerItem` publishes alongside, because items are swapped in place and a host holding a timebase otherwise gets no signal. Requested by edde746 for frame-accurate libass rendering, with the axis measurement that showed the gap.
+
+### Fixed
+
+- **A VOD producer restart no longer folds the whole timeline with its new shift.** Each producer computes its own shift when its video gate opens, and a restart lands wherever the source seek lands, so a restart can change it. The shift history was rebuilt from scratch on every VOD restart with one entry covering everything, so content muxed by the previous producer, which AVPlayer can still hold in its buffer and put on screen, was folded with the incoming shift: the published playhead then leads or trails the picture by the difference for as long as that buffer lasts. The history now records the item-axis position each producer starts writing at and keeps the entries below it, and a backward restart drops only the entries it actually rewrites. Live already worked this way for program boundaries; that path is unchanged. Note that the shift-fold hypotheses in #65 were refuted by measurement at the time: that burst ran with an invariant shift, so this mechanism was inactive there and is not a retroactive explanation for it.
+
+## [6.1.4] - 2026-07-30
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.1.4))
+
+### Fixed
+
+- **In-picture A/53 closed captions are timed against the source again, not against the playlist.** The extraction rides the segment producer's per-packet finalize step, which runs after the pump has rebased the packet onto the output timeline, so the timestamps handed to the caption tap carried the playlist shift while everything downstream reads them as source PTS: the decoded cues feed `subtitleCues`, and a host renders those against `currentTime`, which folds that same shift back in. Every A/53 caption was displaced by it, and because the shift is recomputed on each producer restart, the displacement changed after every seek. On a clip with B-frames it is two frames at head of stream; a restart landing off its planned keyframe has been measured in seconds; and a broadcast MPEG-TS source whose first DTS sits far from zero, which is the case this path exists for, carries it from the first packet. Only the producer path was affected: a demuxable `eia_608` / `c608` caption track is tapped before the rebase, and the software path reads its triplets out of decoded-frame side data, where no shift exists at all. Reported by edde746 from a read of the value flow plus a measurement of the shift magnitude, without a caption-bearing source on hand.
+
+## [6.1.3] - 2026-07-30
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.1.3))
+
+### Fixed
+
+- **Teletext rows no longer arrive with the column padding still on them.** A page libzvbi does not classify as a subtitle page is written out as the raw grid, every row at full column width with a hard space per grid cell, and the engine's two whitespace passes both walked past the inside of a line break: one trims the outer edges of the whole cue, the other folds what sits between two newlines and never looks at the characters touching a single one. A two-row caption therefore reached the host as `row one<pad>` / `<pad>row two`, which puts the second row visibly off centre on a renderer that centres each line and draws the cue's background box wider than its text. Both passes are now gated on that same raw-grid case, which is exactly the page that arrives without an alignment override, so a page the decoder curates itself is passed through whole: there the surviving padding is the relative indentation carrying the alignment it picked, and the blank lines are its vertical fine-positioning inside the block, both of which the blank-line fold had been discarding since #107. Reported by tresby, who had solved it row-wise in a proxy implementation and supplied the failing sequence.
+
+### Changed
+
+- **FFmpegBuild and LibDovi are pinned to the minor rather than floating from a lower bound**, so a released engine tag's dependency set is a property of the tag instead of the registry at resolve time. Both classes of drift this guards against were live: LibDovi 1.1.0 raised its declared tvOS floor in a minor, which SwiftPM floats onto and then fails on instead of backing off, so every 5.x tag stopped resolving; and FFmpegBuild 2.4.0 replaced 2.3.0 under a fixed 5.28.0 checkout. Forward-looking only, already published tags keep what they declared. Consumers resolve to the same versions as before (FFmpegBuild 2.4.0, LibDovi 2.0.0).
+
+## [6.1.2] - 2026-07-30
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.1.2))
+
+### Fixed
+
+- **Opening a large progressive HTTP source no longer dies in the allocator before the first frame.** The chunk-fetch delegate reserved whatever the response declared, and one of the requests that reaches that line is the HEAD size probe, which declares the entire source and delivers no body at all: opening a 12.4 GB MKV asked malloc for 12.4 GB in order to buffer nothing, and on a 6 GB device the NULL that came back was force-unwrapped inside `Data`'s storage, so it trapped on the URLSession delegate queue rather than throwing (a host app could neither catch it nor degrade). The HEAD fallback is launched 0.75 s after the range probes and runs whenever they have not resolved a size yet, so this was reachable on any non-prefetch open (still extraction, one-shot seekable) against a slow origin, not only against origins that reject Range outright. The reservation now comes from the request instead of the response: the span of a bounded `Range`, nothing at all for a HEAD, a flat 8 MB ceiling for an open-ended request. The body is bounded by that same span, so an origin that ignores `Range` and answers a bounded chunk request with `200` plus the whole source's length is hung up on after the requested prefix instead of having its entire file buffered and then rejected. Reported by dlev02 from a symbolicated crash report.
+
+## [6.1.1] - 2026-07-30
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.1.1))
+
+### Fixed
+
+- **A seek on the software path no longer blocks the main thread for the length of a network read.** `SoftwarePlaybackHost` is `@MainActor` and ran the demuxer reposition inline, so a seek issued while the demux loop sat in a slow remote read waited out that read on the main thread: two field App Hangs, "Fully Blocked", 4.4 s and 5.2 s, on a WAN source. The lock is held across the whole of `av_read_frame`, which is also why the existing deadline could not have prevented them, since it is armed on the far side of that lock. The reposition now runs off the main actor under an 8 s read deadline, and a burst of scrubs collapses onto its last target instead of paying one lock wait per seek. The same inline call sat in both hosts' `startPosition` resume, so this covers every resume into a remote source, not just scrubbing. A reposition that spends its budget reports `.stalled` on `seekEvents` rather than a landing it cannot back up. Reported by rrgomes from two production crash-reporter events.
+
+## [6.1.0] - 2026-07-30
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.1.0))
+
+### Added
+
+- **A seek now says what happened to it, not just that it stopped happening.** `isSeeking` / `seekTarget` are a level, and a level's falling edge cannot distinguish a landing from a give-up from a supersede, nor keep the target it belonged to (both properties clear in the same recompute, and any consumer that hops a queue sees them coalesced). `player.seekEvents` publishes `.began`, `.landed(renderedTime:)`, `.stalled`, `.superseded` and `.rejected`, each carrying its target and an id that pairs a seek with its outcome. The one asymmetry is the point of the stream: a seek that spent its recovery budget reports `.stalled` and drops out of `isSeeking`, but it stays alive inside AVPlayer, so its `.landed` can still arrive minutes later on a source that finally serves the target. Reported by rrgomes from production use of the signal in a synchronized-playback host, which had rebuilt all of this out of a landing grace, a retained last target and a 180 s unreached-target map.
+
+### Fixed
+
+- **A native scrub no longer reports a landing before the picture arrives.** The scrub's in-flight window ended when the coalesced producer restart drained, which means "the producer is producing at the new index", not "AVPlayer rendered it"; the picture follows a fetch and a decode later, measured at 1.4 s on a WAN source. The window now ends when the rendered frame reaches the restarted region, bounded at 8 s so a source that never serves it degrades to `.stalled` instead of latching the signal.
+- **A seek issued before the session can take it is visible instead of silently optimistic.** Seeks stashed during load or against a pre-ready item (#127/#178) publish their target on `currentTime` so scrub UI follows, but left `isSeeking` false, which is the worst combination for a consumer broadcasting that position: a place nothing has reached, with no in-flight flag to suppress it. The stash window now carries the seek signal and hands over to its replay without a gap.
+- **`seekTarget` no longer publishes a settled seek's destination.** It folded over the last non-nil target ever written, so a finished programmatic seek's target stayed published while a scrub was in flight toward a different one. Each source now owns its own target, and the published value follows the most authoritative one in flight.
+- **A stop landing mid-seek no longer leaves the subtitle side-reader link owned by the video path** for the whole next session (the #240 gate is per engine, not per session).
+
+## [6.0.2] - 2026-07-29
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.0.2))
+
+### Added
+
+- **The subtitle path now states how far it has decoded display state, on the absolute source axis and fenced by generation.** After a far seek lands, nothing in the log could tell "the pipeline has determined the display state here" from "it has produced nothing yet"; on a PGS track with no acquisition point those are indistinguishable from outside, and that distinction is the whole adjudication for a conformance harness. One line per active drain target, at post-seek reconstruction, on the 30 s cadence, at prefetcher EOF, and whenever the frontier's source changes: `[AetherEngine] #250 subtitle-resolution loadGen= seekGen= stream= coveredFrom= resolvedThrough= via= decodedThrough= reason=`. `resolvedThrough` is the decode window clamped to a harvest frontier, never the window's own lead edge (which would claim determination over unread bytes) and never the drain cursor alone (which stands still through every dialogue pause on a sparse track), with `via=prefetch|eof|pump` stating which frontier bounds the claim and therefore what the number is worth. Requested by cmcpherson274. No published property, no behaviour change.
+
+## [6.0.1] - 2026-07-29
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.0.1))
+
+### Fixed
+
+- **Every 5.x tag stopped resolving, and 6.0.0 pinned the cause.** LibDovi published the visionOS slices and the tvOS floor correction together as 1.1.0. A raised platform floor is a breaking change, so it belonged in a major: SwiftPM resolved that new minor into every consumer pinning `from: "1.0.x"`, then failed the build on the floor mismatch instead of backing off to a version that fits. Any AetherEngine 5.x tag, all of which declare tvOS 16 and `LibDovi from: "1.0.2"`, became unbuildable on a fresh resolve within hours of that release. Reported by cmcpherson274 while retesting #240 on 5.28.0. The same content is now published as LibDovi 2.0.0 and the 1.1.0 tag is withdrawn, so the 5.x line resolves back to 1.0.2 and builds again; this engine pins `from: "2.0.0"`. 6.0.0 itself points at the withdrawn tag and no longer resolves, so it is superseded by this release rather than merely followed by it.
+
+### Changed
+
+- **The subtitle side readers no longer take the link without leaving a trace.** `prefetchYielded` counts every priority yield, a seek in flight as much as a producer that is fetching, while the `yielded the link for` line is emitted once per continuous-yield-cap grant, so a session can legitimately show seconds of yield with no such line anywhere. Reading the two as one number is a mistake this codebase invited and then made in an issue reply. The memprobe now carries `prefetchValve=N` next to `prefetchYielded=Ns` so the escape hatch has a figure of its own, and the native subtitle readers log their grants in the same shape the #151 prefetcher does instead of taking them silently.
+
+## [6.0.0] - 2026-07-29
+
+**Superseded by 6.0.1: this tag pins the withdrawn LibDovi 1.1.0 and no longer resolves.**
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.0.0))
+
+### Added
+
+- **visionOS is a supported build platform.** `Package.swift` declares `.visionOS(.v1)`, and the engine builds for visionOS device and simulator against FFmpegBuild 2.4.0 and LibDovi 1.1.0, which carry the `xros` slices. Three source sites learned about the platform: the AV1 supplemental-decoder registration in `VTCapabilityProbe` (a platform absent from `#available` counts as available, so visionOS reached an API introduced in 26.2), the AirPlay observation (`AVPlayer.isExternalPlaybackActive` is unavailable there, so the whole serve-the-loopback-over-the-LAN path is compiled out and inert), and `SampleBufferRenderer` (`preventsDisplaySleepDuringVideoPlayback` does not exist and `preferredDynamicRange` arrives in 26.0). The tvOS-only display-criteria layer needed nothing: visionOS has no HDMI mode handshake, so the criteria-free routing the iOS path already uses applies. Playback on real hardware is unverified. Requested by jihongboo (#161).
+
+### Changed
+
+- **BREAKING: the tvOS floor is 17.0, up from 16.0.** This is a correction rather than a new requirement. LibDovi compiles its tvOS slices with `-mtvos-version-min=17.0` and declares `.tvOS(.v17)`, so a consumer building this engine against tvOS 16 was already linking a binary that never supported it; the manifest simply claimed otherwise. It surfaces now because the LibDovi release carrying the visionOS slices also carries that correction. Nothing else in the public API changed, and no symbol was removed or renamed.
+
+## [5.29.0] - 2026-07-29
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.29.0))
+
+### Fixed
+
+- **A remote HLS VOD source died when the load-time probe failed for an unrelated reason.** The AE#154 reroute onto the native remote-HLS bypass keys on the reader's typed `hlsPlaylistOnVODPath` classification, but that classification only reaches it when the load-time probe is the open that reads the playlist body. If the probe failed transiently first, the load fell through to the loopback path with no preopened demuxer, `HLSVideoEngine.start()` reopened the URL, and that second open produced the classification, which was then interpolated into `openFailed(reason:)` and lost its domain. A playable source failed terminally with `HLS playlist supplied to the VOD loopback path`, while a manual retry (whose first probe happened to see the body) played natively. The fallback open now rethrows both HLS classifications verbatim, and a load that reaches one takes the same AE#154 reroute, preserving URL, headers and resume position. Reported by qoli (#246).
+- **The remote-HLS bypass ignored the resume position.** `LoadOptions.nativeRemoteHLS` routes before the probe, and that branch never forwarded `startPosition`, so a VOD playlist restarted at zero whether the host requested the bypass directly or arrived on it through a reroute. VOD now honors the anchor; live keeps its no-initial-seek contract even when a host passes one.
+
+### Added
+
+- **Container chapters as `mediaChapters`.** Matroska and MP4 chapters are read off the probe demuxer at load and published as `@Published mediaChapters: [ChapterInfo]`, so a host can bind a chapter picker for ordinary files the way it already can for discs. Empty for disc sources, which keep publishing `discChapters`; unlike those, a container chapter's `startSeconds` is already a timestamp on the `seek(to:)` axis and needs no base (`selectChapter(id:)` stays disc-only). Ids are sequential in start order, untitled entries are numbered, and a chapter's duration runs to the next chapter's start rather than to its declared end, because muxers routinely write `end == start`. Contributed by natedogg058 (#179).
+- **System Now-Playing on the native video path, opt-in.** A host with a custom transport can now let the engine own an `MPNowPlayingSession` bound to the native player: set `ownsVideoNowPlayingSession` before `load()`, register transport commands on the published `videoNowPlayingSession`, and stage identity metadata with `setVideoNowPlayingInfo(_:)`, which is replayed onto every fresh `AVPlayerItem` (readiness-gate reloads, media fallback, in-place PiP swaps). The session lives on the native host, so it survives native->native reloads and keeps system Now-Playing ownership across a background pause, the same shape the audio path already had. It is off by default and must stay off under `AVPlayerViewController`, which owns Now-Playing itself; two owners leave an empty identity card and remote commands routed into a session with no handlers. Contributed by natedogg058 (#180).
+
+## [5.28.2] - 2026-07-29
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.28.2))
+
+### Fixed
+
+- **A disc image leaked every byte it read.** `HTTPDiscIOReader` and `FileIOReader` are driven from FFmpeg's read callback, which runs on a demux pump thread that stays inside one dispatch block for the whole session and so never drains its autorelease pool, so every body they bridged out on that thread was stranded until playback ended. On a remote Blu-ray ISO that is up to 8 MB per range request, several a second, once per reader fork (main demuxer, subtitle side demuxer, forward prefetcher), which is the ~30 MB/s of `mallocMB` growth the reporter measured; RSS looks flat because the pages are never touched again and go to the compressor, and the process is eventually jetsammed. Both readers now drain per read, and the SMB reader got the same treatment. Measured against a local range origin, 480 MB fetched left +968 MB in use before and 0 MB after, and 128 MB read through the file reader left +134 MB before and 0 MB after. A per-request `URLSession` fixes nothing here (+973 MB), which also retires the older reading of the AVIOReader leak as URLSession retaining completed bodies until invalidation: the owner was always the caller thread's pool. Reported by bitxeno (#243).
+
+### Added
+
+- **`discFetchedMB` in the memprobe.** The disc pull path had no byte counter at all (`avioFetchedMB` covers the AVIOReader path only), so on a disc-image session every engine-tracked pool reads flat while the reader forks pull tens of MB/s. Printed only when the path is in use, session-scoped like `t=`, so two probe lines give a rate.
+
+## [5.28.1] - 2026-07-29
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.28.1))
+
+### Fixed
+
+- **`SubtitleCue.placement` reached the host on sidecars but never on an embedded track.** 5.26.0 added the field and the decoders fill it correctly, but every operation on the retained cue store rebuilt the cue through the memberwise initializer to change one field, listing the fields it happened to know about. `placement` is defaulted there for source compatibility, so those call sites dropped it and still compiled. The decisive one stamps the session-monotonic id on every cue entering the store, so nothing arriving through the drained embedded path could carry a placement at all, and the #107 text trim would have dropped it a second time on each teletext page transition. That is the split the reporter saw: WebVTT placement worked because a sidecar's cues are published as decoded, teletext placement did not because it is an embedded track. Cue rebuilds now go through one copy helper that carries every field it is not asked to change. Reported by tresby (#233).
+
+## [5.28.0] - 2026-07-28
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.28.0))
+
+### Fixed
+
+- **Far seeks stop competing with the subtitle side reader for the source link.** On Matroska a subtitle-only side reader is a second full copy of the stream (`matroska_parse_cluster` reads every block off the wire, `matroska_parse_block` only then honours the discard flag), so a subtitled session asks the link for roughly twice the media rate. Above about 2x headroom nobody notices; at 1.3x to 1.5x, an ordinary Wi-Fi bench in front of a high-bitrate remux, the two readers split the link and the video path misses its deadlines. The reporter measured the same segment serving in 2.2 s alone and 7.5 s alongside the prefetcher, which expired the seek landing budget; the recovery then re-anchored, which jumped the clock, which rebuilt the prefetch session, which took more link, and landings stacked to 25 s. The video path now has priority: a side reader fetches while the pump is parked, yields while it is fetching, yields completely while a seek is in flight, keeps a bounded grace window after each anchor so a freshly selected track still fills, and takes the link back after a 60 s continuous yield so a pump that never parks cannot disable lookahead for a session. A playhead jump re-anchors the running prefetch session in place instead of tearing it down and building a new one, which since the bounded ranges of 5.24.0 cost an open, a Matroska cue-index prewarm and a positioning seek, each a full range off the link, once per jump. Measured on a shaped 1.4x-headroom bench: far-seek landings 23.5 s to 12.7 s at the median, source connections 35 to 21, and the side reader's share of the bytes roughly halved. Reported by cmcpherson274 (#240).
+
+### Added
+
+- **Per-reader link attribution in the log.** Every `AVIOReader` carries a label (`pump`, `prefetch`, `nativesubs`, `extract`), the connection-start line names it and reports its range length, and it is no longer `DEBUG`-only; the 30 s memprobe reports `pumpFetchedMB` next to `prefFetchedMB` plus the prefetcher's cumulative link yield. Without those, several readers against one origin are indistinguishable in a field log, and a single reader walking forward in bounded ranges reads like several concurrent connections.
+- **`aetherctl play --seek-pattern a,b,c` and `throttle-origin.py --shared`.** A list of absolute far-seek targets, one per `--seek-every` tick, with the elapsed time printed per seek; and a throttling mode that shapes the sum of all connections rather than each one. Per-connection shaping gives two readers the full rate each, so a contention defect cannot reproduce under it at all.
+
+## [5.27.0] - 2026-07-28
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.27.0))
+
+### Added
+
+- **External WebVTT subtitle files load at all.** The FFmpeg build carried the `webvtt` decoder but never the `webvtt` demuxer, so `avformat_open_input` rejected every standalone `.vtt` file with `AVERROR_INVALIDDATA` and a sidecar WebVTT track failed before a single cue was decoded, on every path that opens one. Same shape as the raw-PGS `sup` gap fixed in FFmpegBuild 2.1.3, and it hid for the same reason: the codec was present, so the failure looked like it had to be elsewhere. Requires FFmpegBuild 2.3.0, which this release pins.
+- **WebVTT cue settings reach the host after all: `line`, `position` and `align` arrive as `SubtitleCue.placement`.** 5.26.0 reported them as upstream-blocked, which was a conclusion about the wrong layer. libavcodec's WebVTT decoder really does drop them, and says so as a `@todo` in `webvttdec.c`'s file header, so nothing about the placement is in the ASS event line it synthesises. The demuxer keeps them: `libavformat/webvttdec.c` attaches the verbatim settings string to every packet as `AV_PKT_DATA_WEBVTT_SETTINGS`, and `matroskadec.c` propagates the same side data for WebVTT in Matroska. Both subtitle decoders now read it, and the packet store carries the string through a rebuild, since side data does not live in the payload and a stored packet would otherwise lose the placement a freshly demuxed one has. A percentage `line` becomes an anchor point plus the alignment row, anchored to the frame edge it is nearer (the spec's default line alignment would pin the box top at `line:90%` and hang a two-line cue off the frame); a `line` number keeps only the half of the frame it names, because line boxes need a rendered line height the engine does not have. An ASS `\an` or `\pos` still wins, since that came from the payload itself. `size` and `vertical` have no equivalent in the placement model and are ignored, and a `position` without a `line` keeps only the alignment column, because an anchor point needs both axes.
+
+### Fixed
+
+- **Teletext captions keep their vertical placement on pages libzvbi does not flag as subtitle pages.** `gen_sub_ass` derives the vertical anchor from the grid row itself and emits it as `{\anN}`, which the engine has read since 5.26.0, but that whole block sits behind `is_subtitle_page`. That flag comes from the row-0 page header (NEWSFLASH clear, SUBTITLE set, SUPPRESS_HEADER set), and when a broadcaster does not set all three, or the header has not been seen yet, the else path writes the whole page instead: one `" \N"` per grid row with the empty ones included, no `\an`, no per-row trim. The ordinal of the first non-blank row is then the only carrier of the position, and the edge trim was removing it before anything could read it. That ordinal now feeds libzvbi's own third-of-the-page formula rather than an invented scale, so a caption the broadcaster moved to the top of frame to clear a lower-third graphic stays there. Deliberately coarse: three bands is what the source encodes, and mapping each row to its own offset makes consecutive cues of different heights sit at different heights, which reads as a blink. It never overrides an `\an` that arrived, including `{\an2}`, which is explicitly bottom and produces exactly the empty derived output that "no information" would. Reported by tresby (#233).
+- **A styled cue trims the same whitespace an unstyled one does.** The plain path trimmed with `.whitespacesAndNewlines`, the styled path tested for a literal space, tab or newline, so a Unicode space (U+00A0 among them) survived on a styled cue and not on an unstyled one carrying the same text. Teletext cannot produce one, since libzvbi maps U+00A0 to a space and writes it as `\h`, but SRT, WebVTT and ASS payloads can.
+- **A blank teletext row that a colour change split into its own run folds like any other.** The #107 interior blank-line fold worked per run plus one run boundary, which misses the shape the source produces most easily: the padding of an otherwise empty row carries the spacing attribute that changes colour, so the blank row lands in a whitespace-only run of its own and breaks the chain between the two text rows. The fold now runs on the flattened sequence and re-splits along the original run boundaries, so run structure cannot hide a blank row from it.
+
+## [5.26.0] - 2026-07-28
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.26.0))
+
+### Added
+
+- **Text subtitle styling reaches the host instead of being stripped: bold, italic, underline, strikeout, colour, font face and size, plus the placement a cue asks for.** `SubtitleTextRun` gained `isBold`, `isItalic`, `isUnderlined`, `isStruckThrough`, `fontName` and `fontSize` alongside the colour it already carried, and `SubtitleCue` gained `placement` (`SubtitleTextPlacement`: an ASS numpad alignment and an optional anchor normalized to [0, 1] the same way `SubtitleImage.position` is). Both additions are source-compatible: the new initializer parameters are defaulted, so existing call sites are untouched. This needed no per-format parsing, because libavcodec converts every text subtitle format into an ASS event line before the engine sees it and the markup was arriving on `AVSubtitleRect.ass` the whole time. SRT goes through `ff_htmlmarkup_to_ass`, which turns `<b>/<i>/<u>/<s>` into `{\b1}/{\i1}/{\u1}/{\s1}`, `<font color=>` into `{\c&HBBGGRR&}`, `<font size=>` into `{\fs}` and `<font face=>` into `{\fn}`; WebVTT maps its own inline tags to the same overrides; dvb_teletext already decoded with `txt_format=ass`, which is why its colours alone survived. What discarded the rest was on this side: `cleanASSBody` stripped every `{...}` block with a regex, and the colour parser handled `\c`/`\1c` and documented that it ignored everything else. That parser is now a full override parser, so SRT, WebVTT, teletext and ASS all light up through one code path, and the teletext positioning that was arriving and being dropped comes with it. Lookalike tags are left alone rather than half-parsed (`\be` and `\bord` are not `\b`, `\iclip` is not `\i`, `\shad` is not `\s`, `\fscx` and `\fsp` are not `\fs`), `\r` resets the accumulated state, and `\an`/`\pos` are lifted out to the cue instead of splitting a run. `\pos` is normalized against the play resolution the line actually uses: a real ASS script's declared `PlayResX/Y` when its header provides one, otherwise libavcodec's 384x288 default, which is what the synthesised lines use. No option gates any of this. An unstyled cue still arrives as `.text` with the same string as before, so a host that only handles that case sees no change, and `.richText` was already a case every subtitle-rendering host had to handle for teletext.
+- **The software-path PiP compositor renders that styling instead of flattening it.** It previously reduced a rich-text cue to `runs.map(\.text).joined()` and drew every cue in one white font stacked from the bottom, so styling would have stopped at the PiP window. It now builds a per-run attributed line (per-run colour, font face, ASS-relative size, real CoreText bold and italic traits, underline, and a manually drawn rule for strikeout, which CoreText has no attribute for) and honours a cue's placement, mapping the ASS numpad alignment to a corner inset by the layout margin, or anchoring the block on an explicit `\pos`. Cues without placement keep the existing bottom-up stack.
+
+### Notes
+
+- WebVTT cue settings (`line`, `position`, `align`, `size`, `vertical`) still do not arrive: libavcodec does not convert them, as `webvttdec.c` states in its own file header. WebVTT bold, italic and underline work; WebVTT positioning needs an upstream change. SRT positioning arrives only when the demuxer supplies `AV_PKT_DATA_SUBTITLE_POSITION` side data, which most `.srt` files do not carry, though a leading `{\anN}` in the text survives libavcodec's conversion.
+
+## [5.25.2] - 2026-07-28
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.25.2))
+
+### Fixed
+
+- **The native subtitle readers anchor their positioning seek on the subtitle axis too.** Same defect as #234 reached from the other direction, and not part of that regression: these readers seek before they set their discard flags, so at seek time every stream is still `AVDISCARD_DEFAULT`, every stream collects `av_find_default_stream_index`'s +200 for `discard != AVDISCARD_ALL`, and video takes the reference on its own +75. There was never an accidental subtitle anchor here to lose, so this predates #230 entirely, but the consequence is the one #234 describes: on Matroska the seek lands in the cluster holding the last video keyframe, and a cue that starts further back is behind the read head before the first packet arrives. These readers feed the native WebVTT renditions, so what went missing was the line that should be on screen where a seek lands. The anchor is now the lowest routed subtitle stream, and the `native subtitle readers started` line carries `anchor=<index>`. A whole-program read (Sodalite#32) starts at 0 and is unaffected either way.
+- **Subtitle packets sharing a PTS are all retained instead of overwriting one another.** Insertion into the packet store treated the timestamp as a unique key, so a packet landing on an already-occupied PTS replaced the entry sitting there. The premise was that a repeated PTS could only mean the pump and the forward prefetcher re-harvesting the same packet (#151), which is a real overlap and does need collapsing, but it is not the only way two packets share a timestamp. ASS/SSA authors overlapping lines on identical Start/End as a matter of course, and a karaoke or layered-style track emits a whole burst of distinct Dialogue events on one: the #56 measurement of a real track found 1534 packets on exactly pts=5.207000. Every member of such a burst but the last was discarded on write, so a heavily styled track reached the renderer with most of its events missing. That is what the report measured from a host wrapper, 245 processed events where the track carries 2054 in the same range, a count that tracked the 268 distinct timestamp pairs rather than the events themselves. A re-harvest is byte-identical to what it duplicates, and that, rather than the bare timestamp match, is the signature the collapse now tests. Anything else joins the run at its end, so a shared timestamp reaches the drainer in harvest order and overlapping lines layer in the order they were authored instead of reversed. The insert position is now found by binary search rather than scanned from the front, which cost little while a burst collapsed to a single entry and costs real time now that it does not: the scan made one append linear in retained packets and a session's harvest quadratic. Reported and fixed by fivepandasna (#235).
+
+## [5.25.1] - 2026-07-28
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.25.1))
+
+### Fixed
+
+- **The subtitle forward prefetcher positions on the subtitle axis explicitly, so a seek landing several keyframes behind the destination is delivered again.** 5.23.11 added a pacing stream at `AVDISCARD_NONKEY` (#230) to give the reader a read-position control point between sparse cues, and that flag silently moved the seek. The reader positions with `avformat_seek_file(ctx, -1, ...)`, and a -1 stream index leaves the reference stream to `av_find_default_stream_index`, whose score awards +200 to any stream with `discard != AVDISCARD_ALL`. Until 5.23.10 the subtitle stream was the only stream not fully discarded and therefore won that vote, 200 to 75, by accident rather than by intent: the target was measured on the subtitle axis and the seek landed on the last cue at or before it. `AVDISCARD_NONKEY` is not `AVDISCARD_ALL`, so from 5.23.11 the pacing stream collected the same +200 and video outranked it at 275. On Matroska the seek then jumps to the cluster holding the last video keyframe and everything in earlier clusters is never read, so a line that starts well behind the destination, the shape a long cue with a distant clear produces, was gone before the first packet arrived. Nothing downstream could recover it: the landing display set was never decoded, so neither the #143 candidate seed nor the #204 finalize ever saw it. The anchor is now passed explicitly (`seekBounded(to:anchorStreamIndex:timeout:)`), which also converts the target into that stream's own time base, so positioning no longer depends on what else the source happens to deliver. The park from #230 is unchanged. Not reproducible on MP4, which is why the #230 tests did not catch it: `mov_read_seek` re-seeks every stream individually and backwards, while `matroska_read_seek` jumps to one cluster position for all of them. Reported by cmcpherson274 with a bisection across four releases on identical fixture bytes (#234).
+
+## [5.25.0] - 2026-07-28
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.25.0))
+
+### Changed
+
+- **A declared interlaced field order is now verified against decoded frames before it routes a stream to software.** H.264 that declares interlaced carriage takes the software path so the deinterlacer can run, because tvOS AVPlayer does not deinterlace and 1080i broadcast would otherwise comb. On progressive-in-interlaced-carriage (PsF) that detour never deinterlaces anything, and European 25 fps Blu-ray masters are exactly that class, Blu-ray having no 1080p25: interlaced carriage, progressive pictures. The two signals disagree by construction. `h264_parser.c` reports `AV_FIELD_TT` for a frame-coded picture on SEI `pic_struct=3` alone, weighing neither `ct_type` nor how the slices were actually coded, while `h264_slice.c` weighs both and leaves `AV_FRAME_FLAG_INTERLACED` clear on that same picture. Routing consumed the structurally less informed of the two, so those titles gave up hardware decode, and the power and thermal headroom that goes with it, for a filter that never built a graph. `InterlaceProbe` now decodes a short sample first and applies the exact predicate that engages the deinterlacer, so it never has to judge content: `SoftwareVideoDecoder` engages on that frame flag and on nothing else, so a sample in which the flag never appears proves the detour would be a no-op and the native path renders the same frames with hardware decode. Only a clean sample overrules the declaration, an inconclusive one keeps the previous routing, and a flagged frame ends the sample at once, so genuinely interlaced material pays a frame or two of decode rather than a full sample (29 ms against 104 ms measured on 1920x1080). Seekable VOD only: the sample moves the read position of the demuxer the session reuses, and live 1080i broadcast, the case the rule exists for, is neither seekable nor mis-declared. Reported by rrgomes (#232).
+
+## [5.24.0] - 2026-07-28
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.24.0))
+
+### Changed
+
+- **The persistent reader now requests a bounded range at a time instead of the rest of the file.** 5.23.12 bounded the resident window by ending the connection once it passed 48 MB, which caught the damage but left the cause: the reader asked for `bytes=X-`, the entire remainder of the source, and then tried to regulate the resulting flow by suspending the URLSession task, which CFNetwork treats as advisory. It now asks for 32 MB and re-requests at the frontier once the consumer drains below the 8 MB low water, so the resident window is bounded by construction (low water plus one range, 40 MB) rather than by reaction, and no delivered byte is discarded or re-fetched at a boundary. The refill is issued from the low-water crossing rather than from an empty window, so a range boundary does not become a stall. A full range delivery is recognised as a planned end and takes its own path: no backoff, no unproductive-reconnect charge, no `.reconnecting` phase and no `lastUnplannedReconnectAt`, because nothing failed and spending the give-up budget on range boundaries would kill the reader on a healthy link. All persistent connections now share one `URLSession` with a per-task delegate, the pattern the chunk path has used since the task-pool leak was fixed, so a range boundary is not a TLS handshake; releasing a connection is `task.cancel()` rather than session teardown. Live sources and any source whose total size is not yet resolved keep the open-ended form. Measured against a real 52.7 GB 4K HEVC remux over a link shaped to 1.46x media rate, the band where the defect actually appears: post-suspend delivery 29-124 MB to zero, cap events 8 to zero, malloc 142-201 MB to 92-151 MB, window peak 51 MB to 21 MB, with playback, subtitle counts and stall counts unchanged. Keep-Alive verified from the server side, 90 range requests served over 3 connections. The 48 MB cap and the task suspend both stay in place as a net that should now never engage, so a firing cap is a signal rather than the normal ceiling.
+
+## [5.23.12] - 2026-07-28
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.23.12))
+
+### Fixed
+
+- **A source served over a link only moderately faster than the content no longer grows the reader's window without bound.** The persistent reader applies backpressure by suspending the URLSession task above a 16 MB high water, and `suspend()` is advisory: CFNetwork keeps draining the socket and delivering to the delegate. Whether that matters depends on the link, which is why it went unseen. Against a fast origin the socket buffer fills, TCP throttles the sender, and the suspend is never asked to hold anything, so every measurement looks correct, including this project's own regression test for the mechanism. Against an origin delivering a moderate multiple of media rate the socket never fills and every byte is accepted while the task is flagged suspended: measured at 911 MB post-suspend on one reader with the window climbing linearly, and over 3 GB across both readers on a real 4K remux, taking the host machine down. The resident window is now bounded at 48 MB, three times the high water, past which the connection is ended deliberately and re-requested at the frontier once the consumer has drained it, so no delivered byte is discarded or re-fetched. The bound is sized against the peak rather than the window, since crossing it is a `Data` realloc that holds both buffers at once; a field capture with an earlier 128 MB bound in place still reached 1003 MB of live allocation with two blocks at 153 and 129 MB. Two readers exist on a subtitled source and both were affected, on the native path as much as the software one: on a direct-play source the native path runs the HLS loopback and demuxes from the origin itself. Healthy sessions sit at 16-21 MB on macOS and tvOS alike and never reach the bound. Reported and field-verified by rrgomes (#220).
+- **The malloc census no longer aborts the process it is measuring.** Its recorder runs inside `malloc_zone`'s in-use enumerator with every zone held through `force_lock`, so it must not allocate, and `for i in 0..<Int(count)` iterates a `Range` through `IndexingIterator`'s protocol witness when the call is not specialized. That allocates, which takes the same `os_unfair_lock` recursively, and libplatform aborts with "Trying to recursively lock an os_unfair_lock". Optimized builds specialize the range away and never reach it, so release builds were fine while debug builds died on the first census.
+
+### Added
+
+- **Per-reader window diagnostics in the periodic memory probe.** `pumpWinMB` / `prefWinMB` (resident window), `AheadMB` (undrained forward extent, the quantity the suspend gates on), `Susp` and `PostMB` (bytes the delegate accepted while the task was already flagged suspended) for the playback reader and the subtitle side reader separately, on both the software and native paths. `PostMB` is what separates backpressure that never engaged from backpressure that engaged and was ignored; the suspend flag alone reads identically in the healthy and the failing case.
+- **A prefetch gauge in the same line.** `prefetch=` reports the subtitle forward prefetcher's state and, once stopped, why (`eof`, `failed`, `openfail`, `cancelled`), alongside `prefetchLead`, `prefetchHarvested` and `prefetchTbFallback`. The reader works a full lead ahead of the playhead, so it reaches EOF before playback ends and a bare "stopped" state fired on every completed session.
+- **`Scripts/throttle-origin.py`**, a range-preserving throttling proxy that puts a chosen link shape in front of a real server, in single-URL or whole-server form, logging per-connection byte totals. Defects that only appear at a moderate multiple of media rate are not reachable by repeating runs on a fast link.
+
 ## [5.23.11] - 2026-07-27
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.23.11))

@@ -21,8 +21,8 @@ extension AetherEngine {
         // nativeClockSeconds preserves the raw AVPlayer clock for onPlaylistShiftChanged to re-derive against.
         nativeClockSeconds = value
         // Newest seam at or before the raw clock wins: activates seams on forward play, re-applies pre-seam shift on backward DVR seeks.
-        if let active = liveShiftSeams.last(where: { value >= $0.activateAt }) {
-            playlistShiftSeconds = active.shift
+        if let active = presentationAxis.shiftSeconds(atItemSeconds: value) {
+            playlistShiftSeconds = active
         }
         if pendingRecoverySeekClockTarget == nil {
             // AE#105: fold the disc's clip-0 STC base back out so the published playhead sits on the same
@@ -132,6 +132,31 @@ extension AetherEngine {
     /// Lean native-HLS live path: AVPlayerItem from the remote URL on the reused NativeAVPlayerHost. No Demuxer, no HLSVideoEngine, no loopback, no display-criteria handshake (AVKit drives match-content). Live-window surfaces come from `host.seekableEnd`.
     /// `startPosition` (AE#154): resume anchor for VOD playlists on the loopback reroute; nil keeps
     /// the historical no-initial-seek behavior every live caller relies on.
+    /// Build a native host carrying the current Now-Playing ownership choice. Read at creation only:
+    /// a host preserved across a native->native reload (issue #15) keeps what it was created with,
+    /// which is the point, since re-creating it is what breaks AVKit's MediaRemote registration.
+    func makeNativeHost() -> NativeAVPlayerHost {
+        #if os(tvOS) || os(iOS)
+        return NativeAVPlayerHost(ownsNowPlayingSession: ownsVideoNowPlayingSession)
+        #else
+        return NativeAVPlayerHost()
+        #endif
+    }
+
+    /// Replay the staged Now-Playing identity onto a host, and re-assert session ownership. The
+    /// re-assert mirrors the audio path: a preserved host never re-runs init, so a session another
+    /// app took over in the meantime would otherwise never be claimed back. Both no-op for a host
+    /// that owns no session.
+    func replayVideoNowPlayingInfo(to host: NativeAVPlayerHost) {
+        #if os(tvOS) || os(iOS)
+        guard host.ownsNowPlayingSession else { return }
+        if !pendingVideoNowPlayingInfo.isEmpty {
+            host.setNowPlayingInfo(pendingVideoNowPlayingInfo)
+        }
+        host.becomeActiveNowPlaying()
+        #endif
+    }
+
     func loadRemoteHLS(url: URL, options: LoadOptions, startPosition: Double? = nil) async throws {
         playbackBackend = .native
         // #168 follow-up: detect a superseding load()/stop() between the carriage verdict and the reroute.
@@ -141,12 +166,13 @@ extension AetherEngine {
         if let existing = nativeHost {
             host = existing
         } else {
-            host = NativeAVPlayerHost()
+            host = makeNativeHost()
         }
         host.playerLayer.videoGravity = _videoGravity
         if !pendingExternalMetadata.isEmpty {
             host.setExternalMetadata(pendingExternalMetadata)
         }
+        replayVideoNowPlayingInfo(to: host)
         self.nativeHost = host
         // A surface bound BEFORE load ran presentCurrentLayer() while nativeHost was still nil
         // (no-op); without this re-present nothing ever attaches host.playerLayer and AVPlayer
@@ -155,7 +181,7 @@ extension AetherEngine {
         applyDesiredVolume(to: host)
         // No loopback producer; playhead is the raw AVPlayer clock. Shift stays 0.
         self.playlistShiftSeconds = 0
-        self.liveShiftSeams.removeAll()
+        self.setPresentationAxis(PresentationAxisMap())
         if currentAVPlayer !== host.avPlayer {
             self.currentAVPlayer = host.avPlayer
         }
@@ -400,35 +426,57 @@ extension AetherEngine {
             maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration,
             forwardBufferSegments: loadedOptions.forwardBufferSegments
         )
+        // #240: the pump claims the source link through this gate while it is fetching, so the
+        // subtitle side readers can stay out of its way. Set before start().
+        session.sideReaderLinkGate = sideReaderLinkGate
+        // #260: an observer installed before load has to reach this session's producers too.
+        session.setNativeVideoFrameTimeObserver(nativeVideoFrameTimeObserver)
         session.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
         }
-        session.onPlaylistShiftChanged = { [weak self] seconds in
+        session.onPlaylistShiftChanged = { [weak self] seconds, seamItemSeconds in
             Task { @MainActor in
                 guard let self = self else { return }
                 let prevShift = self.playlistShiftSeconds
                 let delta = seconds - prevShift
-                self.playlistShiftSeconds = seconds
-                // AE#105: a disc title's raw source PTS starts at clip 0's STC base (= this constant VOD shift)
-                // while its duration is the 0-based MPLS/IFO playlist length. Anchor the display origin to that
-                // base so the published playhead is 0-based like the total. Normal/live sources keep origin 0
-                // (their public axis already equals source PTS), so this whole change is a no-op off disc.
-                self.sourcePresentationOrigin = (!self.discTitles.isEmpty && !self.isLive) ? seconds : 0
-                // Seed seam history: activateAt=-.infinity covers the full output timeline from the start.
-                self.liveShiftSeams = [(activateAt: -.infinity, shift: seconds)]
+                // AE#105 / AE#270: `duration` is 0-based for every source, so the published playhead has to
+                // be too. The origin is the source PTS of the item's first frame: a disc re-reads it from
+                // every publish (constant STC base), any other VOD source latches the first one (its later
+                // shifts carry producer drift), live keeps 0. See `PresentationOriginPolicy`.
+                self.sourcePresentationOrigin = PresentationOriginPolicy.origin(
+                    latched: self.latchedPresentationOrigin,
+                    publishedShift: seconds,
+                    isLive: self.isLive,
+                    isDisc: !self.discTitles.isEmpty
+                )
+                self.latchedPresentationOrigin = self.sourcePresentationOrigin
+                // #260: a live retune/reopen replaces the whole timeline (nothing older comes back on screen), so
+                // the history re-anchors. A VOD producer only writes from `seamItemSeconds` forward; whatever sits
+                // below that on the item axis was muxed by the previous producer, can still be in AVPlayer's
+                // buffer, and has to keep folding with the previous shift. Collapsing the history here (as this
+                // did before) hands every consumer the new shift for old-epoch bytes.
+                if self.isLive {
+                    self.setPresentationAxis(.anchored(shiftSeconds: seconds))
+                } else {
+                    var map = self.presentationAxis
+                    map.appendSeam(shiftSeconds: seconds, activatingAtItemSeconds: seamItemSeconds)
+                    self.setPresentationAxis(map)
+                }
+                // Fold with the shift in effect AT the raw clock, not with the newest one: while old-epoch buffer
+                // is still on screen those differ, and the picture is what the clock has to describe.
+                let activeShift = self.presentationAxis.shiftSeconds(atItemSeconds: self.nativeClockSeconds) ?? seconds
+                self.playlistShiftSeconds = activeShift
                 // Re-fold immediately so currentTime doesn't lag the next periodic tick (origin-corrected).
-                self.clock.currentTime = PresentationAxis.display(sourcePTS: self.nativeClockSeconds + seconds,
+                self.clock.currentTime = PresentationAxis.display(sourcePTS: self.nativeClockSeconds + activeShift,
                                                                   origin: self.sourcePresentationOrigin)
                 // sourceTime re-folds on next $renderedTime tick; keeping it there tracks the rendered picture, not the optimistic clock (#49).
-                // #65 diag: every VOD producer (re)start collapses the seam history to one entry here. If `delta`
-                // is non-zero while AVPlayer still holds old-epoch buffer (avBufAhead > 0), the buffered bytes
-                // keep folding with the NEW shift, so the picture leads the folded clock by ~delta. A burst that
-                // logs two distinct shift= values confirms the cross-epoch divergence (Root A); an invariant
-                // shift across the burst points at the orthogonal playlist-startSeconds-vs-tfdt root (Root B).
                 EngineLog.emit(
-                    "[AetherEngine] #65 VOD shift published: \(String(format: "%.3f", seconds))s "
+                    "[AetherEngine] VOD shift published: \(String(format: "%.3f", seconds))s "
                     + "(prev \(String(format: "%.3f", prevShift))s, delta \(String(format: "%.3f", delta))s, "
-                    + "changed=\(abs(delta) > 0.001 ? "YES" : "no")) seams->1 "
+                    + "changed=\(abs(delta) > 0.001 ? "YES" : "no")) "
+                    + "seamAt=\(String(format: "%.3f", seamItemSeconds))s "
+                    + "seams=\(self.presentationAxis.seams.count) "
+                    + "foldShift=\(String(format: "%.3f", activeShift))s "
                     + "presentationOrigin=\(String(format: "%.3f", self.sourcePresentationOrigin))s "
                     + "rawClock=\(String(format: "%.2f", self.nativeClockSeconds))s "
                     + "avBufAhead=\(String(format: "%.2f", self.avPlayerBufferAheadSeconds()))s",
@@ -500,13 +548,10 @@ extension AetherEngine {
             Task { @MainActor in
                 guard let self = self else { return }
                 // Program boundary: producer rebased but AVPlayer is still rendering old program (buffer + holdback). Record the seam so $currentTime resolves the active shift from history, keeping currentTime/sourceTime behind what is on screen. Backward DVR seeks re-apply the pre-seam shift. Seams append in output-timeline order (continuation dts is monotonic).
-                self.liveShiftSeams.append(
-                    (activateAt: seamOutputSeconds, shift: seconds)
-                )
-                if self.liveShiftSeams.count > 64 {
-                    // Cap history; losing the oldest only reduces fidelity for DVR positions past 60+ program boundaries.
-                    self.liveShiftSeams.removeFirst(self.liveShiftSeams.count - 64)
-                }
+                var map = self.presentationAxis
+                // Cap inside appendSeam; losing the oldest only reduces fidelity for DVR positions past 60+ program boundaries.
+                map.appendSeam(shiftSeconds: seconds, activatingAtItemSeconds: seamOutputSeconds)
+                self.setPresentationAxis(map)
             }
         }
         session.onLiveSourceReset = { [weak self, weak session] in
@@ -699,6 +744,15 @@ extension AetherEngine {
             try checkLoadCurrent(generation)
         }
         self.nativeVideoSession = session
+        // AE#270: anchor the display axis on the container's own start time, which is what `duration` is
+        // measured from. Taking it from the session rather than latching the first published shift keeps a
+        // 0-based source byte-identical to the pre-#270 behaviour: the shift also carries the producer's
+        // initial drift (-0.08 s on a B-frame MP4 whose first PTS is 0), the container start does not.
+        // Live and disc keep their own rule (`PresentationOriginPolicy`).
+        if !isLive, discTitles.isEmpty {
+            latchedPresentationOrigin = session.sourceStartSeconds
+            sourcePresentationOrigin = session.sourceStartSeconds
+        }
         nativeSubtitleRenditionsServed = served.subtitleRenditionsServed
         extractorYieldState.activate(session: session)
 
@@ -740,13 +794,14 @@ extension AetherEngine {
         if let existing = nativeHost {
             host = existing
         } else {
-            host = NativeAVPlayerHost()
+            host = makeNativeHost()
         }
         host.playerLayer.videoGravity = _videoGravity
         // Forward pre-load externalMetadata so the AVPlayerItem picks it up before AVPlayer assigns it.
         if !pendingExternalMetadata.isEmpty {
             host.setExternalMetadata(pendingExternalMetadata)
         }
+        replayVideoNowPlayingInfo(to: host)
         self.nativeHost = host
         applyDesiredVolume(to: host)
         // Publish before wiring mirrors so subscribers see the AVPlayer before the first time update. Only emit on change: re-publishing the same instance retriggers the AVKit re-registration this reuse path avoids.
@@ -764,7 +819,7 @@ extension AetherEngine {
         host.$renderedTime
             .sink { [weak self] value in
                 guard let self = self else { return }
-                let shift = self.liveShiftSeams.last(where: { value >= $0.activateAt })?.shift
+                let shift = self.presentationAxis.shiftSeconds(atItemSeconds: value)
                     ?? self.playlistShiftSeconds
                 // #93 PiP skips: AVKit-side seeks never reach the engine seek API; a far rendered-
                 // time jump is the engine-visible signal to re-anchor the subtitle readers.
@@ -783,8 +838,11 @@ extension AetherEngine {
                     ) {
                         // A late landing settled the clock onto the target; if the deadline loop held the
                         // clock at the target and returned without finalizing (slow-source spinner path),
-                        // leave `.seeking` now that the frame is presented.
-                        self.finalizeLateRecoverySeekLanding()
+                        // leave `.seeking` now that the frame is presented. Also where a seek that already
+                        // gave up (`.stalled`) finally reports `.landed` (AE#38 follow-up).
+                        self.finalizeLateRecoverySeekLanding(
+                            rendered: PresentationAxis.display(sourcePTS: value + shift,
+                                                               origin: self.sourcePresentationOrigin))
                     } else {
                         let prev = self.lastRenderedForPendingSeek
                         if value > prev, value - prev < 1.0 {
@@ -810,6 +868,9 @@ extension AetherEngine {
                         self.lastRenderedForPendingSeek = value
                     }
                 }
+                // AE#38 follow-up: a native scrub's in-flight window ends when the PICTURE reaches the
+                // scrub target, not when the coalesced restart run drains.
+                self.checkPendingScrubLanding(rendered: value)
                 // #65: mirror AVPlayer's rendered (playlist-axis) position for off-main wedge re-anchoring.
                 self.renderedPositionMirror.set(value)
                 self.clock.sourceTime = value + shift
@@ -1112,7 +1173,7 @@ extension AetherEngine {
         }
         // SW path has no AVPlayer-clock fold; the host's synchronizer is the only clock.
         self.playlistShiftSeconds = 0
-        self.liveShiftSeams.removeAll()
+        self.setPresentationAxis(PresentationAxisMap())
 
         softwareCancellables.removeAll()
         host.$currentTime
@@ -1186,7 +1247,7 @@ extension AetherEngine {
         self.audioHost = host
         applyDesiredVolume(to: host)
         self.playlistShiftSeconds = 0
-        self.liveShiftSeams.removeAll()
+        self.setPresentationAxis(PresentationAxisMap())
 
         audioCancellables.removeAll()
         host.$currentTime
@@ -1251,7 +1312,7 @@ extension AetherEngine {
         applyDesiredVolume(to: host)
         self.audioAVPlayerActive = true
         self.playlistShiftSeconds = 0
-        self.liveShiftSeams.removeAll()
+        self.setPresentationAxis(PresentationAxisMap())
         // Reclaim Now-Playing ownership for this session on each track start,
         // so the Home badge + remote commands stay bound across a pause.
         host.becomeActiveNowPlaying()
@@ -1524,7 +1585,15 @@ extension AetherEngine {
                 activeAudioDecoder = nativeVideoSession?.audioPipelineDescription
                 presentCurrentLayer()
                 // Wait for pending AVKit display-criteria handshake before resuming (first frame must not hit a mid-transition panel).
-                await displayCriteria.waitForSwitch()
+                // #274: this reload preserved the criteria (resetDisplayCriteria: false) and re-applies none,
+                // so only a sole-writer host's re-write on the swapped item can still switch anything; the
+                // published (panel-clamped) format decides whether that can be a dynamic-range switch.
+                await displayCriteria.waitForSwitch(startGrace: Self.playGateGrace(
+                    criteriaUnchanged: false,
+                    engineIsCriteriaWriter: !loadedOptions.suppressDisplayCriteria,
+                    formatKnown: true,
+                    effectiveFormat: videoFormat
+                ))
                 try checkLoadCurrent(gen)
                 nativeHost?.play()
             }

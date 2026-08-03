@@ -31,6 +31,16 @@ The view is polymorphic: under the hood the engine swaps the hosted CALayer (`AV
 
 You provide the transport bar. You provide the dropdowns. You provide the pretty.
 
+## Used by
+
+<!-- used-by:start -->
+- [Sodalite](https://github.com/superuser404notfound/Sodalite): native Jellyfin client for Apple TV.
+- [AetherPlayer](https://github.com/superuser404notfound/AetherPlayer): native macOS media player.
+- [NowSeen](https://discord.com/invite/7AFh3Hy8p4): IPTV / Manifest app for tvOS.
+<!-- used-by:end -->
+
+Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed here and on [aetherengine.superuser404.de](https://aetherengine.superuser404.de).
+
 ## What it handles
 
 A scannable summary; the depth for each row lives in **[docs/formats.md](docs/formats.md)**.
@@ -40,7 +50,7 @@ A scannable summary; the depth for each row lives in **[docs/formats.md](docs/fo
 | Containers | MKV, MP4, WebM, MPEG-TS, AVI, OGG, FLV |
 | Disc | DVD-Video and Blu-ray ISO (decrypted): selectable titles and chapters, demuxed through the normal path |
 | Video (HW) | H.264, HEVC, HEVC Main10 via VideoToolbox; AV1 where HW AV1 exists |
-| Video (SW) | AV1 (dav1d) without HW, VP9 / VP8, MPEG-4 Part 2 / MPEG-2 / VC-1, H.264 High 4:2:2 / 4:4:4 / 10 and HEVC Rext where VideoToolbox has no HW decoder (Intel Macs, older chips), interlaced H.264 (AVPlayer does not deinterlace); GPU deinterlace (yadif_videotoolbox, Metal, field-rate by default) with a CPU bwdif fallback |
+| Video (SW) | AV1 (dav1d) without HW, VP9 / VP8, MPEG-4 Part 2 / MPEG-2 / VC-1, H.264 High 4:2:2 / 4:4:4 / 10 and HEVC Rext where VideoToolbox has no HW decoder (Intel Macs, older chips), interlaced H.264 (AVPlayer does not deinterlace; on VOD the declared field order is verified against decoded frames, so progressive-in-interlaced-carriage keeps hardware decode); GPU deinterlace (yadif_videotoolbox, Metal, field-rate by default) with a CPU bwdif fallback |
 | HDR | HDR10, HDR10+ (per-frame ST 2094-40), Dolby Vision (P5, P7 as single-layer 8.1, P8.1, P8.4, AV1 P10.x), HLG |
 | Audio | AAC, AC3, EAC3, FLAC, ALAC stream-copy lossless; TrueHD / DTS / DTS-HD MA / MP3 / Opus bridge to EAC3 5.1 (default) or lossless FLAC |
 | Dolby Atmos | EAC3+JOC stream-copied on every route (HDMI MAT 2.0, AirPods spatial, BT downmix). No container reliably declares JOC pre-decode, so an honest `TrackInfo.isAtmos` needs a bounded decode: `AetherEngine.probeDetectingAtmos(url:/source:)` answers for a details screen without starting playback, and `LoadOptions.confirmAtmos` has the running session confirm its own tracks in the background and republish `audioTracks`. Both are opt-in and neither sits on the playback-start path |
@@ -112,13 +122,27 @@ player.$state          // .idle, .loading, .playing, .paused, .seeking, .ended, 
                        // .ended = played to completion (any backend); .idle = pre-load / stopped
 player.$duration
 player.$videoFormat    // .sdr, .hdr10, .hdr10Plus, .dolbyVision, .hlg
-player.$isSeeking      // true until a seek physically lands (programmatic + native scrubs)
+player.$isSeeking      // true until a seek physically lands (programmatic + native scrubs, and
+                       // seeks stashed before the session can take them)
 player.$seekTarget     // in-flight seek destination (source-PTS), nil otherwise
+player.seekEvents      // AnyPublisher<SeekEvent, Never>: .began / .landed(renderedTime:) /
+                       // .stalled / .superseded / .rejected, each with the target it belongs to.
+                       // Use this where the FALLING edge of $isSeeking matters: the level cannot
+                       // say whether a seek landed, gave up, or was superseded, and a seek that
+                       // gave up can still land minutes later on a stalled source.
 player.$playbackPhase  // unified: .idle/.loading/.playing/.paused/.seeking/.rebuffering/
                        // .stalled(reconnecting:)/.ended/.error. One source of truth for a status
                        // spinner; derived from state + isBuffering + isSeeking + source reconnect.
                        // Prefer this over stitching the raw signals or matching EngineLog text.
 player.$currentAVPlayer // active AVPlayer, re-emitted on every reload (MPNowPlayingSession)
+
+// System Now-Playing on the native video path (tvOS / iOS). Off by default: an
+// AVPlayerViewController host already gets this from AVKit and must NOT opt in.
+// Custom-transport hosts set it before load(), then register commands on the
+// session and stage identity through setVideoNowPlayingInfo.
+player.ownsVideoNowPlayingSession = true
+player.videoNowPlayingSession                  // MPNowPlayingSession?, nil unless opted in
+player.setVideoNowPlayingInfo([ /* MPMediaItemProperty… */ ])
 
 // Time lives on player.clock, a SEPARATE ObservableObject, so the ~10 Hz
 // ticks never fire objectWillChange on the engine (track lists / state views
@@ -133,7 +157,18 @@ player.selectAudioTrack(index: trackID)
 player.subtitleTracks                          // [TrackInfo], text + bitmap + external, one list
 player.selectSubtitleTrack(index: streamID)
 player.clearSubtitle()
-player.$subtitleCues                           // [SubtitleCue]: .text(String), .richText([SubtitleTextRun]) (coloured teletext), or .image(SubtitleImage)
+player.$subtitleCues                           // [SubtitleCue]: .text(String), .richText([SubtitleTextRun]), or .image(SubtitleImage)
+
+// #233: styled text arrives as .richText. A run carries colour, bold, italic, underline,
+// strikeout, font face and an ASS-relative font size; the cue carries the placement it asks
+// for (numpad alignment plus an optional [0, 1] anchor). This covers SRT, WebVTT, teletext
+// and ASS alike, because libavcodec converts them all to ASS event lines before the engine
+// sees them. A cue with no styling still arrives as .text, so handling only that case keeps
+// working. WebVTT cue settings are the exception: libavcodec does not convert them, so VTT
+// positioning does not arrive (its inline bold/italic/underline does).
+for cue in player.subtitleCues {
+    if case .richText(let runs) = cue.body { render(runs, at: cue.placement) }
+}
 
 // External subtitle files are first-class tracks (#88): they appear in subtitleTracks
 // (isExternal == true, synthetic id) and select through the same call as embedded streams.
@@ -142,6 +177,9 @@ let track = player.addExternalSubtitleTrack(
 player.selectSubtitleTrack(index: track.id)
 // Declared at load instead, external tracks also join the native WebVTT renditions (PiP):
 // LoadOptions(prepareNativeSubtitles: true, externalSubtitles: [ExternalSubtitleTrack(url: srtURL, language: "en")])
+// When the URL is a container holding several subtitle streams, register one track per stream
+// with its absolute AVStream index; tracks sharing a URL are decoded in one pass (#266).
+ExternalSubtitleTrack(url: mkvURL, name: "Spanish", language: "es", sourceStreamIndex: 3)
 
 // Native WebVTT subtitle renditions (subtitles in PiP / AirPlay / external display; opt-in
 // via LoadOptions.prepareNativeSubtitles, details in docs/formats.md)
@@ -160,18 +198,35 @@ player.$discTitles                             // [TitleInfo]: id, name, duratio
 player.$selectedDiscTitle                      // TitleInfo?
 player.selectTitle(id: titleID)                // switch title (rebuilds from the new title's head)
 player.$discChapters                           // [ChapterInfo] for the selected title
-player.selectChapter(id: chapterID)            // seek to a chapter
+player.selectChapter(id: chapterID)            // seek to a chapter (disc chapters only)
+
+// Container chapters (Matroska / MP4; empty for disc sources, which publish discChapters instead)
+player.$mediaChapters                          // [ChapterInfo]; startSeconds are seek(to:) timestamps
 
 // Info panel / Now Playing (iOS / tvOS)
 player.setExternalMetadata([ AVMetadataItem(/* title, artwork, etc. */) ])
+
+// Frame-accurate host rendering on the native path (#260). Cue times, chapters and sourceTime live on
+// the SOURCE axis; AVPlayerItem.currentTime() and its timebase read the ITEM axis. They differ by the
+// producer shift, which steps at every producer epoch (a seek restart, a live program boundary).
+player.presentationAxisMap                        // conversion both ways, readable off the main actor
+player.presentationAxisMap.itemSeconds(forSourceSeconds: cue.startTime)   // stamp an overlay sample
+player.presentationAxisMap.sourceSeconds(forItemSeconds: item.currentTime().seconds)
+player.$currentAVPlayerItem                       // items swap in place; this is the signal for it
+
+// Per muxed video frame, on both axes at once. Called on the producer's pump thread in DECODE order,
+// so `source` is not monotonic under B-frames; sort before using it as a frame-boundary list.
+player.setNativeVideoFrameTimeObserver { frame in
+    frame.source; frame.item; frame.segmentIndex; frame.isKeyframe; frame.epoch
+}
 ```
 
-Subtitle cues land in raw source PTS; render the overlay against `player.sourceTime` (see [docs/formats.md › Subtitles](docs/formats.md#subtitles)). The 1 Hz diagnostics snapshot lives on `player.diagnostics.liveTelemetry`, off-the-engine for the same render-stability reason. Frame extraction, authored-ASS styling, and the full published surface are documented in [docs/formats.md](docs/formats.md).
+Subtitle cues land in raw source PTS; render the overlay against `player.sourceTime` (see [docs/formats.md › Subtitles](docs/formats.md#subtitles)). A host compositing its own overlay onto the native path (libass and friends) needs the item axis too, since that is what the compositor pairs its samples against: `presentationAxisMap` converts arbitrary positions, `setNativeVideoFrameTimeObserver` reports the frames themselves. Both return nothing rather than a guess when no axis is established, because a defaulted shift is indistinguishable from a measured one at the call site. The 1 Hz diagnostics snapshot lives on `player.diagnostics.liveTelemetry`, off-the-engine for the same render-stability reason. Frame extraction, authored-ASS styling, and the full published surface are documented in [docs/formats.md](docs/formats.md).
 
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "5.23.11")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.5.5")
 ```
 
 Two complementary samples ship in `Examples/`:
@@ -250,16 +305,6 @@ For an upstream AVPlayer can play natively (a standard remote `master.m3u8`, e.g
 
 A non-live remote `m3u8` handed to the default (loopback) path reroutes onto this bypass automatically: the bundled FFmpeg is built without network support, so the playlist can never be demuxed locally, and remote HLS is AVPlayer's native domain anyway (#154). On the bypass the engine surfaces the stream's external WebVTT subtitle renditions (the legible `AVMediaSelectionGroup`) as `subtitleTracks`; `selectSubtitleTrack(index:)` and `clearSubtitle()` drive AVPlayer's media selection, and AVPlayer renders the cues itself.
 
-## Used by
-
-<!-- used-by:start -->
-- [Sodalite](https://github.com/superuser404notfound/Sodalite): native Jellyfin client for Apple TV.
-- [AetherPlayer](https://github.com/superuser404notfound/AetherPlayer): native macOS media player.
-- [NowSeen](https://discord.com/invite/7AFh3Hy8p4): IPTV / Manifest app for tvOS.
-<!-- used-by:end -->
-
-Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed.
-
 ## Host setup on tvOS
 
 For HDR / Dolby Vision sources to play reliably on tvOS 26.5+, the engine must drive `AVDisplayManager.preferredDisplayCriteria` itself (synchronously, before the AVPlayerItem assignment). Apple Tech Talk 503 has prescribed this ordering since 2017, and tvOS 26.5 now enforces it synchronously at HLS variant validation: the validator rejects variants whose `VIDEO-RANGE` the panel can't currently host with `AVFoundationErrorDomain -11868`, before fetching the `EXT-X-MAP` init segment, producing `item.status = .failed` with zero `errorLog().events`. SDR variants are unaffected.
@@ -311,18 +356,19 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "5.23.11")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.5.5")
 ```
 
-Pin to `.upToNextMinor(from: "5.23.11")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "6.5.5")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 
 | | Min |
 | --- | --- |
 | iOS | 16.0 |
-| tvOS | 16.0 |
+| tvOS | 17.0 |
 | macOS | 14.0 |
+| visionOS | 1.0 |
 | Swift | 6.0 |
 | Xcode | 16.0 |
 
