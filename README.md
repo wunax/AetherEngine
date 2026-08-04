@@ -226,7 +226,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.5.6")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.6.3")
 ```
 
 Two complementary samples ship in `Examples/`:
@@ -303,6 +303,8 @@ Direct ingest covers MPEG-TS with demuxed-audio and packed-audio renditions, in-
 
 For an upstream AVPlayer can play natively (a standard remote `master.m3u8`, e.g. a Jellyfin live channel), `LoadOptions.nativeRemoteHLS` skips the demuxer probe and the loopback server entirely and hands the URL straight to AVPlayer, which manages the live edge and reconnect itself. Pair it with `isLive: true`. `LoadOptions.httpHeaders` rides into the `AVURLAsset` on this path, so origins that enforce per-stream `Referer` / `User-Agent` / `Authorization` headers (common for IPTV channels) work too.
 
+A live channel whose master advertises HEVC (or Dolby Vision / AV1) while delivering MPEG-TS segments is carriage AVFoundation builds no video track for, so the bypass would play it as audio over black. The engine recognizes that signature and reroutes the session onto the live ingest above (#168). The recognition runs alongside the mount: the playlist and the head of one segment are read while AVPlayer starts, so the reroute does not wait out a grace window, and a media playlist URL with no master to judge is covered too (#293). Only a codec the HLS Authoring Spec sanctions in fMP4 alone reaches that read, so an H.264 channel spends no extra request on it. `LoadOptions.nativeRemoteHLSIngestFallback = false` turns the whole recovery off.
+
 A non-live remote `m3u8` handed to the default (loopback) path reroutes onto this bypass automatically: the bundled FFmpeg is built without network support, so the playlist can never be demuxed locally, and remote HLS is AVPlayer's native domain anyway (#154). On the bypass the engine surfaces the stream's external WebVTT subtitle renditions (the legible `AVMediaSelectionGroup`) as `subtitleTracks`; `selectSubtitleTrack(index:)` and `clearSubtitle()` drive AVPlayer's media selection, and AVPlayer renders the cues itself.
 
 ## Host setup on tvOS
@@ -331,6 +333,18 @@ try await engine.load(url: url, options: LoadOptions(
 
 > **Custom chrome with a SwiftUI `Menu`?** On tvOS 26 an open `Menu`'s focused row blinks on any render transaction in the tree. Build the menu button in UIKit (`UIButton.menu` + `showsMenuAsPrimaryAction`) and guard `updateUIView` so the open dropdown never rebuilds. Pattern in [docs/architecture.md › SwiftUI Menu](docs/architecture.md#swiftui-menu-in-custom-player-chrome).
 
+## Diagnostics
+
+Every diagnostic line the engine emits goes to `os.Logger` under the subsystem `de.superuser404.AetherEngine`, one category per subsystem (`engine`, `session`, `demux`, `muxer`, `hls.server`, `audio.bridge`, `sw.playback`, `scrub`, `ffmpeg`). Release builds keep emitting; Console.app against the attached device, or `log stream --predicate 'subsystem == "de.superuser404.AetherEngine"'`, shows them without a debugger attached.
+
+A test rig that only captures stdout / stderr (`devicectl device process launch --console`, CI harnesses) sees none of that, because os_log is not stdio. Mirror the same lines into your own capture path with the host handler:
+
+```swift
+EngineLog.handler = { print($0) }   // every info-level line, verbatim
+```
+
+The handler fires from whatever thread emitted the line (demuxer, producer pump, local server, audio bridge), so it must be thread-safe and non-blocking; serialize onto a queue before writing to a file. Per-segment trace lines are emitted at `.verbose` and reach os_log's debug level only, never the handler, so the mirrored stream stays readable. `aetherctl` installs exactly this handler, which is why the CLI prints what the app hides.
+
 ## Non-goals
 
 Things AetherEngine deliberately doesn't do, so you don't have to read the source to find out:
@@ -356,10 +370,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.5.6")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.6.3")
 ```
 
-Pin to `.upToNextMinor(from: "6.5.6")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "6.6.3")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 

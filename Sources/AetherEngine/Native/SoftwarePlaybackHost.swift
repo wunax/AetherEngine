@@ -100,6 +100,12 @@ final class SoftwarePlaybackHost {
     /// the length of the reposition and then snap to the target.
     private var seekInFlight = false
 
+    /// Transport intent for the reposition currently in flight (#292). `seek` clears `isPlaying` to park
+    /// the loops, so a seek entering while another is suspended in its off-main reposition (#254) would
+    /// read that cleared flag as "was paused" and land a playing session at rate 0. Rewritten by
+    /// `pause()` / `play()` so an explicit transport call inside the window still wins.
+    private var inFlightSeekResumeIntent = false
+
     /// Guards isPlaying/stopRequested across demux thread reads and main-actor writes.
     private let flagsLock = NSLock()
     nonisolated(unsafe) private var _isPlaying: Bool = false
@@ -248,6 +254,67 @@ final class SoftwarePlaybackHost {
     }
 
     private var timeTimer: AnyCancellable?
+
+    // MARK: - Surface visibility (#298)
+
+    /// Where a software session's frames end up on screen, or why they cannot.
+    enum SurfaceVisibility: Equatable {
+        case onScreen
+        /// The display layer is in no view hierarchy: the host never bound a render surface.
+        case notInViewHierarchy
+        /// Attached, but the bound view never got a layout, so nothing can be visible.
+        case zeroSized(width: Int, height: Int)
+    }
+
+    /// #298: a software session renders into `renderer.displayLayer`, which only reaches the screen
+    /// once the host binds a surface (`AetherEngine.bind(view:)` / `AetherPlayerSurface`). A host that
+    /// presents an AVPlayerViewController instead gets audio, a completely healthy engine log, and no
+    /// picture, because this path has no AVPlayerItem for AVKit to show (its own spinner then sits
+    /// there forever). Neither condition left a trace before, so the report reads as a renderer stall.
+    /// "Never bound" wins over the size: an unbound layer is usually zero-sized as well, and the bind
+    /// is the actionable half.
+    nonisolated static func assessSurface(hasSuperlayer: Bool, size: CGSize) -> SurfaceVisibility {
+        guard hasSuperlayer else { return .notInViewHierarchy }
+        guard size.width > 0, size.height > 0 else {
+            return .zeroSized(width: Int(size.width), height: Int(size.height))
+        }
+        return .onScreen
+    }
+
+    /// Ticks (0.25 s each) the surface check waits after the first enqueued frame. A host binding its
+    /// view during load, and the first layout pass after that, both land well inside this.
+    private static let surfaceCheckTicks = 8
+
+    private var surfaceCheckTicksSeen = 0
+    private var surfaceChecked = false
+
+    /// Runs once per session, ~2 s after frames start flowing. Reads CALayer state, so main actor only.
+    private func checkSurfaceVisibilityIfDue() {
+        guard !surfaceChecked, !backgroundAudioOnly, framesEnqueued > 0 else { return }
+        surfaceCheckTicksSeen += 1
+        guard surfaceCheckTicksSeen >= Self.surfaceCheckTicks else { return }
+        surfaceChecked = true
+
+        let layer = renderer.displayLayer
+        switch Self.assessSurface(hasSuperlayer: layer.superlayer != nil, size: layer.bounds.size) {
+        case .onScreen:
+            return
+        case .notInViewHierarchy:
+            EngineLog.emit(
+                "[SWHost] \(framesEnqueued) frames decoded into a display layer that is in no view "
+                + "hierarchy: the host never bound a render surface (AetherEngine.bind(view:) / "
+                + "AetherPlayerSurface). The software path renders into that layer, not through "
+                + "AVPlayerViewController, so audio plays and no picture can appear",
+                category: .swPlayback
+            )
+        case .zeroSized(let width, let height):
+            EngineLog.emit(
+                "[SWHost] display layer is bound but sized \(width)x\(height) after "
+                + "\(framesEnqueued) frames: the bound view has no layout, so no frame can be visible",
+                category: .swPlayback
+            )
+        }
+    }
 
     /// Caching the chosen rate so resume() restores the right speed after a pause without the
     /// host needing to know its history. Lock-guarded: the demux/feeder threads read it at clock
@@ -556,6 +623,7 @@ final class SoftwarePlaybackHost {
         // Cold start: demux loop arms the clock on first decoded audio sample; don't eager-start.
         rate = lastRate
         isPlaying = true
+        inFlightSeekResumeIntent = true
     }
 
     private var demuxLoopStarted: Bool = false
@@ -608,6 +676,7 @@ final class SoftwarePlaybackHost {
         pausedByHost = true
         rate = 0
         isPlaying = false
+        inFlightSeekResumeIntent = false
     }
 
     /// Background-enter (iOS keepalive): keep audio flowing, stop feeding video. The demux loop reads the flag.
@@ -663,7 +732,12 @@ final class SoftwarePlaybackHost {
         // reposition can tell on `seekQueue` whether a newer seek has already taken over.
         bumpSeekGeneration()
         let generation = seekGeneration
-        let wasPlaying = isPlaying
+        // #292: inside another seek's window `isPlaying` is that seek's parked flag, not the transport's
+        // intent. Inherit what it captured, and hand the same value on to whoever supersedes this one.
+        let wasPlaying = SeekResumeIntent.resolve(isPlaying: isPlaying,
+                                                  seekInFlight: seekInFlight,
+                                                  inFlightIntent: inFlightSeekResumeIntent)
+        inFlightSeekResumeIntent = wasPlaying
         isPlaying = false
 
         videoDecoder.flush()
@@ -706,7 +780,10 @@ final class SoftwarePlaybackHost {
 
         currentTime = seconds
 
-        if wasPlaying {
+        // #292: the intent is read HERE, not from what this seek captured on entry. `pause()` / `play()`
+        // during the reposition rewrite the stash, and a landing that ignored them either overrode the
+        // pause (kept playing) or, from the other side, anchored at rate 0 under a running loop.
+        if inFlightSeekResumeIntent {
             // Anchor clock at seek target: clock at .zero + PTS=seekTarget would stall rendering for seekTarget seconds (FigVideoQueueRemote -12080).
             audioOutput?.seekClock(to: targetTime, rate: lastRate)
             isPlaying = true
@@ -1731,7 +1808,10 @@ final class SoftwarePlaybackHost {
         timeTimer = Timer.publish(every: 0.25, on: .main, in: .common)
             .autoconnect()
             .sink { [weak self] _ in
-                guard let self, let aOut = self.audioOutput else { return }
+                guard let self else { return }
+                // Independent of the clock below: a seek in flight must not defer the one check.
+                self.checkSurfaceVisibilityIfDue()
+                guard let aOut = self.audioOutput else { return }
                 // #254: a reposition in flight holds `currentTime` at its target; the synchronizer is
                 // still on the pre-seek anchor and would drag the published position backwards.
                 guard !self.seekInFlight else { return }

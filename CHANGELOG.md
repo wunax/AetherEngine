@@ -12,6 +12,154 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.6.3] - 2026-08-04
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.6.3))
+
+### Added
+
+- **A software session says when its frames are decoding into nothing.** The
+  software path renders into an `AVSampleBufferDisplayLayer` the engine owns,
+  and that layer reaches the screen only once the host binds a surface with
+  `bind(view:)` or `AetherPlayerSurface`. A host that presents an
+  `AVPlayerViewController` for a software-routed source instead gets audio, a
+  completely healthy engine log and no picture, because this path has no
+  `AVPlayerItem` for AVKit to show, and a layer bound to a view that never got a
+  layout looks the same from the outside. Both are now named once per session,
+  about two seconds after frames start flowing, with the count of frames that
+  went nowhere. Nothing about the session changes; the report that prompted this
+  read a full render queue (`isReadyForMoreMediaData == false`, which is the
+  demux loop's back-pressure gate working) as a renderer that had stopped
+  accepting frames, and no line said otherwise. Reported by @akacores (#298).
+
+### Changed
+
+- **A frame whose presentation timestamp is not numeric no longer reaches the
+  display queue.** `AV_NOPTS_VALUE` arrives at the renderer as `CMTime.invalid`,
+  and CoreMedia builds a sample buffer from it without complaint, so the render
+  synchronizer was the first thing in the chain that could not schedule it; the
+  deinterlace path has dropped its own untimestamped output for that reason since
+  it was added. The gate sits before the B-frame reorder buffer, where such a
+  frame additionally reordered its neighbours (every comparison against NaN is
+  false), and it counts and names what it drops so a source that produces untimed
+  frames says so instead of showing a still picture (#298).
+
+## [6.6.2] - 2026-08-04
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.6.2))
+
+### Fixed
+
+- **A seek no longer discards a transport call that arrives while its
+  reposition is still running.** The software and audio hosts park their demux
+  and feeder loops for the duration of a seek by clearing `isPlaying`, and since
+  6.1.1 the demuxer reposition that follows is awaited off the main actor, so a
+  second seek could enter that window and read the flag its predecessor had
+  cleared as "was paused". A scrub during playback that reached the engine as
+  two same-target seeks therefore anchored the audio clock at rate 0 and left
+  the session parked, while the engine went on reporting `.playing`; only a
+  manual pause plus play recovered it. The intent is now stashed by the seek
+  that owns the window, inherited by whoever supersedes it, rewritten by
+  `pause()` and `play()`, and read at the landing rather than at entry, which
+  also closes the two siblings of the same defect: a `pause()` issued during a
+  reposition was swallowed and playback continued, and a `play()` issued during
+  one landed at rate 0 under a running loop. The seek finalize no longer reports
+  `.playing` over a software or audio host that landed paused either. Reported
+  by @wunax (#292).
+
+## [6.6.1] - 2026-08-04
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.6.1))
+
+### Fixed
+
+- **The live carriage probe no longer spends a media connection where the
+  playlists already answer, nor spends one against the mount.** Origins that
+  authenticate per token routinely cap concurrent connections at one or two, and
+  what such a cap counts is media fetches rather than playlist fetches, so the
+  6.6.0 probe's ranged segment head was a second media connection opened while
+  AVPlayer was establishing its own on exactly the channels the probe exists to
+  speed up. An fMP4 media segment requires an `EXT-X-MAP` (RFC 8216 4.3.2.5), so
+  a master advertising hvc1 / hev1 / dvh1 / dvhe / av01 over a window that
+  carries none is that codec in MPEG-TS, settled now from the `CODECS` attribute
+  AVFoundation has already parsed plus one playlist fetch and no segment byte at
+  all. AES-128 no longer blocks that branch, since nothing is being decrypted to
+  reach the verdict. What the playlists cannot settle, a direct media playlist or
+  a master without `CODECS`, still reads one segment head, because only the PMT
+  separates HEVC in MPEG-TS from H.264 in MPEG-TS there, but it waits for
+  readyToPlay: the verdict cannot be acted on before the watchdog arms in any
+  case, and a connection lost at that point costs the verdict rather than the
+  mount. A session whose watchdog disarms first, or which never becomes ready,
+  now fetches nothing. The saving stays about 3.5 s of the 4 s grace. Raised by
+  @kskchaitanya1993 out of the #293 device leg (#296).
+
+## [6.6.0] - 2026-08-03
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.6.0))
+
+### Added
+
+- **`nativePlayerLayer` and `softwareHostFramesEnqueued`,** two read-only
+  properties with no behaviour attached. `AVPictureInPictureController` wants an
+  `AVPlayerLayer` rather than an `AVPlayer`, and the software path has published
+  its layer since 5.13.0, so a host rendering through `bind(view:)` had no route
+  to the native layer already on screen and had to mount a second one. It reads
+  nil outside a native session, which is also the honest signal for hiding a PiP
+  button. `softwareHostFramesEnqueued` was already the engine's own answer to
+  "are frames reaching the display layer" and simply was not public in a Release
+  build: a host watchdog can ask `AVPlayerItemVideoOutput.hasNewPixelBuffer` on
+  the native path and had nothing to ask on the software one, so it read every
+  dav1d / libavcodec session as picture-less. Monotonic within a session and
+  restarting at zero when a `load()` builds a new host. Requested by
+  @kskchaitanya1993, who had been carrying both as downstream patches (#288).
+
+### Changed
+
+- **A live HEVC-in-MPEG-TS channel reaches the ingest without paying for a
+  doomed native mount first.** The carriage verdict used to come only from the
+  #168 watchdog, which needs a full mount, readyToPlay and a 4 s grace before it
+  can conclude that AVPlayer will never build a video track, so every first open
+  of such a channel spent that grace as audio over black, in every process. The
+  same question is now answered from the source itself, the playlist plus the
+  head of one segment (the evidence chain #268 already uses for finite VOD), read
+  concurrently with the mount so nothing is serialized in front of first frame. A
+  master that advertises H.264 never reaches the network for it, and a live media
+  playlist URL with no master to judge is covered for the first time: its carriage
+  was previously unjudgeable, which left it audio-only indefinitely. A video track
+  that does build still wins at any point, so no working session is taken off the
+  native path (#293).
+
+### Fixed
+
+- **No play-gate wait for a display switch Match Content cannot start.** With
+  Match Content off, `waitForSwitch()` still ran its poll on the path that gates
+  `play()`, and nothing in that state can start a switch: `apply()` declines to
+  write the criteria, and tvOS ignores a sole-writer host's AVKit write just the
+  same. The budget was dead startup time on every load, 200 ms for an
+  engine-writer host and 1000 ms for a sole-writer host on HDR / DV. The guard
+  reads the toggle live off the display manager rather than the host's
+  `LoadOptions` snapshot, which can be stale in the direction that matters, and
+  the skip line names the budget it dropped. Sessions with Match Content on are
+  untouched. Reported by @kskchaitanya1993 (#289).
+- **A pixel aspect ratio is judged by the picture it produces, not by its own
+  magnitude.** `saneSAR` bounded each component to 256, which catches the
+  pathological values and admits small-but-wrong ones: a live 1080p H.264 channel
+  declaring 3:1 cleared it and smeared 1920x1080 into a 5.33:1 band. No bound on
+  the ratio itself can work, since 2:1 is a standard VUI value and exactly right
+  on a 960x1080 broadcast frame while being the reported defect on 1920x1080. The
+  display aspect the ratio resolves to on this frame is now bounded to 1:3 ... 3:1,
+  a rejected candidate falls through frame to codec context to stream rather than
+  ending resolution, and the FrameExtractor resolves through the same policy.
+  Reported by @kskchaitanya1993 (#290).
+- **A container-declared pixel aspect ratio reaches the decoder.** The software
+  path's container-SAR fallback read `codecpar->sample_aspect_ratio` alone, which
+  is the one place a container ratio never lands: Matroska writes its DisplayWidth
+  quotient to `st->sample_aspect_ratio` and MP4 does the same with `pasp`. The
+  fallback was dead in exactly the case it was written for, and MPEG-2 sources hid
+  it because their ratio arrives per frame from the sequence header. A 960x1080
+  VP9 MKV declaring 2:1 drew at coded dimensions and now draws 16:9. A container
+  ratio still runs the gates above like any other.
+
 ## [6.5.6] - 2026-08-03
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.5.6))
