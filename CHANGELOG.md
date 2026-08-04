@@ -12,6 +12,59 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.7.0] - 2026-08-04
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.7.0))
+
+### Added
+
+- **The software path reports its read-ahead, and what the display did with it.** A software
+  session left a trace with no cushion figure in it: `frameAhead` is the native producer-shift
+  fold and reads 0 here whatever the buffer holds, `bufferedSessionTime` is fed only on live
+  sessions so a VOD software session published its own playhead back as its frontier, and the
+  `isReadyForMoreMediaData=false` line is latched to one per session. The memprobe now carries
+  `swAhead=` (seconds of decoded video queued ahead of the clock), plus `swDropped=` and
+  `swDelay=` from the renderer's own accounting, which counts frames dropped for missing their
+  display deadline rather than only the ones we refuse ourselves. On a native session the fields
+  are absent rather than zero.
+
+### Changed
+
+- **`bufferedPosition` on a VOD software session reports the decoded cushion instead of the
+  playhead.** The AetherEngine#54 contract is unchanged (it never trails the playhead) and the live
+  frontier still wins where it is larger; what changes is that the VOD software case stops
+  publishing a frontier that was only ever a placeholder.
+
+### Fixed
+
+- **Ordinary remote custom readers can skip ISO/UDF disc-image recognition.**
+  `IOReader.discImageProbeEnabled` defaults to `true`, preserving automatic DVD
+  and Blu-ray image support. Readers that already know they expose a regular
+  media file can return `false`, avoiding the sparse remote seeks used only for
+  ISO9660 and UDF signature checks. The policy travels with independent readers,
+  so subtitle side demuxers, reloads, and frame extraction do not repeat those
+  unnecessary network reads. Contributed by @murderer1234.
+
+## [6.6.4] - 2026-08-04
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.6.4))
+
+### Fixed
+
+- **A bounded-range boundary no longer re-fetches bytes the origin already
+  delivered.** The #220 frontier refill opens the next range while data is still
+  resident ahead of the read position, so a range boundary is not a stall.
+  Starting that connection reset the window start to the frontier and dropped
+  the window with it, up to 8 MB of delivered but undrained bytes, and the next
+  read then sat below the window start, took the backward branch, and pulled
+  those same bytes back over the network in 4 MB detour blocks on the demux read
+  thread. A continuation now keeps its window. Visible on any paced consumer
+  (playback reads at media rate, so the transfer always wins the race), and
+  worst on a high-bitrate source, where the boundary comes around often enough
+  to be noticed. On the software path, whose read-ahead is whatever
+  `AVSampleBufferVideoRenderer` accepts and is not measured today (#303), the
+  blocked read reached the picture as a stutter.
+
 ## [6.6.3] - 2026-08-04
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.6.3))

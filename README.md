@@ -226,7 +226,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.6.3")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.7.0")
 ```
 
 Two complementary samples ship in `Examples/`:
@@ -242,9 +242,13 @@ final class MyArchiveReader: IOReader {
     func seek(offset: Int64, whence: Int32) -> Int64 { /* ... */ }  // AVSEEK_SIZE (65536) returns total size
     func close() { /* ... */ }
 
-    // Optional (both have defaults). Override to unlock extra features:
+    // Optional requirements have defaults. Override to unlock extra features:
     func cancel() { /* unblock a blocked read at teardown, do NOT invalidate the reader */ }
     func makeIndependentReader() -> IOReader? { /* a fresh cursor over the same source, or nil */ }
+
+    // Optional, defaults to true. Return false when this is known to be an
+    // ordinary media file rather than a raw ISO/UDF disc image.
+    var discImageProbeEnabled: Bool { false }
 }
 
 let probe = try await engine.load(source: .custom(MyArchiveReader(), formatHint: "mp4"))
@@ -265,8 +269,15 @@ let smb = try await SMBConnection.connect(
     server: URL(string: "smb://nas.local")!, share: "media",
     path: "Movies/film.mkv", user: "alice", password: "s3cret"
 )
-try await engine.load(source: .custom(SMBIOReader(source: smb), formatHint: "matroska"))
+try await engine.load(source: .custom(
+    SMBIOReader(source: smb),
+    formatHint: "matroska"
+))
 ```
+
+When the SMB path is known to be an ordinary media file, construct the reader with
+`discImageProbeEnabled: false` to skip ISO/UDF signature reads. Keep the default for raw disc
+images so DVD/Blu-ray recognition remains available.
 
 Read-only, NTLMv2 / guest auth (no Kerberos). On tvOS the host must declare `NSLocalNetworkUsageDescription` + the local-network entitlement to reach a LAN share. See [`aetherctl smbtest`](docs/cli.md#smbtest) to validate a share from macOS.
 
@@ -370,10 +381,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.6.3")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.7.0")
 ```
 
-Pin to `.upToNextMinor(from: "6.6.3")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "6.7.0")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 
