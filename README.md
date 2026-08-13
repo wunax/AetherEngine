@@ -50,7 +50,7 @@ A scannable summary; the depth for each row lives in **[docs/formats.md](docs/fo
 | Containers | MKV, MP4, WebM, MPEG-TS, AVI, OGG, FLV |
 | Disc | DVD-Video and Blu-ray ISO (decrypted): selectable titles and chapters, demuxed through the normal path |
 | Video (HW) | H.264, HEVC, HEVC Main10 via VideoToolbox; AV1 where HW AV1 exists |
-| Video (SW) | AV1 (dav1d) without HW, VP9 / VP8, MPEG-4 Part 2 / MPEG-2 / VC-1, H.264 High 4:2:2 / 4:4:4 / 10 and HEVC Rext where VideoToolbox has no HW decoder (Intel Macs, older chips), interlaced H.264 (AVPlayer does not deinterlace; on VOD the declared field order is verified against decoded frames, so progressive-in-interlaced-carriage keeps hardware decode); GPU deinterlace (yadif_videotoolbox, Metal, field-rate by default) with a CPU bwdif fallback |
+| Video (SW) | AV1 (dav1d) without HW, VP9 / VP8, MPEG-4 Part 2 / MPEG-2 / VC-1, QuickTime RLE and anything else the FFmpeg build carries a decoder for (software is the default route; only HEVC, H.264 and HW-decodable AV1 go native), H.264 High 4:2:2 / 4:4:4 / 10 and HEVC Rext where VideoToolbox has no HW decoder (Intel Macs, older chips), interlaced H.264 (AVPlayer does not deinterlace; on VOD the declared field order is verified against decoded frames, so progressive-in-interlaced-carriage keeps hardware decode); GPU deinterlace (yadif_videotoolbox, Metal, field-rate by default) with a CPU bwdif fallback |
 | HDR | HDR10, HDR10+ (per-frame ST 2094-40), Dolby Vision (P5, P7 as single-layer 8.1, P8.1, P8.4, AV1 P10.x), HLG |
 | Audio | AAC, AC3, EAC3, FLAC, ALAC stream-copy lossless; TrueHD / DTS / DTS-HD MA / MP3 / Opus bridge to EAC3 5.1 (default) or lossless FLAC |
 | Dolby Atmos | EAC3+JOC stream-copied on every route (HDMI MAT 2.0, AirPods spatial, BT downmix). No container reliably declares JOC pre-decode, so an honest `TrackInfo.isAtmos` needs a bounded decode: `AetherEngine.probeDetectingAtmos(url:/source:)` answers for a details screen without starting playback, and `LoadOptions.confirmAtmos` has the running session confirm its own tracks in the background and republish `audioTracks`. Both are opt-in and neither sits on the playback-start path |
@@ -58,7 +58,7 @@ A scannable summary; the depth for each row lives in **[docs/formats.md](docs/fo
 | Audio-only | `LoadOptions.audioOnly`: lean pipeline, no video machinery, system Now-Playing on tvOS / iOS |
 | Background audio | Audio keeps playing when the app backgrounds on iOS: native AVPlayer stays alive, the software path drops video and keeps decoding audio (`backgroundPlaybackEnabled` / `pictureInPictureActive`); a paused session survives quick app switches for a grace window (`backgroundTeardownGraceSeconds`, default 15 s) before the wedge-safe teardown runs. tvOS tears down immediately (wedge-safe) unless a PiP window is active, which keeps the pipeline and loopback server alive; with PiP the software path keeps decoding video too (the window needs frames). Hosts gate corrective actions on the published `isSessionReady` |
 | Picture in Picture | Native path: hosts build `AVPictureInPictureController` around `currentAVPlayer`, or around the session's own `nativePlayerLayer` when they render through `bind(view:)` rather than AVKit; while `pictureInPictureActive` a native->native load hands the AVPlayerItem over in place so the window survives next-episode transitions. Software path: published `softwarePiPSource` carries the `AVSampleBufferDisplayLayer` plus transport answers on the enqueued frames' PTS axis for sample-buffer PiP. While PiP is active the software path also composites active subtitle cues (text and PGS/DVB bitmaps) into the decoded frames, so the window shows subtitles the host overlay cannot reach. On the native path, a selected bitmap track's compositions are OCR-recognized into its WebVTT rendition, so PGS subtitles render in the PiP window there as well. iOS renders sample-buffer PiP; tvOS AVKit does not evaluate sample-buffer content sources (Apple FB9751461, verified through tvOS 26) |
-| Subtitles | Text (SRT / ASS / SSA / VTT / mov_text) inline, bitmap (PGS / DVB / DVD) as `CGImage`, in-band CEA-608 closed captions (field-1, from an `eia_608`/`c608` demuxable track or extracted from A53 `cc_data` embedded in the video bitstream: H.264/HEVC SEI on the native path, decoded-frame side data such as MPEG-2 on the software path, with the caption track surfacing lazily on first real caption data), DVB teletext decoded to text cues with broadcaster colour preserved and a selectable caption page (libzvbi, `LoadOptions.teletextPage`), external files as first-class tracks (registered, listed, selected like embedded streams), opt-in raw ASS markup + fonts; embedded-text cues harvested from the producer's own read (instant enable, no side-channel bandwidth); opt-in native WebVTT renditions (one per text track incl. load-declared external files, language-tagged) so subtitles survive PiP / AirPlay / external display (`LoadOptions.prepareNativeSubtitles`); bitmap tracks (PGS / DVB / DVD, embedded and external .sup) join as OCR-fed renditions: on-device Vision text recognition runs while the track is selected and fills a language-tagged text rendition, so bitmap subtitles survive PiP / AirPlay / external display on the native path too (lossy by design; fullscreen keeps the pixel-accurate overlay) |
+| Subtitles | Text (SRT / ASS / SSA / VTT / mov_text) inline, bitmap (PGS / DVB / DVD) as `CGImage`, in-band CEA-608 closed captions (field-1, from an `eia_608`/`c608` demuxable track or extracted from A53 `cc_data` embedded in the video bitstream: H.264/HEVC SEI on the native path, decoded-frame side data such as MPEG-2 on the software path, with the caption track surfacing lazily on first real caption data), DVB teletext decoded to text cues with broadcaster colour preserved and a selectable caption page (libzvbi, `LoadOptions.teletextPage` at load, `setTeletextPage(_:)` while the channel plays), external files as first-class tracks (registered, listed, selected like embedded streams), a live channel's own HLS `SUBTITLES` renditions surfaced as tracks and fetched only once one is selected, opt-in raw ASS markup + fonts; embedded-text cues harvested from the producer's own read (instant enable, no side-channel bandwidth); opt-in native WebVTT renditions (one per text track incl. load-declared external files, language-tagged) so subtitles survive PiP / AirPlay / external display (`LoadOptions.prepareNativeSubtitles`); bitmap tracks (PGS / DVB / DVD, embedded and external .sup) join as OCR-fed renditions: on-device Vision text recognition runs while the track is selected and fills a language-tagged text rendition, so bitmap subtitles survive PiP / AirPlay / external display on the native path too (lossy by design; fullscreen keeps the pixel-accurate overlay) |
 | Frames | Off-playback `FrameExtractor`: `thumbnail` (scrub preview) + `snapshot` (frame-accurate) |
 | Audio tap | Opt-in `installAudioTap()`: decoded playback audio as mono Float32 48 kHz PCM with source-PTS timestamps, off the render path (live transcription, ShazamKit); delivers on the loopback, remote-HLS (VOD + live), and software paths |
 | Metadata | `MediaMetadata` (title / artist / album / albumArtist + cover) parsed on load |
@@ -134,7 +134,37 @@ player.$playbackPhase  // unified: .idle/.loading/.playing/.paused/.seeking/.reb
                        // .stalled(reconnecting:)/.ended/.error. One source of truth for a status
                        // spinner; derived from state + isBuffering + isSeeking + source reconnect.
                        // Prefer this over stitching the raw signals or matching EngineLog text.
-player.$currentAVPlayer // active AVPlayer, re-emitted on every reload (MPNowPlayingSession)
+player.$videoRoute     // pipeline actually serving the session: .remoteBypass (AVPlayer on the
+                       // origin URL) / .loopback / .software / .audio / .none. LoadOptions
+                       // .nativeRemoteHLS is only the request: the carriage watchdog, the
+                       // remembered verdict and the HLS reroutes move a session between the
+                       // bypass and the loopback, mid-session too. Branch on this where behaviour
+                       // differs per pipeline, above all who draws subtitles: on .remoteBypass
+                       // AVPlayer renders the origin's renditions, elsewhere the host renders.
+player.$hasFirstFrameReadyForDisplay
+                       // the running path has a first frame ready for display, for the media THIS
+                       // load opened: the edge a black cover comes off on. readyToPlay is not that
+                       // edge (AVFoundation reaches it before the layer holds a picture, and it
+                       // stays true across a seek), so a cover lifted on isSessionReady lifts onto
+                       // black. Latched for the load, false again at the next load() / stop().
+                       // For "has this seek reached the screen" use seekEvents .landed instead.
+player.$startupProgress // StartupProgress?, for a determinate loading bar: .completed of .total
+                       // checkpoints, .fraction, and .stage naming the work in flight. Every value
+                       // is work some part of the load actually finished, never a timer and never an
+                       // estimate, so a slow stretch holds and a skipped one jumps. It covers the
+                       // two stretches a host cannot otherwise see: the source open (connection,
+                       // container, stream analysis) and the display-criteria handshake. Scoped to
+                       // .generation, which counts the startups a user waited through rather than
+                       // teardowns, so an engine-initiated reroute continues the bar instead of
+                       // resetting it. Monotonic and deduped; nil before the first load and after
+                       // stop(); a load that fails simply never reaches the last checkpoint.
+player.$currentAVPlayer // active AVPlayer, re-emitted on every reload (MPNowPlayingSession).
+                       // nil on the .software route: that pipeline renders into its own display
+                       // layer, and the property is cleared so AVKit cannot hold a player nothing
+                       // feeds any more. A host that only ever hands currentAVPlayer to an
+                       // AVPlayerViewController therefore gets audio and AVKit's own spinner over an
+                       // empty video plane on that route (#298). Bind a surface for it, and pick the
+                       // presentation off $videoRoute rather than off the source's codec.
 
 // System Now-Playing on the native video path (tvOS / iOS). Off by default: an
 // AVPlayerViewController host already gets this from AVKit and must NOT opt in.
@@ -216,17 +246,35 @@ player.$currentAVPlayerItem                       // items swap in place; this i
 
 // Per muxed video frame, on both axes at once. Called on the producer's pump thread in DECODE order,
 // so `source` is not monotonic under B-frames; sort before using it as a frame-boundary list.
+// `epoch` rises strictly, process-wide: a restart and a load() both continue the sequence, so
+// "a higher epoch retires my older entries" separates one item's frames from the next's.
 player.setNativeVideoFrameTimeObserver { frame in
     frame.source; frame.item; frame.segmentIndex; frame.isKeyframe; frame.epoch
 }
+
+// The same question on the software path (#311), where the engine decodes and enqueues the source
+// timestamp unchanged: one axis, no segments, and the reports arrive past the reorder buffer in
+// ASCENDING presentation order. `generation` moves on every renderer flush, i.e. on a seek, and
+// rises across a load() the same way `epoch` does.
+player.softwarePresentationTimebase               // the master clock, on the source axis
+player.setSoftwareVideoFrameTimeObserver { frame in
+    frame.presentation; frame.generation
+}
+
+// The rectangle those frames land in (#353): coded dimensions under the pixel aspect ratio the
+// decoder attached, read off the format description the renderer enqueues. `sourceVideoWidth` and
+// `sourceVideoHeight` are the CODED size, so anamorphic content laid out against them is off by the
+// pixel aspect (720x576 at 64:45 presents as 1024x576). nil off the software path and before the
+// first frame; it follows a mid-stream format change and is cleared with the session.
+player.softwareDisplaySize                        // CGSize?, @Published
 ```
 
-Subtitle cues land in raw source PTS; render the overlay against `player.sourceTime` (see [docs/formats.md › Subtitles](docs/formats.md#subtitles)). A host compositing its own overlay onto the native path (libass and friends) needs the item axis too, since that is what the compositor pairs its samples against: `presentationAxisMap` converts arbitrary positions, `setNativeVideoFrameTimeObserver` reports the frames themselves. Both return nothing rather than a guess when no axis is established, because a defaulted shift is indistinguishable from a measured one at the call site. The 1 Hz diagnostics snapshot lives on `player.diagnostics.liveTelemetry`, off-the-engine for the same render-stability reason. Frame extraction, authored-ASS styling, and the full published surface are documented in [docs/formats.md](docs/formats.md).
+Subtitle cues land in raw source PTS; render the overlay against `player.sourceTime` (see [docs/formats.md › Subtitles](docs/formats.md#subtitles)). A host compositing its own overlay onto the native path (libass and friends) needs the item axis too, since that is what the compositor pairs its samples against: `presentationAxisMap` converts arbitrary positions, `setNativeVideoFrameTimeObserver` reports the frames themselves. On the software path neither is needed: `softwarePresentationTimebase` hands out the clock the frames are presented against and `setSoftwareVideoFrameTimeObserver` reports them, both on the same axis as the cues, and `softwareDisplaySize` gives the rectangle to lay the overlay out in (the native path measures its own on `AVPlayerLayer.videoRect`). Both return nothing rather than a guess when no axis is established, because a defaulted shift is indistinguishable from a measured one at the call site. The 1 Hz diagnostics snapshot lives on `player.diagnostics.liveTelemetry`, off-the-engine for the same render-stability reason. Frame extraction, authored-ASS styling, and the full published surface are documented in [docs/formats.md](docs/formats.md).
 
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.7.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.23.0")
 ```
 
 Two complementary samples ship in `Examples/`:
@@ -312,11 +360,36 @@ try await player.load(
 
 Direct ingest covers MPEG-TS with demuxed-audio and packed-audio renditions, in-line AES-128 clear-key decryption, and SSAI ad-pod direct play (versioned init segments, audio re-anchoring, no-cut watchdog). Unsupported encryption / fMP4 playlists surface a typed `HLSIngestError` so the host can fall back. Details in [docs/formats.md › Live ingest](docs/formats.md#live-ingest-aes-128-ssai).
 
+A channel whose master declares an `EXT-X-MEDIA:TYPE=SUBTITLES` group gets those renditions as ordinary entries in `subtitleTracks` (#359). The ingest demuxes the picked video variant only, so the group never reaches the demuxer; the engine reads it off the master instead and, once `selectSubtitleTrack(index:)` picks one, fetches that rendition's WebVTT segments and publishes the cues on the host-overlay surface, placed against the picture by the shared `EXT-X-PROGRAM-DATE-TIME` geometry rather than by `X-TIMESTAMP-MAP`. Nothing is fetched until a track is selected. Details in [docs/formats.md › Live HLS subtitle renditions](docs/formats.md#live-hls-subtitle-renditions-host-overlay).
+
 For an upstream AVPlayer can play natively (a standard remote `master.m3u8`, e.g. a Jellyfin live channel), `LoadOptions.nativeRemoteHLS` skips the demuxer probe and the loopback server entirely and hands the URL straight to AVPlayer, which manages the live edge and reconnect itself. Pair it with `isLive: true`. `LoadOptions.httpHeaders` rides into the `AVURLAsset` on this path, so origins that enforce per-stream `Referer` / `User-Agent` / `Authorization` headers (common for IPTV channels) work too.
 
 A live channel whose master advertises HEVC (or Dolby Vision / AV1) while delivering MPEG-TS segments is carriage AVFoundation builds no video track for, so the bypass would play it as audio over black. The engine recognizes that signature and reroutes the session onto the live ingest above (#168). The recognition runs alongside the mount: the playlist and the head of one segment are read while AVPlayer starts, so the reroute does not wait out a grace window, and a media playlist URL with no master to judge is covered too (#293). Only a codec the HLS Authoring Spec sanctions in fMP4 alone reaches that read, so an H.264 channel spends no extra request on it. `LoadOptions.nativeRemoteHLSIngestFallback = false` turns the whole recovery off.
 
 A non-live remote `m3u8` handed to the default (loopback) path reroutes onto this bypass automatically: the bundled FFmpeg is built without network support, so the playlist can never be demuxed locally, and remote HLS is AVPlayer's native domain anyway (#154). On the bypass the engine surfaces the stream's external WebVTT subtitle renditions (the legible `AVMediaSelectionGroup`) as `subtitleTracks`; `selectSubtitleTrack(index:)` and `clearSubtitle()` drive AVPlayer's media selection, and AVPlayer renders the cues itself.
+
+Sidecar subtitles declared in `LoadOptions.externalSubtitles` become renditions on this bypass too (#316). Media selection on an HLS asset comes from the playlist and nowhere else, so for a VOD source the engine fetches the origin master, rewrites every variant, audio and key URI to an absolute origin URL, adds one `EXT-X-MEDIA:TYPE=SUBTITLES` entry per sidecar, and serves that master from the loopback origin. AVPlayer still fetches all A/V bytes straight from the origin, so E-AC-3 / Atmos passthrough is untouched; only the master and the WebVTT renditions are local. The tracks keep the external ids they were registered under, and selecting one drives media selection instead of the host overlay, so the subtitle survives PiP, AirPlay and a wired external display. Live sources (no `EXT-X-ENDLIST`), bitmap sidecars, a playlist that will not rewrite and a slow origin all fall back to playing the origin URL with host-overlay subtitles, which is the behaviour before #316; the load is never failed over this.
+
+### IPTV timeshift / catch-up archives
+
+```swift
+// An origin that answers every Range with a plausible 206 whose body is not at that offset:
+try await player.load(url: archiveURL, options: LoadOptions(
+    sequentialOrigin: true,             // only byte 0 is addressable
+    declaredDurationSeconds: 8100       // required on VOD; the tail-read estimate is gone
+))
+```
+
+Timeshift and catch-up archives commonly fabricate range answers: `Range: bytes=X-` returns `206`
+with a body that actually sits on a coarse internal chunk boundary. No header exposes that, so the
+caller declares it (#346). The reader then runs one long-lived unranged GET with no ranged probes,
+no byte-offset reconnects and no tail read, the demuxer's pb is non-seekable, and a dropped
+connection surfaces as a read error rather than end-of-media so the host can re-request. Such a
+source keeps the native path instead of being forced to software, and the session serves an
+append-only `EVENT` playlist carrying the durations actually muxed, completed with `ENDLIST` at
+true source EOF. Every producer reposition is refused by construction, so **seeking is
+unavailable**: re-request the archive with a shifted start timestamp instead. `aetherctl play`
+gains `--sequential-origin` / `--declared-duration` for reproducing one from macOS.
 
 ## Host setup on tvOS
 
@@ -381,10 +454,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.7.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.23.0")
 ```
 
-Pin to `.upToNextMinor(from: "6.7.0")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "6.23.0")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 

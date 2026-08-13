@@ -68,7 +68,7 @@ Backed by the public `AetherEngine.swDecodeProbe(url:maxPackets:options:)` stati
 
 ## play
 
-Runs a full `load()` + `play()` session exactly like a host app and prints 1 Hz transport telemetry (state, phase, currentTime, sourceTime, buffered frontier, duration). Where `swdecode` proves the decoder, `play` proves the transport: it fails loud on the two silent failure modes of a session that "loads fine" but never actually plays (#107): exit 2 when the clock does not advance, exit 3 when a selected subtitle track produces no cues.
+Runs a full `load()` + `play()` session exactly like a host app and prints 1 Hz transport telemetry (state, phase, currentTime, sourceTime, buffered frontier, duration) plus the network half of the same `liveTelemetry` snapshot a host reads (`net` throughput, `rx` reader lifetime pull, `ahead` fetched-but-unconsumed window, `cushion` decoded video past the clock, `fwd` native forward buffer, `drop` / `delay`). Fields absent on the running path are omitted, so a software session reads `cushion` where a native one reads `fwd`. Note that `drop` climbs steadily in a CLI run: nothing binds a render surface, and the renderer drops what it cannot present. Where `swdecode` proves the decoder, `play` proves the transport: it fails loud on the two silent failure modes of a session that "loads fine" but never actually plays (#107): exit 2 when the clock does not advance, exit 3 when a selected subtitle track produces no cues.
 
 ```bash
 swift run aetherctl play <url>                                  # VOD load, 30 s telemetry
@@ -78,13 +78,31 @@ swift run aetherctl play --subs teletext <url>                  # activate the f
 swift run aetherctl play --host-calls reloadlive,play,extractor,setrate <url>   # mimic a host's post-load call sequence
 swift run aetherctl play --live --dvr-window 1800 --audio-stats <url>           # decoded-PCM continuity + per-second audio lead
 swift run aetherctl play --live --native-hls <master.m3u8>      # nativeRemoteHLS bypass (carriage watchdog + #293 probe)
+swift run aetherctl play --sidecar de=/tmp/de.srt --subs de <master.m3u8>   # declare a sidecar at load (#316)
 ```
+
+`--sidecar <lang>=<path-or-url>[,<lang>=<path>...]` fills `LoadOptions.externalSubtitles`, the load-time
+declaration a host makes. On a remote `m3u8` this is what makes the engine stand up its rewritten master
+(#316), so it is the way to see the whole chain from the CLI: the served `master.m3u8` body is logged, the
+engine reports how many renditions it injected, and selecting the track (`--subs <lang>` matches the
+external track by language) shows the `subs_N.m3u8` and `subs_N_0.vtt` fetches arriving. The end-of-run
+`subtitle tracks` line is the settled list a host's picker would show, with `*` marking external ids; note
+that `cues=0` and "no cues arrived" are CORRECT there, because AVPlayer renders a rendition itself and the
+overlay pipeline stays empty (same as AE#154).
 
 `--subs <codec-or-lang>` matches against the track's libavcodec name or language and logs every overlay cue and cue trim as it lands. `--host-calls` replays host post-load behavior against the fresh session: `play`, `extractor` (`makeFrameExtractor`), `setrate` (`setRate(1.0)`), `reloadlive` (reload the URL on the live path when the probe flags it live, the AetherPlayer Open URL flow), `seekback` (rewind 20 s into the DVR window at t=15, return to the live edge at t=30), and `overlapseek` (the #292 seek-window drills below); this is how the pre-arming `setRate` wedge was isolated.
 
 `--host-calls overlapseek` (pair it with `--sw`) runs three drills at t=8, each making a transport call while a seek's demuxer reposition is still in flight, which is the window #254 opened by moving that reposition off the main actor: **A** a second same-target seek (the #292 report: a scrub arriving as two seeks, the second superseding the first), **B** a `pause()`, **C** a `play()` from paused. `seektest` cannot reach any of this because it awaits every seek, so its bursts are strictly serial. Each drill heals the session with pause + play first, so a defect one drill provokes is not inherited by the next, and each reports its own PASS / FAIL / INCONCLUSIVE (`inWindow=NO` means the call arrived after the landing and the run proves nothing). Exit 4 when any drill fails, 5 when any is inconclusive. Before the #292 fix, A and C land the clock at `rate=0.0` while the engine reports `.playing` and B silently keeps playing through the pause.
 
+`--live-ingest` loads the URL through `HLSLiveIngestReader` as a custom source, which is the shape a host uses for a live channel it ingests and re-serves itself (Sodalite's direct live path). Pair it with `--live`. This is the only way to exercise the live ingest against a real channel from the CLI: plain `--live` sends an m3u8 to the raw live path, which rejects it by design, and `hlslive` only serves local `.ts` files. AE#359 (the master's SUBTITLES renditions were parsed away) survived precisely because this path had no harness; `--live-ingest --subs <lang>` now reproduces and verifies it in 40 s against a public broadcaster URL.
+
 `--native-hls` sets `LoadOptions.nativeRemoteHLS`, the path a host uses for a live channel AVPlayer can play itself. It is the only way to exercise the #168 carriage watchdog and the #293 carriage probe from the CLI (`hlslive` loads the ingest reader directly and never mounts natively). Pair it with `--live`; without that the m3u8 goes to the raw live path, which rejects it by design.
+
+`--switch-audio <index>[@ms]` replays a host applying a viewer's language preference just after playback starts (default +20 ms, the #337 field case): the engine rebuilds the session with the new stream at `resumeAt = 0`, which is the only shape where the rebuilt session's video renderer can fill before the newly selected stream's first packet arrives. Pick a stream whose first packet sits late in the mux and the run before the fix reads `state=playing cur=0.00` for its whole length with a first frame on screen; the end-of-run verdict names it. `--audio-stats` alongside it re-installs the tap after the switch, because the tap is bound to the software host the switch replaces and would otherwise report silence for a session that is playing fine. Build a fixture with a late track by offsetting one input: `ffmpeg -f lavfi -i testsrc2=size=1280x720:rate=30:duration=40 -f lavfi -i sine=frequency=440:duration=40 -itsoffset 12 -f lavfi -i sine=frequency=660:duration=28 -map 0:v -map 1:a -map 2:a -c:v libx264 -c:a libopus late-audio.mkv`.
+
+`--teletext-page N` sets `LoadOptions.teletextPage` for the load, and `--switch-teletext-page <page|auto>[@ms]` changes it on a channel that is already playing (default +20 s, deliberately long: the switch has to land after `--subs` has a teletext track showing, else the run measures the load option it could already measure). The engine states what the change reached, `re-decoding N channel(s)` or `no active teletext track to re-decode`, so a page that does nothing is distinguishable from a page that never arrived. Real teletext needs a broadcast transport stream; there is no way to synthesise one with ffmpeg, so the CLI check covers the wiring and the gate, and the decode itself is confirmed against a live DVB channel (#364).
+
+`--frame-times` installs the #311 software frame-time observer BEFORE `load()` (the documented usage: the engine re-arms each new host with it) and reads `softwarePresentationTimebase`. Per tick it appends `ft` (frames reported since the last tick), `ftLast` (newest reported presentation time), `ftGen` (renderer flush generation, which a seek moves) and `ooo`, the count of reports that arrived out of presentation order. `ooo` is the API's own claim under test: these are reported past the reorder buffer, so it must stay 0. `tb` is the timebase read at the same instant, and its closeness to `ftLast` is the point, both are on the source axis with nothing to convert between them.
 
 `--audio-stats` installs the engine audio tap and watches the decoded PCM itself: an `AGAP` line for every source-PTS discontinuity > 2 ms between consecutive buffers, and per-second `alead` (last decoded audio PTS minus the synchronizer clock) plus `abufs` (buffers delivered) appended to the telemetry. `alead` is the audio renderer's safety margin: on the SW live path the look-ahead pump holds it near `AudioLookaheadPolicy.targetLeadSeconds`; a collapse toward zero means the source or the feeder cannot keep real time (this is how the #107 audio-chopping report was diagnosed).
 
@@ -139,7 +157,7 @@ Verifies SW-path background audio (iOS keepalive) headless on macOS, where the `
 
 ## customio
 
-Wraps a local file in a custom `IOReader` and plays it through `load(source:)`. `--memory` reads via `DataIOReader`, `--forward-only` drops the seek capability, `--audio-only` routes through the audio-only pipeline, and `--reload` / `--switch-audio` / `--select-subs` / `--extract` exercise the optional capabilities (background reload, audio-track switch, embedded subtitles, scrub preview) end-to-end.
+Wraps a local file in a custom `IOReader` and plays it through `load(source:)`. `--memory` reads via `DataIOReader`, `--forward-only` drops the seek capability, `--audio-only` routes through the audio-only pipeline, and `--reload` / `--switch-audio` / `--select-subs` / `--extract` exercise the optional capabilities (background reload, audio-track switch, embedded subtitles, scrub preview) end-to-end. `--audio-index N` names the audio stream at LOAD and prints what it asked for next to what it got. Pair it with `--forward-only` for the one question a live host has to answer: `selectAudioTrack` refuses such a source (rebuilding a drained FIFO), so naming the stream at load is the only way onto another track, and this is where that was measured rather than assumed (Sodalite#64).
 
 ## disc-inspect
 
