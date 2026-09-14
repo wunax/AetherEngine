@@ -39,6 +39,9 @@ final class ThrottledOriginServer: @unchecked Sendable {
     private let throttleUs: useconds_t
     private let firstByteDelayUs: @Sendable (_ isSuffix: Bool) -> useconds_t
     private let respond: @Sendable (_ requestIndex: Int, _ offset: Int64, _ path: String) -> Directive
+    /// #388: how many requests this origin tolerates at once before it answers 509, the way a
+    /// connection-capped panel does. nil keeps every existing test on the unmetered behaviour.
+    private let refuseAboveConcurrency: Int?
     private let lock = NSLock()
     private var _bytesWritten: Int64 = 0
     private var _connFDs: [Int32] = []
@@ -46,6 +49,23 @@ final class ThrottledOriginServer: @unchecked Sendable {
     private var _requestedRanges: [(start: Int64, end: Int64?)] = []
     private var _requestLog: [(path: String, start: Int64, end: Int64?)] = []
     private var _rangeHeaderPresent: [Bool] = []
+    private var _inflight = 0
+    private var _peakInflight = 0
+    private var _refusedForConcurrency = 0
+
+    /// #388: the most requests this origin ever had open at the same time. The reader's own budget
+    /// counts what it BELIEVES it issued against an origin; this counts what the origin saw, which
+    /// is the only side of the redirect the declared ceiling is supposed to be about.
+    var peakConcurrentRequests: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _peakInflight
+    }
+
+    /// Requests this origin refused because they arrived on top of `refuseAboveConcurrency`.
+    var refusedForConcurrency: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _refusedForConcurrency
+    }
 
     var bytesWritten: Int64 {
         lock.lock(); defer { lock.unlock() }
@@ -89,11 +109,13 @@ final class ThrottledOriginServer: @unchecked Sendable {
     /// that difference is what let the speculative tail fetch pass every test while never once
     /// winning its race in the field. `isSuffix` is true for the `bytes=-n` form.
     init?(totalSize: Int64, chunkBytes: Int = 256 * 1024, throttleUs: useconds_t = 5000,
+          refuseAboveConcurrency: Int? = nil,
           firstByteDelayUs: @escaping @Sendable (_ isSuffix: Bool) -> useconds_t = { _ in 0 },
           respond: @escaping @Sendable (_ requestIndex: Int, _ offset: Int64, _ path: String) -> Directive = { _, _, _ in .serve206 }) {
         self.totalSize = totalSize
         self.chunkBytes = chunkBytes
         self.throttleUs = throttleUs
+        self.refuseAboveConcurrency = refuseAboveConcurrency
         self.firstByteDelayUs = firstByteDelayUs
         self.respond = respond
 
@@ -111,7 +133,10 @@ final class ThrottledOriginServer: @unchecked Sendable {
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        guard bindResult == 0, listen(fd, 4) == 0 else {
+        // #450: a backlog of 4 is a ceiling of this harness's own, and the suite that reads
+        // this origin's request log is measuring how many concurrent readers get on the link.
+        // A harness that brings its own version of the cause cannot measure it.
+        guard bindResult == 0, listen(fd, 32) == 0 else {
             close(fd)
             return nil
         }
@@ -134,19 +159,29 @@ final class ThrottledOriginServer: @unchecked Sendable {
 
     func stop() {
         lock.lock()
-        let fds = _connFDs
-        _connFDs = []
         let alreadyStopped = _stopped
         _stopped = true
+        // shutdown unblocks a recv or a write parked on this fd and fails every later one; it
+        // does not free the descriptor number. The serving thread owns that number until it
+        // exits and closes it under this lock (`closeConnection`), so no write of its own can
+        // land on a number the kernel has handed to someone else in between. Closing here did
+        // exactly that on 2026-09-03: a write in `writeFully` hit a recycled guarded fd and
+        // EXC_GUARD took the whole test process with it, 20 tests into 2475.
+        let fds = alreadyStopped ? [] : _connFDs
+        for fd in fds { shutdown(fd, SHUT_RDWR) }
         lock.unlock()
         guard !alreadyStopped else { return }
-        // shutdown unblocks a write parked on a full socket buffer; close alone may not.
-        for fd in fds {
-            shutdown(fd, SHUT_RDWR)
-            close(fd)
-        }
         shutdown(listenFD, SHUT_RDWR)
         close(listenFD)
+    }
+
+    /// The one place a connection fd is closed. Deregistering and closing under the lock is
+    /// what keeps `stop()` from shutting down a number this thread has already given back.
+    private func closeConnection(_ fd: Int32) {
+        lock.lock()
+        _connFDs.removeAll { $0 == fd }
+        close(fd)
+        lock.unlock()
     }
 
     private func acceptLoop() {
@@ -172,6 +207,7 @@ final class ThrottledOriginServer: @unchecked Sendable {
     /// same socket, so serving exactly one and hanging up would force a new connection per
     /// range and make the pooling measurement meaningless.
     private func serve(_ fd: Int32) {
+        defer { closeConnection(fd) }
         while !stopped {
             if !serveOneRequest(fd) { return }
         }
@@ -213,7 +249,28 @@ final class ThrottledOriginServer: @unchecked Sendable {
         _requestLog.append((path, offset, rangeEnd))
         _rangeHeaderPresent.append(hadRangeHeader)
         let requestIndex = _requestLog.count - 1
+        // #388: in flight from the moment this origin has a request to answer until its body is
+        // written. A request parked in `readRequestHeader` on a kept-alive socket is not one.
+        _inflight += 1
+        _peakInflight = max(_peakInflight, _inflight)
+        let concurrent = _inflight
+        let cap = refuseAboveConcurrency
+        if let cap, concurrent > cap { _refusedForConcurrency += 1 }
         lock.unlock()
+        defer {
+            lock.lock()
+            _inflight = max(0, _inflight - 1)
+            lock.unlock()
+        }
+
+        if let cap, concurrent > cap {
+            // What a connection-capped panel answers to the request that arrives on top of the
+            // one it is already serving (#307/#380: 509, not 429).
+            let header = "HTTP/1.1 509 Bandwidth Limit Exceeded\r\n"
+                + "Content-Length: 0\r\n"
+                + "Connection: keep-alive\r\n\r\n"
+            return writeFully(fd, Array(header.utf8))
+        }
 
         var silentAfter: Int64? = nil
         var dropAfter: Int64? = nil
@@ -237,15 +294,8 @@ final class ThrottledOriginServer: @unchecked Sendable {
                 + "Connection: keep-alive\r\n\r\n"
             return writeFully(fd, Array(header.utf8))
         case .dropConnection:
-            // `serve` leaves closing to `stop()`, which closes every fd still in `_connFDs`.
-            // Closing here without deregistering first frees a descriptor number the process
-            // can hand straight to the next socket, and `stop()` would then shut down whatever
-            // took it over. Deregister under the lock, then close exactly once.
-            lock.lock()
-            _connFDs.removeAll { $0 == fd }
-            lock.unlock()
+            // Returning false ends `serve`, which closes the fd exactly once.
             shutdown(fd, SHUT_RDWR)
-            close(fd)
             return false
         }
 
@@ -285,10 +335,11 @@ final class ThrottledOriginServer: @unchecked Sendable {
             // the peer has not handed to its application yet. The bytes this origin says it served
             // would silently stop being the bytes the reader can see, and a test asserting on the
             // amount delivered would be measuring the machine's scheduling (the 2026-08-11 CI
-            // failure: 327212 of 2 MiB arrived). FIN keeps the sent bytes deliverable; `stop()`
-            // closes the descriptor, which is why it stays registered in `_connFDs`.
+            // failure: 327212 of 2 MiB arrived). FIN keeps the sent bytes deliverable, so this
+            // thread parks on the half-closed socket until `stop()` and closes it only then.
             if let dropAfter, served >= dropAfter {
                 shutdown(fd, SHUT_WR)
+                while !stopped { usleep(200_000) }
                 return false
             }
             var n = Int(min(Int64(chunkBytes), remaining - served))

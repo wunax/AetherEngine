@@ -2,9 +2,9 @@ import Foundation
 import CoreMedia
 import CoreVideo
 import VideoToolbox
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 /// VTDecompressionSession-backed HEVC decoder for the SoftwarePlaybackHost pipeline.
 /// Owns the decoded-frame pool, IOSurface lifetime, and session teardown explicitly
@@ -73,6 +73,12 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     /// Protects `session` across the demux thread (decode), main thread (close/flush), and VT callback (delivery).
     private let lock = NSLock()
+
+    /// AE#492: guarded by `lock`, the same one `flush()` and `decode(packet:epoch:)` take.
+    private var _feedEpoch: UInt64 = 0
+    var feedEpoch: UInt64 {
+        lock.lock(); defer { lock.unlock() }; return _feedEpoch
+    }
 
     /// Heap-allocated box carrying a weak self reference for the C decompression callback's refCon.
     /// Separate object so we can pass UnsafeMutablePointer<RefConBox> to VT without unsafe bit-casts.
@@ -218,8 +224,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     // MARK: - Decode
 
-    func decode(packet: UnsafeMutablePointer<AVPacket>) {
+    func decode(packet: UnsafeMutablePointer<AVPacket>, epoch: UInt64? = nil) {
         lock.lock()
+        // AE#492: see `SoftwareVideoDecoder.decode`. Same rule, same lock as `flush()`.
+        if let epoch, epoch != _feedEpoch { lock.unlock(); return }
         guard let session = session, let formatDesc = formatDescription else {
             lock.unlock()
             return
@@ -321,6 +329,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     func flush() {
         lock.lock()
+        _feedEpoch &+= 1   // AE#492
         let session = self.session
         lock.unlock()
         guard let session else { return }
@@ -360,10 +369,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     static func resolvePixelAspectRatio(
         bitstream: AVRational, container: AVRational, width: Int32, height: Int32
     ) -> AVRational? {
-        let declared = SoftwareVideoDecoder.declaredStreamSAR(bitstream: bitstream, container: container)
-        guard let sane = PixelAspectPolicy.saneSAR(declared, width: width, height: height),
-              sane.num != sane.den else { return nil }
-        return sane
+        PixelAspectPolicy.declaredPixelAspect(
+            bitstream: bitstream, container: container, width: width, height: height)
     }
 
     // MARK: - Callback handling (called from VT's queue)

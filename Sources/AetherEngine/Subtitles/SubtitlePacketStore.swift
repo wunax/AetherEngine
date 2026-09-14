@@ -1,6 +1,6 @@
 import Foundation
-import Libavcodec
-import Libavutil
+import AetherLibavcodec
+import AetherLibavutil
 
 /// #112 rework: session-lifetime retention of compressed subtitle packets harvested
 /// from the owning host's demux pump (HLSSegmentProducer or SoftwarePlaybackHost).
@@ -17,14 +17,21 @@ struct StoredSubtitlePacket: Sendable {
     /// only in packet side data (the decoder never puts them in the ASS line), so a rebuilt packet
     /// loses the cue's placement unless the string rides along with the payload.
     let webvttSettings: String?
+    /// #362: when this entry was harvested, on the store's own monotonic append counter. A harvest
+    /// reads a stream forwards, so within one run PTS and sequence rise together; a PTS-ascending
+    /// pair whose sequence DESCENDS is two different runs meeting, and the span between them is one
+    /// nobody has read. That is the only signal that separates a hole in the harvest from a silence
+    /// in the source, and the drain needs it to decide whether waiting can bring anything.
+    let sequence: UInt64
 
     init(ptsSeconds: Double, durationSeconds: Double, flags: Int32, payload: Data,
-         webvttSettings: String? = nil) {
+         webvttSettings: String? = nil, sequence: UInt64 = 0) {
         self.ptsSeconds = ptsSeconds
         self.durationSeconds = durationSeconds
         self.flags = flags
         self.payload = payload
         self.webvttSettings = webvttSettings
+        self.sequence = sequence
     }
 }
 
@@ -90,6 +97,12 @@ final class SubtitlePacketStore: @unchecked Sendable {
     /// targets, never evicted by aggregate pressure. `lastTouchByStream` orders non-protected
     /// streams coldest-first for eviction; a monotonic counter (no wall clock) drives it.
     private var totalBytes: Int = 0
+    /// #362: monotonic harvest order, stamped on every appended entry. See `StoredSubtitlePacket`.
+    private var appendCounter: UInt64 = 0
+    /// #416: which spans of the source the readers have actually read. Lives here because this is
+    /// the object whose EMPTINESS gets interpreted: every "no packet between here and there" answer
+    /// this store gives is only as good as the reading behind it. See `SubtitleHarvestCoverage`.
+    private var coverage = SubtitleHarvestCoverage()
     private var protectedStreams: Set<Int32> = []
     private var lastTouchByStream: [Int32: UInt64] = [:]
     private var touchCounter: UInt64 = 0
@@ -115,6 +128,46 @@ final class SubtitlePacketStore: @unchecked Sendable {
         protectedStreams = indices
     }
 
+    // MARK: - #416: harvest coverage
+
+    /// #416: a reader has positioned at `seconds` and reads forwards from there. Announced by every
+    /// reposition of every reader that writes here, because an unannounced one would let the run
+    /// below be extended across ground nobody read.
+    func noteHarvestAnchor(_ writer: Writer, at seconds: Double) {
+        lock.lock(); defer { lock.unlock() }
+        coverage.noteAnchor(writer, at: seconds)
+    }
+
+    /// #416: that reader's current run has read one step further, through `seconds`.
+    func noteHarvestProgress(_ writer: Writer, through seconds: Double) {
+        lock.lock(); defer { lock.unlock() }
+        coverage.noteProgress(writer, through: seconds)
+    }
+
+    /// #416: that reader's current run has REACHED `seconds` from its anchor, however far that is
+    /// in one note. For a claim resting on an invariant rather than on observed steps; see
+    /// `SubtitleHarvestCoverage.noteReach`.
+    func noteHarvestReach(_ writer: Writer, through seconds: Double) {
+        lock.lock(); defer { lock.unlock() }
+        coverage.noteReach(writer, through: seconds)
+    }
+
+    /// #416: was the whole span between `from` and `through` read by some run this session?
+    ///
+    /// True when nothing has ever been noted. A path whose readers do not report coverage must keep
+    /// behaving exactly as it did before this existed: the caller's alternative to a proof is a
+    /// refusal, and refusing on ignorance would dark landings that are perfectly sound.
+    func hasReadSpan(from: Double, through: Double) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return coverage.isEmpty || coverage.covers(from: from, through: through)
+    }
+
+    /// Introspection for tests and diagnostics.
+    var harvestCoverageSpans: [SubtitleHarvestCoverage.Span] {
+        lock.lock(); defer { lock.unlock() }
+        return coverage.sortedSpans()
+    }
+
     func append(streamIndex: Int32, ptsSeconds: Double, durationSeconds: Double,
                 flags: Int32 = 0, payload: Data, webvttSettings: String? = nil) {
         lock.lock(); defer { lock.unlock() }
@@ -128,11 +181,17 @@ final class SubtitlePacketStore: @unchecked Sendable {
         let before = bytesByStream[streamIndex] ?? 0
         var entries = entriesByStream[streamIndex] ?? []
         var bytes = before
+        // #362: a re-harvest of a packet already stored takes the FRESH sequence. It is a new
+        // observation of that position by the run doing the writing, and that is exactly what the
+        // drain reads it for: the run has now covered this PTS, so the span behind it is no longer
+        // a hole. Keeping the old sequence would leave a boundary the drain waits at forever.
+        appendCounter &+= 1
         let entry = StoredSubtitlePacket(ptsSeconds: ptsSeconds,
                                          durationSeconds: durationSeconds,
                                          flags: flags,
                                          payload: payload,
-                                         webvttSettings: webvttSettings)
+                                         webvttSettings: webvttSettings,
+                                         sequence: appendCounter)
         // #235: several packets legitimately share a PTS. ASS/SSA authors overlapping lines on
         // identical Start/End, and a karaoke or layered-style track puts a whole burst of distinct
         // Dialogue events on one timestamp. Only a byte-identical payload is the pump and the
@@ -247,6 +306,10 @@ final class SubtitlePacketStore: @unchecked Sendable {
                       flags: Int32, payload: Data, assembleSplitDisplaySets: Bool,
                       writer: Writer = .pump, webvttSettings: String? = nil) {
         lock.lock(); defer { lock.unlock() }
+        // #416: a harvested packet is a position its writer demonstrably read, so the run reaches
+        // it. This is what gives the pump the forward lookahead its playhead-based note cannot
+        // state, which is the region a backward seek into already-produced content lands in.
+        if let ptsSeconds { coverage.noteReach(writer, through: ptsSeconds) }
         guard assembleSplitDisplaySets else {
             guard let ptsSeconds else { return }
             appendLocked(streamIndex: streamIndex, ptsSeconds: ptsSeconds,
@@ -343,6 +406,37 @@ final class SubtitlePacketStore: @unchecked Sendable {
         return entries.filter { $0.ptsSeconds >= from && $0.ptsSeconds <= through }
     }
 
+    /// #362: PTS of the first stored packet on `streamIndex` strictly after `ptsSeconds`.
+    ///
+    /// A PGS display set has no end of its own and is closed by whatever packet follows it on the
+    /// stream, its own clear or the next composition alike. So this IS the authored end of a set,
+    /// available from the harvest long before the drain window's forward edge reaches it. Strictly
+    /// after, because one display set can reach the store as several same-PTS chunks (raw SUP, split
+    /// MPEG-TS PES) and closing a set at its own start would render nowhere.
+    func firstPTS(streamIndex: Int32, after ptsSeconds: Double) -> Double? {
+        lock.lock(); defer { lock.unlock() }
+        guard let entries = entriesByStream[streamIndex] else { return nil }
+        var index = Self.lowerBound(entries, ptsSeconds)
+        while index < entries.count, entries[index].ptsSeconds <= ptsSeconds { index += 1 }
+        guard index < entries.count else { return nil }
+        // Deliberately answered even across a harvest hole, where the next stored packet belongs to
+        // an older run and the real successor is still on its way. The answer is then too late, but
+        // it is BOUNDED and self-correcting: the clear that lands when the hole fills trims the cue
+        // to its authored end. Refusing to answer leaves the cue carrying the open placeholder, and
+        // the next seek launders that into #357's window boundary, which nothing ever corrects.
+        // Measured both ways on the fixture: answering, 0 to 2 sets ended late; refusing, 4 to 5,
+        // the worst by 74 s. Measured again in round 2 against a boundary 15 s behind a landing:
+        // still worse than the island, and by more (+46 s against +37 s on the same cue).
+        //
+        // Round 2: the CALLER bounds how far this may reach, and it has to, because nothing here
+        // can. Whether the ground between the set and this packet was ever read is not a property
+        // of the packets that arrived: a reader restarted BEHIND leaves a descending sequence at the
+        // boundary, and a reader re-anchored FORWARD leaves an ascending one (measured on the
+        // fixture: sequence 19, then 20, with 46 s of unread source between them). Only the drain
+        // knows how far the harvest is designed to have reached by now, so the horizon lives there.
+        return entries[index].ptsSeconds
+    }
+
     func frontier(streamIndex: Int32) -> Double? {
         lock.lock(); defer { lock.unlock() }
         return entriesByStream[streamIndex]?.last?.ptsSeconds
@@ -370,5 +464,7 @@ final class SubtitlePacketStore: @unchecked Sendable {
         protectedStreams.removeAll()
         totalBytes = 0
         touchCounter = 0
+        appendCounter = 0
+        coverage = SubtitleHarvestCoverage()
     }
 }

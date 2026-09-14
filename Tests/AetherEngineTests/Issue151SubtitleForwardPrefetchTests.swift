@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-import Libavcodec
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// #151 (rrgomes): on direct-play sources the SubtitlePacketStore's forward frontier ends at the
@@ -144,6 +144,18 @@ struct Issue151SubtitleForwardPrefetchTests {
             isLive: false, hasEmbeddedDrainTargets: false, hasSource: true))
         #expect(!AetherEngine.shouldRunSubtitleForwardPrefetch(
             isLive: false, hasEmbeddedDrainTargets: true, hasSource: false))
+    }
+
+    @Test("prefetch holds whenever its origin is paced or serial")
+    func meteredOriginHoldTruthTable() {
+        #expect(!SubtitleForwardPrefetcher.shouldHold(
+            originPaced: false, originSerial: false))
+        #expect(SubtitleForwardPrefetcher.shouldHold(
+            originPaced: true, originSerial: false))
+        #expect(SubtitleForwardPrefetcher.shouldHold(
+            originPaced: false, originSerial: true))
+        #expect(SubtitleForwardPrefetcher.shouldHold(
+            originPaced: true, originSerial: true))
     }
 
     /// A drain-tick jump (seek) re-anchors the prefetcher; a fresh selection (no cursor yet) does

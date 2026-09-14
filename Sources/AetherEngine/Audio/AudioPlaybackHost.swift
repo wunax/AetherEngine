@@ -2,9 +2,9 @@ import Foundation
 import AVFoundation
 import CoreMedia
 import Combine
-import Libavformat
-import Libavcodec
-import Libavutil
+import AetherLibavformat
+import AetherLibavcodec
+import AetherLibavutil
 
 /// Audio-only playback host (lean sibling of `SoftwarePlaybackHost`): FFmpeg decode -> `AVSampleBufferAudioRenderer`
 /// for sources with no video track, skipping video decoder/display/HDR/HLS/muxer/loopback. The synchronizer is the
@@ -19,7 +19,8 @@ final class AudioPlaybackHost {
     @Published private(set) var currentTime: Double = 0
     @Published private(set) var duration: Double = 0
     @Published private(set) var rate: Float = 0
-    @Published private(set) var failureMessage: String?
+    /// #376: carries the classification with the message, so the engine can publish both.
+    @Published private(set) var failure: PlaybackErrorInfo?
     @Published private(set) var didReachEnd: Bool = false
 
     // MARK: - Internals
@@ -193,6 +194,11 @@ final class AudioPlaybackHost {
     }
 
     func setRate(_ newRate: Float) {
+        // #436: zero is a pause, not a speed; see SoftwarePlaybackHost.setRate.
+        if newRate == 0 {
+            pause()
+            return
+        }
         lastRate = newRate
         audioOutput?.setRate(newRate)
         rate = newRate
@@ -209,6 +215,11 @@ final class AudioPlaybackHost {
         clockArmed = true
         audioOutput?.setRate(newRate, time: itemTime, atHostTime: hostTime)
         rate = newRate
+    }
+
+    func setResumeRate(_ rate: Float) {
+        guard rate != 0 else { return }
+        lastRate = rate
     }
 
     /// #254: the demuxer reposition is awaited off the main actor, for the reason
@@ -310,7 +321,9 @@ final class AudioPlaybackHost {
         let setClockArmed: @Sendable () -> Void = { [weak self] in self?.clockArmed = true }
         let getSeekGeneration: @Sendable () -> UInt64 = { [weak self] in self?.seekGeneration ?? 0 }
         let onError: @Sendable (String) -> Void = { [weak self] msg in
-            Task { @MainActor [weak self] in self?.failureMessage = msg }
+            Task { @MainActor [weak self] in
+                self?.failure = PlaybackErrorInfo(kind: .audioSessionFailed, message: msg)
+            }
         }
         let onEnd: @Sendable () -> Void = { [weak self] in
             Task { @MainActor [weak self] in

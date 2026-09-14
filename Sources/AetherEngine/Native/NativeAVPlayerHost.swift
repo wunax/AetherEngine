@@ -10,6 +10,21 @@ import MediaPlayer
 /// tvOS exposes the HDMI DV/HDR handshake only through AVPlayer-rooted playback, not AVSampleBufferDisplayLayer.
 /// Covers HEVC, H.264, and HW-AV1; SW fallback (AV1/VP9) lives in SoftwarePlaybackHost.
 /// DisplayCriteriaController writes preferredDisplayCriteria before item load so the handshake is in flight first.
+/// AE#422: what the seek-deadline loop needs from AVPlayer, as one off-main reading.
+/// AE#422 / AE#287: what the premature-end recovery needs from AVPlayer, as one off-main reading.
+struct PrematureEndReading: Sendable {
+    let playhead: Double
+    let seekableEnd: Double?
+    let loadedEnd: Double?
+}
+
+struct SeekBufferSnapshot: Sendable {
+    /// End of the contiguous buffered span covering the playhead.
+    let bufferedEnd: Double
+    /// Loaded seconds measured AT the pending seek target, not at the playhead.
+    let targetIsland: Double
+}
+
 @MainActor
 final class NativeAVPlayerHost {
 
@@ -21,9 +36,14 @@ final class NativeAVPlayerHost {
     @Published private(set) var renderedTime: Double = 0
     @Published private(set) var duration: Double = 0
     @Published private(set) var rate: Float = 0
-    @Published private(set) var failureMessage: String?
+    /// #376: the failure a host classifies on, message included. Published instead of a bare string so
+    /// the AVFoundation domain and code survive the hop into `state`.
+    @Published private(set) var failure: PlaybackErrorInfo?
     /// #50: monotonic token; bumped on each deferred .failed so a superseding failure or item swap cancels the in-flight confirmation.
     private var failureConfirmToken: Int = 0
+    /// AE#495: what the AE#495 relay knows about the origin's certificate, when the item this host
+    /// plays is served by one. Set by the engine at mount, read only while classifying a failure.
+    var upstreamTrustRefusal: (@Sendable () -> Int?)?
     /// #50: latched on first .playing; discriminates startup failures (never played) from mid-playback transients. .failed and timeControlStatus KVOs are unsynchronized, so instantaneous status is unreliable. Reset with the item on a reused host.
     private var hasEverPlayed = false
     @Published private(set) var didReachEnd: Bool = false
@@ -40,9 +60,50 @@ final class NativeAVPlayerHost {
     /// consume; nothing here is worth reacting to on its own.
     @Published private(set) var isVideoReadyForDisplay: Bool = false
 
+    /// What the current session was loaded under, carried across an item swap (#440 round 5). See
+    /// `SessionLoadContract` and `swapItem`.
+    private(set) var sessionContract = SessionLoadContract()
+
     /// Set per load; gates the AE#287 premature-end recovery, which only makes sense for a fixed-length
     /// presentation. A live session has no advertised end to fall short of.
     private var isLiveSession: Bool = false
+    /// AE#440: set per load from `LoadOptions.liveJoinStartsImmediately`. Arms the one-shot below.
+    private var liveJoinStartsImmediately: Bool = false
+    /// AE#440: spent once the join has either been started by hand or rolled on its own, so the override
+    /// belongs to the join and every later hold in the session keeps AVPlayer's own stall policy.
+    private var liveJoinImmediateStartSpent: Bool = false
+    /// AE#440: true while the buffer reading for this decision is in flight off the main actor. The
+    /// reading is async, so two hold edges arriving during it would otherwise each decide on their own
+    /// copy of a one-shot neither has spent yet.
+    private var liveJoinImmediateStartProbeInFlight: Bool = false
+    /// AE#440: keeps the "left the wait alone" line to one per load. It reports the depth that failed
+    /// the floor, which is the only way to tell a starved join from a rate evaluation after the fact.
+    private var liveJoinThinBufferLogged: Bool = false
+    /// AE#440 round 5: keeps the "the hold was over before the reading came back" line to one per load.
+    private var liveJoinNoDecisionLogged: Bool = false
+    /// AE#440 round 3: one witness per load for a hold that was refused, so the bound is read while the
+    /// hold stands and not only at its edges. Observes, never acts (see `startLiveJoinHoldWitness`).
+    private var liveJoinHoldWitnessStarted: Bool = false
+    /// AE#440 round 4: the one-shot was spent by the override firing rather than by the rate rolling on
+    /// its own. Both spend it, and the witness has to name which, because "the wait ended without the
+    /// buffer reaching the floor" is the opposite of what happened when the override cut it.
+    private var liveJoinImmediateStartCutShort: Bool = false
+    /// AE#443: what the items this host has already retired transferred, so `rx` keeps describing the
+    /// SESSION across an item swap the session survives.
+    ///
+    /// Summing an item's access-log entries fixed the fall inside one item; an item's log holds only
+    /// its own entries, so the number still restarted from zero the moment the #93 stage-2 recovery
+    /// replaced the item under a session that never stopped. Measured by the reporter on 6.53.0:
+    /// 1229.1 MB, the field absent for the swap, then 34.3 MB. Same scope error as the two before it,
+    /// one layer further out.
+    ///
+    /// Folded at the swap rather than at the unload: the in-place handover deliberately keeps the old
+    /// item playing until `replaceCurrentItem`, and folding earlier would let a tick read the outgoing
+    /// item AND the fold and count it twice. At the swap, the sampler's own
+    /// `player.currentItem === item` guard covers the race.
+    private(set) var retiredItemTransferredBytes: Int64 = 0
+    private(set) var retiredItemDroppedFrames: Int = 0
+
     /// AE#287 bookkeeping, cleared with the item in `unloadCurrentItem`.
     private var prematureEndRecoveryAttempts: Int = 0
     private var lastPrematureEndRecoveryPlayhead: Double?
@@ -65,6 +126,8 @@ final class NativeAVPlayerHost {
     /// to mediaserverd, and clock-tick sinks plus the 1 Hz paused-live timer read this at a
     /// cadence that turns a busy media server into a main-thread hang (#134).
     @Published private(set) var seekableEnd: Double = 0
+    /// AE#446 round 4: the start of the same range. See `seekableStart(from:)`.
+    @Published private(set) var seekableStart: Double = 0
 
     /// Published when a startup `.failed` is a display-rejection of the served master (#98). The
     /// engine's fallback subscriber reads it, decides, and either reloads the media playlist or
@@ -81,14 +144,25 @@ final class NativeAVPlayerHost {
     /// AetherEngine#168: the same-read nominal frame rate, so the engine's remote-HLS criteria also carry
     /// Match Frame Rate (the reporter's 4K item is 50 fps). nil when no video track / rate resolves.
     @Published private(set) var detectedVideoFrameRate: Double?
+    /// Codec name read back from the item's video sample type on the probe-free bypass, in the libavcodec
+    /// spelling the engine publishes elsewhere. Set beside `detectedVideoFormat`, which the engine's sink
+    /// reads it with; nil while no video track resolves.
+    @Published private(set) var detectedVideoCodecName: String?
 
     /// AetherEngine#168 follow-up: fires once when the armed carriage watchdog concludes the master
     /// advertises a video rendition but AVPlayer never built a video track past the grace window
     /// (HEVC-in-MPEG-TS carriage, which AVFoundation's HLS demuxer does not support). The engine's
     /// remote-HLS load subscribes and reroutes the session onto the loopback live-ingest path.
     @Published private(set) var remoteHLSVideoCarriageRejected = false
-    /// Set per load; the watchdog itself starts at readyToPlay (a dead origin never reaches it).
-    private var carriageWatchdogArmed = false
+    /// AE#363: fires once when the origin refused the native mount outright (HTTP 401 / 403, measured as
+    /// NSURLError -1013 / -1102). The engine subscribes and hands the session to the live ingest, whose
+    /// fetcher is a different client: headers on every request, four concurrent fetches at most, no
+    /// AVFoundation user agent. Separate from the carriage signal because the evidence is different;
+    /// a refusal is the origin's decision, not a verdict about what AVFoundation can demux.
+    @Published private(set) var remoteHLSOriginRefused = false
+    /// Set per load; arms both live-ingest fallbacks. The carriage watchdog itself starts at
+    /// readyToPlay (a dead origin never reaches it), the refusal path fires before readiness.
+    private var ingestFallbackArmed = false
     private var carriageWatchdogTask: Task<Void, Never>?
     /// Watchdog poll cadence. The pure `Watchdog`'s grace is expressed in ticks of this length, so the
     /// grace a probe verdict removes is reported in the same unit.
@@ -150,6 +224,11 @@ final class NativeAVPlayerHost {
     private var playIntent = false
     private var rateObservation: NSKeyValueObservation?
     private var timeControlObservation: NSKeyValueObservation?
+    /// AE#440: the waiting REASON changes without `timeControlStatus` changing. A live join goes
+    /// `waitingToPlay(EvaluatingBufferingRate)` -> `waitingToPlay(ToMinimizeStalls)` -> `playing`, and
+    /// only the second of those is the hold the join lever may cut short, so keying it off the status
+    /// observation alone leaves the decision to whether AVFoundation happens to republish the status.
+    private var waitingReasonObservation: NSKeyValueObservation?
     private var seekableObservation: NSKeyValueObservation?
     /// Diagnostic: isReadyForDisplay is the only signal for first-frame-on-screen; t+ stamps localize the audio-leads-black-video gap.
     private var layerReadyObservation: NSKeyValueObservation?
@@ -169,6 +248,10 @@ final class NativeAVPlayerHost {
     /// Monotonic counter tags every load() invocation so multi-attempt sessions produce distinguishable log lines.
     private static var nextSessionID: Int = 0
     private var sessionID: Int = 0
+
+    /// AE#446 round 4: which item this host currently holds. Bumped by every `load`/`swapItem`, so a
+    /// caller that latches something about the item can tell when the item under it changed.
+    var itemGeneration: Int { sessionID }
 
     // MARK: - Init
 
@@ -261,6 +344,63 @@ final class NativeAVPlayerHost {
         httpHeaders.isEmpty ? nil : ["AVURLAssetHTTPHeaderFieldsKey": httpHeaders]
     }
 
+    /// Everything a load establishes about the SESSION rather than about the item it opens (#440 round 5).
+    ///
+    /// It exists because an in-place swap replaces the item under a session that stays whole (#443), and
+    /// passing these per call site is what failed: six swap sites called `load` with the item arguments
+    /// only, so every one of them silently re-declared the session as VOD, header-less, and buffered at
+    /// the loopback default. The reporter found it from the outside, as a live rejoin that produced no
+    /// AE#440 decision at all; the same silence also handed the AE#287 premature-end recovery an
+    /// `isLive: false` on a live session that had just closed a window with ENDLIST.
+    ///
+    /// `swapItem` is the fix rather than a longer argument list: a swap has no contract argument to get
+    /// wrong, and a genuinely new session states its own.
+    struct SessionLoadContract: Sendable, Equatable {
+        /// Whether the session is live. Gates the AE#440 join override and the AE#287 premature-end
+        /// recovery, which only makes sense for a presentation with an advertised end.
+        var isLive: Bool = false
+        /// AE#440: may the join's stall-avoidance hold be cut short once the cushion is proven. Live-only,
+        /// and armed per load.
+        var liveJoinStartsImmediately: Bool = false
+        /// 4 s matches the loopback segment cadence; the remote-HLS bypass passes 0 (system adaptive),
+        /// where 4 s forced a 3-4 s black screen on bandwidth-limited Jellyfin live transcodes.
+        var forwardBufferDuration: Double = 4.0
+        /// The lean remote-HLS path has no live-reopen or readiness watchdog, so AVPlayer's "gave up"
+        /// signal has to surface a dead upstream instead of being swallowed as a recoverable stall.
+        var surfaceEndFailures: Bool = false
+        /// Sent with every asset and segment request. The bypass path carries the origin's auth here, so
+        /// a swap that dropped them would re-open the same URL unauthenticated.
+        var httpHeaders: [String: String] = [:]
+        /// #168 / #293: arm the carriage probe and the ingest reroute for a remote origin.
+        var armIngestFallback: Bool = false
+        /// #334: the ceiling on silence for a path with no other readiness watchdog.
+        var readinessDeadline: Double?
+        /// AE#520: this session stream-copies an EAC3 bitstream that carries JOC. HDMI passthrough
+        /// then tunnels it through a 2-channel MAT carrier, so the route's channel count is not a
+        /// statement about the audio and the surround-downmix warning below must not read it as one.
+        var audioIsAtmosStreamCopy: Bool = false
+    }
+
+    /// AE#446 round 5: a fresh item is about to attach, invoked before anything can fetch a playlist
+    /// for it.
+    ///
+    /// A live item's zero is the first segment ITS playlist listed, so the axis belongs to the item,
+    /// and the engine has to know which item a served playlist describes. Every attach passes through
+    /// `load` (`swapItem` delegates to it), so this hook is the one place that knows, and a swap path
+    /// added later inherits it without anyone remembering to arm at the call site.
+    var onWillAttachItem: (@MainActor () -> Void)?
+
+    /// Replace the item under a session that survives the swap, keeping the contract that session was
+    /// loaded under (#440 round 5).
+    ///
+    /// Every in-place swap is this: the #35 readiness gate reloading a master, the #98 media fallback,
+    /// the #65 stalled-consumer reload, the #446 rejoin, an AirPlay hop. None of them starts a new
+    /// session, so none of them gets to re-decide whether the session is live or what headers it sends.
+    func swapItem(url: URL, startPosition: Double?, skipInitialSeek: Bool = false) {
+        load(url: url, startPosition: startPosition, skipInitialSeek: skipInitialSeek,
+             inPlaceSwap: true, contract: sessionContract)
+    }
+
     /// Load the loopback HLS-fMP4 URL into AVPlayer. DisplayCriteriaController.apply must run first so the HDR pipeline is configured before the first segment fetch.
     /// `inPlaceSwap`: atomic same-content item swap for the #93 recovery reload. The default
     /// teardown pauses and drops the current item to nil before the new one exists; during PiP
@@ -268,16 +408,36 @@ final class NativeAVPlayerHost {
     /// after an in-PiP recovery reload) and the pause bounces transport for nothing. The swap
     /// keeps transport intent, clocks and the old item alive until replaceCurrentItem hands
     /// AVPlayer the fresh one.
-    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0, surfaceEndFailures: Bool = false, inPlaceSwap: Bool = false, httpHeaders: [String: String] = [:], armVideoCarriageWatchdog: Bool = false, readinessDeadline: Double? = nil, isLive: Bool = false) {
+    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false,
+              inPlaceSwap: Bool = false, contract: SessionLoadContract) {
         unloadCurrentItem(inPlaceSwap: inPlaceSwap)
 
-        self.surfaceEndFailures = surfaceEndFailures
-        self.carriageWatchdogArmed = armVideoCarriageWatchdog
-        self.readinessDeadlineSeconds = readinessDeadline
-        self.isLiveSession = isLive
+        self.sessionContract = contract
+        let forwardBufferDuration = contract.forwardBufferDuration
+        let httpHeaders = contract.httpHeaders
+        let armIngestFallback = contract.armIngestFallback
+        self.surfaceEndFailures = contract.surfaceEndFailures
+        self.ingestFallbackArmed = armIngestFallback
+        self.readinessDeadlineSeconds = contract.readinessDeadline
+        self.isLiveSession = contract.isLive
+        // AE#440: per load, and only ever armed for a live session. The player is reused across loads,
+        // so an override left armed from a live zap would meet the next VOD title's cold start.
+        self.liveJoinStartsImmediately = contract.isLive && contract.liveJoinStartsImmediately
+        self.liveJoinImmediateStartSpent = false
+        self.liveJoinImmediateStartProbeInFlight = false
+        self.liveJoinThinBufferLogged = false
+        self.liveJoinNoDecisionLogged = false
+        // AE#440 round 4: both of these are per LOAD, and the host is reused across loads on the
+        // keepNativeHost path. Left standing, the second live join of a reused host would arm no witness
+        // at all and read the previous join's spend reason.
+        self.liveJoinHoldWitnessStarted = false
+        self.liveJoinImmediateStartCutShort = false
         Self.nextSessionID += 1
         sessionID = Self.nextSessionID
         let sid = sessionID
+        // AE#446 round 5: before the item exists, so the first playlist it fetches is recorded against
+        // it rather than against the one it replaces.
+        onWillAttachItem?()
         let loadStart = DispatchTime.now()
         loadStartTime = loadStart
 
@@ -304,11 +464,19 @@ final class NativeAVPlayerHost {
                 "[NativeAVPlayerHost] #\(sid) layer.isReadyForDisplay=\(ready) t+\(String(format: "%.2f", elapsed))s",
                 category: .engine
             )
-            Task { @MainActor in self?.isVideoReadyForDisplay = ready }
+            // AE#158: the handover leaves the outgoing item on this layer through the load gap, so it
+            // keeps producing changes past the false unloadCurrentItem published. Without the session
+            // guard the item observers carry, the previous episode's picture reads as the successor's
+            // first frame.
+            Task { @MainActor in
+                guard let self, self.sessionID == sid else { return }
+                self.isVideoReadyForDisplay = ready
+            }
         }
 
         let asset = AVURLAsset(url: url, options: Self.assetCreationOptions(httpHeaders: httpHeaders))
         let item = AVPlayerItem(asset: asset)
+        AudioRatePolicy.apply(to: item)
         // 4s default matches loopback HLS segment cadence; raising it for live makes AVPlayer race to the edge and stall at the transcode warm-up gap.
         // Remote-HLS passes 0 (system adaptive): 4s forced a 3-4s black screen on bandwidth-limited Jellyfin live transcodes.
         item.preferredForwardBufferDuration = forwardBufferDuration
@@ -333,19 +501,25 @@ final class NativeAVPlayerHost {
         // #293: run the carriage probe alongside the mount. Nothing is serialized in front of first
         // frame; a healthy stream's watchdog disarms and cancels it, an unjudgeable one has its verdict
         // ready by the time the watchdog arms.
-        if armVideoCarriageWatchdog {
+        if armIngestFallback {
             startCarriageProbe(asset: asset, url: url, httpHeaders: httpHeaders)
         }
         playerItem = item
         accessLogCount = 0
-        failureMessage = nil
+        failure = nil
         pendingDisplayRejection = nil
         lastSuppressedStartupFailure = nil
         isReady = false
         seekableEnd = 0
+        // AE#454 round 2: both ends, or the mirror is a mixture. Only the end was reset here, so after
+        // an in-place swap `seekableStart` still carried the RETIRED item's window while `seekableEnd`
+        // already read the fresh item's. Anything reading the pair across a hand-off then measures one
+        // item against the other; the live axis offset is a difference between exactly those two, and
+        // it collapses to 0 on the reading that matters (AE#454 round 2, reported from a device).
+        seekableStart = 0
         // #334: the bypass's ceiling on silence. Started with the mount rather than at readyToPlay,
         // because the session it exists for is exactly the one that never gets there.
-        if let budget = readinessDeadline {
+        if let budget = contract.readinessDeadline {
             startReadinessDeadline(item: item, budgetSeconds: budget)
         }
 
@@ -354,7 +528,16 @@ final class NativeAVPlayerHost {
         // keep it current, including while paused.
         seekableObservation = item.observe(\.seekableTimeRanges, options: [.initial, .new]) { [weak self] item, _ in
             let end = Self.seekableEnd(from: item.seekableTimeRanges)
-            Task { @MainActor in self?.seekableEnd = end }
+            let start = Self.seekableStart(from: item.seekableTimeRanges)
+            Task { @MainActor in
+                // AE#454 round 2: a reading belongs to the item it was taken from. The observation is
+                // replaced on the next attach, but a notification already in flight is not, and its
+                // hop to the main actor can land after the swap; the same `sid == sessionID` guard the
+                // end-of-media path has carried since #15.
+                guard let self, self.sessionID == sid else { return }
+                self.seekableEnd = end
+                self.seekableStart = start
+            }
         }
 
         // KVO fires on AVPlayerItem's queue; Task round-trips to MainActor.
@@ -420,7 +603,7 @@ final class NativeAVPlayerHost {
             }
 
             Task { @MainActor in
-                guard let self = self else { return }
+                guard let self, self.sessionID == sid else { return }
                 switch item.status {
                 case .readyToPlay:
                     self.duration = item.duration.seconds.isFinite ? item.duration.seconds : 0
@@ -436,9 +619,10 @@ final class NativeAVPlayerHost {
                     }
                     // #168: publish the item's real dynamic range for the probe-free remote-HLS badge.
                     await self.publishDetectedVideoFormat(from: item)
+                    guard self.sessionID == sid else { return }
                     // #168 follow-up: watch for an advertised video rendition that never builds a track
                     // (HEVC-in-MPEG-TS carriage); anchored at readyToPlay so dead origins never arm it.
-                    if self.carriageWatchdogArmed, self.carriageWatchdogTask == nil {
+                    if self.ingestFallbackArmed, self.carriageWatchdogTask == nil {
                         self.startVideoCarriageWatchdog(item: item)
                     }
                 case .failed:
@@ -454,11 +638,21 @@ final class NativeAVPlayerHost {
             let rate = player.rate
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) rate=\(rate)", category: .engine)
             Task { @MainActor in
-                self?.rate = rate
+                guard let self, self.sessionID == sid else { return }
+                self.rate = rate
             }
         }
 
         // timeControlStatus + reasonForWaitingToPlay diagnose "spinner forever" -- reason surfaces the exact stall cause.
+        // AE#440: the reason moves inside a single `waitingToPlayAtSpecifiedRate` stretch, so this is a
+        // separate edge from the one below. It carries no diagnostics and no state: the lever logs its
+        // own outcome, and everything else here keys on the status.
+        waitingReasonObservation = avPlayer.observe(\.reasonForWaitingToPlay, options: [.new]) { [weak self] player, _ in
+            guard let reason = player.reasonForWaitingToPlay?.rawValue else { return }
+            Task { @MainActor in
+                self?.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
+            }
+        }
         timeControlObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             let status = player.timeControlStatus
             let statusStr: String
@@ -472,10 +666,11 @@ final class NativeAVPlayerHost {
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds - (self?.loadStartTime ?? DispatchTime.now()).uptimeNanoseconds) / 1_000_000_000
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) timeControlStatus=\(statusStr) reason=\(reason) t+\(String(format: "%.2f", elapsed))s", category: .engine)
             Task { @MainActor in
-                guard let self = self else { return }
+                guard let self, self.sessionID == sid else { return }
                 // AE#287: swallow the pause AVPlayer takes while a premature-end recovery re-seeks.
                 if status == .paused, self.prematureEndRecoveryInFlight { return }
                 self.timeControlStatus = status
+                self.startLiveJoinImmediatelyIfHolding(waitingReason: reason)
                 // First .playing: re-sample route after 2.5s settle -- AVKit only negotiates HDMI format on playback start (issue #24).
                 if status == .playing { self.hasEverPlayed = true }
                 if status == .playing, !self.didSampleSettledRoute {
@@ -485,7 +680,8 @@ final class NativeAVPlayerHost {
                         guard let self = self, let item = self.playerItem else { return }
                         Self.dumpAudioRoute(sid: sid, phase: "settled")
                         await Self.warnIfFLACSurroundExceedsRoute(item, sid: sid)
-                        await Self.warnIfEAC3SurroundOnStereoRoute(item, sid: sid)
+                        await Self.warnIfEAC3SurroundOnStereoRoute(
+                            item, sid: sid, isAtmosStreamCopy: contract.audioIsAtmosStreamCopy)
                         // #168: the video track can be absent from item.tracks at readyToPlay for HLS;
                         // re-read once playing so the remote-HLS badge settles on the real dynamic range.
                         await self.publishDetectedVideoFormat(from: item)
@@ -589,10 +785,11 @@ final class NativeAVPlayerHost {
         ) { [weak self] _ in
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) didPlayToEndTime", category: .engine)
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.sessionID == sid else { return }
                 // AE#287: AVPlayer ends a VOD the moment its video renderer runs dry, even with the
                 // audio-only tail still ahead. Recover before `.ended` latches; it is terminal.
                 if await self.recoverFromPrematureEnd() { return }
+                guard self.sessionID == sid else { return }
                 self.didReachEnd = true
             }
         }
@@ -605,7 +802,7 @@ final class NativeAVPlayerHost {
         ) { [weak self] time in
             let value = time.seconds.isFinite ? time.seconds : 0
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.sessionID == sid else { return }
                 // renderedTime tracks the parked on-screen frame mid-seek (issue #49).
                 self.renderedTime = value
                 // seekInFlight suppresses currentTime: AVPlayer still reports pre-seek clock until physical landing (issue #37).
@@ -614,6 +811,9 @@ final class NativeAVPlayerHost {
             }
         }
 
+        // AE#443: the outgoing item takes its access log with it. Only reachable on an in-place
+        // swap; the plain teardown already dropped the item and cleared these totals with it.
+        if let outgoing = avPlayer.currentItem { retireItemCounters(outgoing) }
         avPlayer.replaceCurrentItem(with: item)
 
         // Explicitly load each key separately: AVPlayerItem(asset:)+KVO was observed stuck in .unknown (build-123), and separate awaits let DrHurt's "1 success, 3 failures" pattern identify which key -1008 hits.
@@ -646,6 +846,18 @@ final class NativeAVPlayerHost {
 
         // Explicit seek prevents AVPlayer from defaulting to the EVENT-playlist live edge. Remote-HLS and loopback live REJOINS set skipInitialSeek (backlog-start seek was the prime suspect for permanent waitingToPlay on rejoin; see LiveReloadPolicy.skipInitialSeek).
         if !skipInitialSeek {
+            // AE#509: name the seek and the axis it is spent on. This is the only unconditional
+            // reposition of a fresh item, it happens before the item can answer for itself, and
+            // nothing logged it: a session parked at an unreachable position looked exactly like a
+            // session that placed nothing. `startPosition` is an ITEM-axis anchor, while a live
+            // host only ever sees the published clock (item + shift), so a live anchor that is not
+            // nil is the one shape where those two axes can be confused.
+            EngineLog.emit(
+                "[NativeAVPlayerHost] #\(sid) mount seek: item axis "
+                + String(format: "%.2f", startPosition ?? 0) + "s "
+                + "(startPosition=\(startPosition.map { String(format: "%.2f", $0) } ?? "nil"), "
+                + "live=\(contract.isLive))",
+                category: .engine)
             // Load-time seek (not a user scrub): no seekInFlight needed; the async seek(to:) carries #37/#38 semantics for user seeks.
             avPlayer.seek(to: CMTime(seconds: startPosition ?? 0, preferredTimescale: 600),
                           toleranceBefore: .zero, toleranceAfter: .zero)
@@ -654,6 +866,20 @@ final class NativeAVPlayerHost {
 
     func tearDown() {
         unloadCurrentItem()
+    }
+
+    /// Retire the outgoing session before the engine subscribes for its successor, without
+    /// detaching the item or layer and without bouncing transport. The #93 same-content recovery
+    /// keeps its clock through `load(inPlaceSwap:)`; an episode change must not replay the previous
+    /// episode's EOF, readiness or position into the next session's subscribers.
+    func prepareForItemHandover() {
+        unloadCurrentItem(inPlaceSwap: true)
+        currentTime = 0
+        renderedTime = 0
+        duration = 0
+        rate = 0
+        timeControlStatus = .paused
+        seekableEnd = 0
     }
 
     // MARK: - Failure handling
@@ -708,15 +934,32 @@ final class NativeAVPlayerHost {
                     category: .engine)
                 return
             }
+            // AE#363: the origin refused this client. Publishing a terminal failure here ends a live
+            // session the engine's own fetcher may well be allowed to serve, so signal the reroute
+            // instead of surfacing, the same way a master rejection is handed to the engine below.
+            if let nsError = item.error as NSError?,
+               RemoteHLSIngestFallback.shouldRerouteOnOriginRefusal(
+                   domain: nsError.domain, code: nsError.code,
+                   armed: ingestFallbackArmed, alreadyRerouted: remoteHLSOriginRefused) {
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(sessionID) origin refused the native mount "
+                    + "(\(nsError.domain)/\(nsError.code)); handing the session to the live ingest (AE#363)",
+                    category: .engine)
+                remoteHLSOriginRefused = true
+                return
+            }
             if let code, MasterFallbackDecision.isMasterRejectionCode(code) {
                 EngineLog.emit(
                     "[NativeAVPlayerHost] #\(sessionID) startup .failed is a master rejection "
                     + "(code=\(code)); signalling engine for media fallback instead of surfacing",
                     category: .engine)
-                pendingDisplayRejection = DisplayRejection(code: code, message: desc)
+                pendingDisplayRejection = DisplayRejection(code: code,
+                                                           message: desc,
+                                                           domain: (item.error as NSError?)?.domain)
                 return
             }
-            failureMessage = desc
+            failure = Self.itemFailureInfo(desc: desc, itemError: item.error,
+                                           relayRefusalCode: upstreamTrustRefusal?())
             return
         }
 
@@ -744,7 +987,8 @@ final class NativeAVPlayerHost {
                     + "clock=\(String(format: "%.2f", self.renderedTime)))",
                     category: .engine
                 )
-                self.failureMessage = desc
+                self.failure = Self.itemFailureInfo(desc: desc, itemError: item.error,
+                                                    relayRefusalCode: self.upstreamTrustRefusal?())
             } else {
                 EngineLog.emit(
                     "[NativeAVPlayerHost] #\(self.sessionID) deferred failure cleared: player recovered "
@@ -807,6 +1051,17 @@ final class NativeAVPlayerHost {
     /// stamping `sourceTime`/`renderedTime` to a target the picture has not reached yet (#123).
     var isBufferingTowardSeekTarget: Bool { avPlayer.timeControlStatus == .waitingToPlayAtSpecifiedRate }
 
+    /// AE#446 round 4: the START of the first seekable range, the other end of `seekableEnd`.
+    ///
+    /// A live item's seekable range is a WINDOW, and only its end was ever mirrored, which is enough
+    /// to follow the live edge and not enough to answer whether a given position is inside the item
+    /// at all. A rejoin after an in-place swap asks exactly that question.
+    nonisolated static func seekableStart(from ranges: [NSValue]) -> Double {
+        guard let r = ranges.first?.timeRangeValue else { return 0 }
+        let start = CMTimeGetSeconds(r.start)
+        return start.isFinite ? start : 0
+    }
+
     /// Maps `seekableTimeRanges` to the end of the last range (seconds); 0 when empty or non-finite.
     nonisolated static func seekableEnd(from ranges: [NSValue]) -> Double {
         guard let r = ranges.last?.timeRangeValue else { return 0 }
@@ -814,22 +1069,46 @@ final class NativeAVPlayerHost {
         return end.isFinite ? end : 0
     }
 
-    /// End of the contiguous buffered span covering the playhead (AetherEngine#54); disjoint ranges ahead of a gap are ignored.
-    var bufferedEnd: Double {
-        guard let item = avPlayer.currentItem else { return 0 }
-        let now = item.currentTime().seconds
+    /// End of the contiguous buffered span covering the playhead (AetherEngine#54); disjoint ranges
+    /// ahead of a gap are ignored. Pure, so the reading can be taken off the main actor (AE#422).
+    nonisolated static func contiguousBufferedEnd(ranges: [(Double, Double)], now: Double) -> Double {
         guard now.isFinite else { return 0 }
         var end = now
-        for value in item.loadedTimeRanges {
-            let r = value.timeRangeValue
-            let s = r.start.seconds
-            let e = (r.start + r.duration).seconds
-            guard s.isFinite, e.isFinite else { continue }
+        for (start, endpoint) in ranges {
+            guard start.isFinite, endpoint.isFinite else { continue }
             // Contiguous with the playhead (small tolerance for the gap
             // between the rendered frame and the range's reported start).
-            if s <= now + 1.0 && e >= now { end = max(end, e) }
+            if start <= now + 1.0 && endpoint >= now { end = max(end, endpoint) }
         }
         return end
+    }
+
+    /// AE#422: the queue every figplayer-backed read hops onto. A stalled reply parks a GCD thread
+    /// rather than the main thread, which past the watchdog threshold is a process kill.
+    nonisolated static let offMainReadQueue = DispatchQueue(
+        label: "engine.avplayerhost.avfread", qos: .userInitiated)
+
+    /// AE#422: everything the seek-deadline loop measures, read ONCE and off the main actor.
+    ///
+    /// That loop runs precisely while a seek is not landing, which is the state in which the media
+    /// server is least likely to answer, and it was taking four synchronous XPC round trips per pass
+    /// on the main actor (one island, three `bufferedEnd`). The reporter measured 13.3 s of fully
+    /// blocked app on one such read, returning 30 ms after the re-engage watchdog fired. Batching
+    /// also makes the two figures one consistent reading rather than four moments.
+    func seekBufferSnapshot(target: Double, excludeAtOrAbove: Double?) async -> SeekBufferSnapshot {
+        guard let item = avPlayer.currentItem else { return SeekBufferSnapshot(bufferedEnd: 0, targetIsland: 0) }
+        return await AVFoundationOffMain.read(item, on: Self.offMainReadQueue) { item in
+            let now = item.currentTime().seconds
+            let ranges = item.loadedTimeRanges.map { value -> (Double, Double) in
+                let r = value.timeRangeValue
+                return (r.start.seconds, (r.start + r.duration).seconds)
+            }
+            return SeekBufferSnapshot(
+                bufferedEnd: NativeAVPlayerHost.contiguousBufferedEnd(ranges: ranges, now: now),
+                targetIsland: NativeAVPlayerHost.bufferedSecondsInWindow(
+                    ranges: ranges, target: target, tolerance: 1.0, window: 30.0,
+                    excludeAtOrAbove: excludeAtOrAbove))
+        }
     }
 
     /// Seconds of media buffered *at the pending seek target*, i.e. how much the producer has actually
@@ -851,26 +1130,19 @@ final class NativeAVPlayerHost {
     /// measurement origin: the reason this function ignores the playhead is that a figure measured *from*
     /// one is meaningless while `currentTime()` and `renderedTime` diverge, and clamping a range does not
     /// reintroduce that.
-    func bufferedSecondsAtTarget(
-        _ target: Double,
-        tolerance: Double = 1.0,
-        window: Double = 30.0,
-        excludeAtOrAbove: Double? = nil
-    ) -> Double {
-        guard let item = avPlayer.currentItem else { return 0 }
-        return Self.bufferedSecondsInWindow(
-            ranges: item.loadedTimeRanges.map {
-                let r = $0.timeRangeValue
-                return (r.start.seconds, (r.start + r.duration).seconds)
-            },
-            target: target,
-            tolerance: tolerance,
-            window: window,
-            excludeAtOrAbove: excludeAtOrAbove)
-    }
+    // AE#422: the main-actor reader that used to sit here is gone; `seekBufferSnapshot` is the only
+    // way in, so a stall-adjacent caller cannot accidentally take the blocking route again.
 
     /// Pure part of `bufferedSecondsAtTarget(_:tolerance:window:excludeAtOrAbove:)`: total loaded seconds
     /// intersecting the target window, with the optional exclusion bound applied.
+    ///
+    /// AE#408: the target itself must be covered before any of the window counts. The window reaches
+    /// `window` seconds PAST the target, so without that gate a band loaded 20 s downstream reads as
+    /// "the producer is serving the target" at full weight: the reporter's `island=7.30s at target`
+    /// sat next to `rendered == bufferedEnd` and a seek that never landed, which is only possible if
+    /// nothing was loaded at the target at all (media there would have landed the seek). The window
+    /// stays as wide as it was, because its job is measuring how DEEP the served region runs; it is
+    /// only the licence to read it that now requires the target to be inside it.
     nonisolated static func bufferedSecondsInWindow(
         ranges: [(start: Double, end: Double)],
         target: Double,
@@ -885,14 +1157,449 @@ final class NativeAVPlayerHost {
             upperBound = Swift.min(upperBound, excludeAtOrAbove - tolerance)
         }
         guard upperBound > lowerBound else { return 0 }
+        // Coverage is judged inside the same clamped window, so the exclusion bound cannot be walked
+        // around by a range that merely reaches down across the target from above it.
+        let coverageHigh = Swift.min(target + tolerance, upperBound)
+        var covered = false
         var total = 0.0
         for range in ranges {
             guard range.start.isFinite, range.end.isFinite, range.end > range.start else { continue }
+            if range.start < coverageHigh, range.end > lowerBound { covered = true }
             let lo = Swift.max(range.start, lowerBound)
             let hi = Swift.min(range.end, upperBound)
             if hi > lo { total += hi - lo }
         }
-        return total
+        return covered ? total : 0
+    }
+
+    /// AE#440: whether to cut AVPlayer's stall-avoidance wait short right now.
+    ///
+    /// The wait this answers is the join tail a host cannot otherwise reach. AVPlayer presents the first
+    /// frame, publishes `.waitingToPlayAtSpecifiedRate` with `AVPlayerWaitingToMinimizeStallsReason`, and
+    /// holds that frame still while it decides whether the cushion it has will sustain playback. Against
+    /// a live source delivered at 1x, that cushion is bought in wall-clock time and nothing on the item
+    /// shortens it.
+    ///
+    /// Four guards, each of which is a way this would otherwise be the wrong call:
+    /// - `armed`: opt-in per load, and never on a VOD session, whose start has no such deadline.
+    /// - `hostWantsToPlay`: a host that paused during the join asked for a still picture. Overriding into
+    ///   motion there would resurrect a session the host put down.
+    /// - `isWaitingToMinimizeStalls`: NOT the `EvaluatingBufferingRate` reason, which `AVPlayer.h`
+    ///   describes as a brief monitoring period and explicitly tells clients not to show waiting UI for.
+    ///   Firing there would preempt an evaluation that was about to start playback on its own.
+    /// - `playbackBufferEmpty`: the documented precondition. Over a non-empty buffer `playImmediately`
+    ///   starts on the media already there; over an empty one `AVPlayer.h` says it "will act as if the
+    ///   buffer became empty during playback", and a stall while the player is not waiting to minimize
+    ///   stalls is exactly the shape that resets rate to 0 and never resumes. That is the failure the
+    ///   2026-05 `automaticallyWaitsToMinimizeStalling = false` experiment hit process-wide (35fa16d0),
+    ///   and the reason this is a one-shot on a proven buffer rather than a policy on the player.
+    /// - `bufferedAheadSeconds`: how deep that proven buffer actually is. The flag above is the
+    ///   documented MINIMUM, not a measure of safety: one served fragment reads `false` exactly as a
+    ///   four-second cushion does. The device A/B that turned this default on sampled the real hold and
+    ///   found 3.7 to 4.9 s ahead of the playhead throughout, which is why starting on it cost nothing;
+    ///   behind the same `false` a genuinely starved join holds a fraction of a second, and starting
+    ///   there trades a still picture for an immediate stall. The depth is the axis that separates the
+    ///   two mechanisms, so it is the one the guard reads.
+    nonisolated static func shouldStartLiveJoinImmediately(
+        armed: Bool,
+        alreadySpent: Bool,
+        hostWantsToPlay: Bool,
+        isWaitingToMinimizeStalls: Bool,
+        playbackBufferEmpty: Bool,
+        bufferedAheadSeconds: Double
+    ) -> Bool {
+        guard armed, !alreadySpent, hostWantsToPlay else { return false }
+        guard isWaitingToMinimizeStalls else { return false }
+        guard !playbackBufferEmpty else { return false }
+        // NaN fails every comparison silently, and an unresolved item's currentTime() is NaN, so an
+        // absent reading has to be rejected rather than fall through the bound below.
+        guard bufferedAheadSeconds.isFinite else { return false }
+        return bufferedAheadSeconds >= minimumLiveJoinBufferAhead
+    }
+
+    /// Seconds of contiguous buffer a live join must hold ahead of its playhead before the
+    /// stall-avoidance wait may be cut short.
+    ///
+    /// Chosen to separate the two mechanisms rather than to model a link: below one segment the cushion
+    /// is a fragment and the start is a coin flip, while the hold this exists for was measured at 3.7 s
+    /// and up on hardware, so the floor sits well under the case it must always admit and well over the
+    /// case it must never admit. A source delivered at 1x does not grow this figure after the start,
+    /// which is why AVPlayer's own estimate waits so long on a live join in the first place.
+    nonisolated static let minimumLiveJoinBufferAhead: Double = 1.5
+
+    /// Spend the AE#440 one-shot if this transport status is the join holding on buffered media. Also
+    /// spends it silently once the rate rolls on its own, so the override can never reach a mid-stream
+    /// rebuffer: past the join, AVPlayer's stall policy is the right one and a live channel that runs
+    /// dry should wait rather than spin at rate 1 over nothing.
+    private func startLiveJoinImmediatelyIfHolding(waitingReason: String) {
+        guard liveJoinStartsImmediately, !liveJoinImmediateStartSpent else { return }
+        if timeControlStatus == .playing {
+            liveJoinImmediateStartSpent = true
+            return
+        }
+        // The free guards first, so the reading below is only ever taken on a hold that could actually
+        // be cut short. `timeControlStatus` is the observer's mirror rather than a fresh player read:
+        // the edge that called this set it one line earlier.
+        guard playIntent,
+              timeControlStatus == .waitingToPlayAtSpecifiedRate,
+              waitingReason == AVPlayer.WaitingReason.toMinimizeStalls.rawValue,
+              !liveJoinImmediateStartProbeInFlight,
+              let item = playerItem
+        else { return }
+        liveJoinImmediateStartProbeInFlight = true
+        let probeStart = DispatchTime.now()
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.liveJoinImmediateStartProbeInFlight = false }
+            let reading = await Self.liveJoinBufferReading(item)
+            // AE#422: the reading is async, so the hold it described may be over. Decide on the state
+            // that exists now, not on the edge that asked.
+            guard !self.liveJoinImmediateStartSpent,
+                  self.playIntent,
+                  self.timeControlStatus == .waitingToPlayAtSpecifiedRate
+            else {
+                // Round 5: and say so. This is the last silent exit of the three the report walked into,
+                // and it is the one a short hold takes: a rejoin swap that rolled 70 ms after entering the
+                // wait produced no line at all, which from outside is indistinguishable from a lever that
+                // was never armed on that path. One per load, because a hold has one such ending.
+                if !self.liveJoinNoDecisionLogged {
+                    self.liveJoinNoDecisionLogged = true
+                    EngineLog.emit(
+                        "[NativeAVPlayerHost] #\(self.sessionID) "
+                        + Self.liveJoinDecisionAbandoned(
+                            afterSeconds: Self.secondsSince(probeStart),
+                            rolled: self.timeControlStatus == .playing),
+                        category: .engine
+                    )
+                }
+                return
+            }
+            guard Self.shouldStartLiveJoinImmediately(
+                armed: self.liveJoinStartsImmediately,
+                alreadySpent: self.liveJoinImmediateStartSpent,
+                hostWantsToPlay: self.playIntent,
+                isWaitingToMinimizeStalls: true,
+                playbackBufferEmpty: reading.bufferEmpty,
+                bufferedAheadSeconds: reading.aheadSeconds
+            ) else {
+                // The cushion, not the decision, is what a later report needs: it separates a join
+                // waiting on AVPlayer's rate estimate from one genuinely starved at the edge.
+                if !self.liveJoinThinBufferLogged {
+                    self.liveJoinThinBufferLogged = true
+                    EngineLog.emit(
+                        "[NativeAVPlayerHost] #\(self.sessionID) AE#440 live join: leaving the "
+                        + "stall-avoidance wait alone (buffer ahead "
+                        + String(format: "%.2f", reading.aheadSeconds)
+                        + "s, empty=\(reading.bufferEmpty), floor "
+                        + String(format: "%.2f", Self.minimumLiveJoinBufferAhead) + "s)"
+                        + (Self.liveJoinPlacementClause(reading: reading).map { "; " + $0 } ?? ""),
+                        category: .engine
+                    )
+                }
+                self.startLiveJoinHoldWitness(item: item)
+                return
+            }
+            self.liveJoinImmediateStartSpent = true
+            self.liveJoinImmediateStartCutShort = true
+            // #436: `defaultRate` is where the session's speed lives; a resume window must not silently
+            // return a live join to 1.0 when the host is running at another rate.
+            let rate = self.avPlayer.defaultRate != 0 ? self.avPlayer.defaultRate : 1.0
+            EngineLog.emit(
+                "[NativeAVPlayerHost] #\(self.sessionID) AE#440 live join: cutting the stall-avoidance "
+                + "wait short at rate \(rate) (buffer ahead "
+                + String(format: "%.2f", reading.aheadSeconds) + "s)",
+                category: .engine
+            )
+            self.avPlayer.playImmediately(atRate: rate)
+        }
+    }
+
+    /// AE#440 round 3: what a refused hold did next, reported and never acted on.
+    ///
+    /// The guard above answers one instant, and the bound it read is read only at the hold's edges: a
+    /// `timeControlStatus` change or a `reasonForWaitingToPlay` change. A join that begins the hold
+    /// starved and fills while the reason stands still therefore gets no second look, and no log line
+    /// says whether that happened. The reporter's stack is about to make that shape common rather than
+    /// hypothetical: with #447 the first manifest is served 1.2 s into a join and with #449 the
+    /// display-criteria gate no longer spends a 2 s cap in front of `play()`, so the decision now falls
+    /// EARLIER relative to the media arriving, which is the variable that decides what the guard reads.
+    ///
+    /// So this samples the same reading while the hold stands, and says which of three things happened:
+    /// the cushion crossed the floor with the hold still standing (the case that would justify deciding
+    /// during a hold), the hold ended first (the guard was right and the wait was AVPlayer's own rate
+    /// estimate), or the sampling budget ran out with the hold still up. Exactly one line either way,
+    /// because a witness that is silent about its own negative cannot be told from a witness that never
+    /// ran. Round 4 makes that true: the first version still had two silent exits, and one of them was
+    /// the ordinary ending (see `liveJoinHoldWitnessEnding`).
+    ///
+    /// It does not start playback. Firing on a cushion that has just crossed and is still climbing is
+    /// the bet `minimumLiveJoinBufferAhead` exists to refuse, and the evidence for taking it is what
+    /// this produces rather than what it assumes.
+    private func startLiveJoinHoldWitness(item: AVPlayerItem) {
+        guard !liveJoinHoldWitnessStarted else { return }
+        liveJoinHoldWitnessStarted = true
+        let startedAt = DispatchTime.now()
+        // Held rather than read off `self`, so the two endings that have no host to read it from still
+        // carry the session they belong to.
+        let sid = sessionID
+        Task { @MainActor [weak self] in
+            // Optional, and it stays nil until this witness has actually read something (#440 round 5).
+            // A placeholder here printed `ahead 0.00s, empty=true` for a hold that ended inside the first
+            // sampling interval, which reads as a measurement of a starved buffer and contradicted the
+            // refusal's own `empty=false` one line above it. A reading that was never taken has to say so.
+            var last: LiveJoinBufferReading?
+            func account(_ outcome: LiveJoinHoldOutcome) {
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(sid) "
+                    + Self.liveJoinHoldAccount(outcome: outcome,
+                                               standingSeconds: Self.secondsSince(startedAt),
+                                               reading: last),
+                    category: .engine
+                )
+            }
+            for _ in 0..<Self.liveJoinHoldWitnessSamples {
+                try? await Task.sleep(nanoseconds: UInt64(Self.liveJoinHoldWitnessInterval * 1_000_000_000))
+                guard let self else { account(.hostGone); return }
+                if let ending = Self.liveJoinHoldWitnessEnding(
+                    itemIsCurrent: self.playerItem === item,
+                    waitWasCutShort: self.liveJoinImmediateStartCutShort,
+                    oneShotSpent: self.liveJoinImmediateStartSpent,
+                    hostWantsToPlay: self.playIntent,
+                    isWaitingToPlay: self.timeControlStatus == .waitingToPlayAtSpecifiedRate
+                ) {
+                    account(ending)
+                    return
+                }
+                let reading = await Self.liveJoinBufferReading(item)
+                last = reading
+                guard Self.shouldStartLiveJoinImmediately(
+                    armed: true, alreadySpent: false, hostWantsToPlay: true,
+                    isWaitingToMinimizeStalls: true,
+                    playbackBufferEmpty: reading.bufferEmpty, bufferedAheadSeconds: reading.aheadSeconds
+                ) else { continue }
+                account(.crossed)
+                return
+            }
+            account(.budgetSpent)
+        }
+    }
+
+    /// Which ending this sample landed on, or nil to keep sampling. Pure, because the endings that
+    /// matter most are the ones a device run does not reliably produce.
+    ///
+    /// The order is the whole point of round 4. A spent one-shot used to be read first and as a reason
+    /// to stop WITHOUT a line, on the theory that it meant the witness no longer applied. But the rate
+    /// rolling is exactly what spends it (`startLiveJoinImmediatelyIfHolding` spends it on the
+    /// `.playing` edge so the override can never reach a mid-stream rebuffer), so the single most
+    /// common way a refused hold ends was routed into the silent exit and `.holdEnded` was left
+    /// reachable only by a pause. The 6.56.1 field capture is that defect: three refusals, one line,
+    /// and no way from outside to tell a sampler that ended in a state with no line from one that never
+    /// armed. Every ending below emits.
+    nonisolated static func liveJoinHoldWitnessEnding(itemIsCurrent: Bool,
+                                                      waitWasCutShort: Bool,
+                                                      oneShotSpent: Bool,
+                                                      hostWantsToPlay: Bool,
+                                                      isWaitingToPlay: Bool) -> LiveJoinHoldOutcome? {
+        guard itemIsCurrent else { return .itemReplaced }
+        // Before the plain spend, which it also sets: the override firing is the opposite fact from the
+        // wait ending on its own.
+        if waitWasCutShort { return .cutShort }
+        if oneShotSpent || !hostWantsToPlay || !isWaitingToPlay { return .holdEnded }
+        return nil
+    }
+
+    /// How a refused live-join hold ended, from the witness's side.
+    enum LiveJoinHoldOutcome: Sendable, Equatable {
+        /// The cushion reached the floor while the hold was still standing.
+        case crossed
+        /// The hold ended on its own (the rate rolled, or the host paused) before it did.
+        case holdEnded
+        /// A later edge found the cushion over the floor and the override cut the wait short.
+        case cutShort
+        /// The item was replaced under the witness: this join was abandoned rather than resolved.
+        case itemReplaced
+        /// The host went away while the hold stood.
+        case hostGone
+        /// The sampling budget ran out with the hold still standing.
+        case budgetSpent
+    }
+
+    /// One line per refused hold, in the terms the decision would be taken in. Pure so the negative
+    /// cases are pinned by tests rather than by a device run that happens not to produce them.
+    nonisolated static func liveJoinHoldAccount(outcome: LiveJoinHoldOutcome,
+                                                standingSeconds: Double,
+                                                reading: LiveJoinBufferReading?) -> String {
+        let stood = String(format: "%.2f", standingSeconds)
+        let floor = String(format: "%.2f", minimumLiveJoinBufferAhead)
+        let head = "AE#440 live join: "
+        // What this witness itself measured, or the fact that it never got to (#440 round 5). The floor
+        // travels with it either way, since it is the number the sentence is about.
+        let seen: String = reading.map {
+            "last reading ahead \(String(format: "%.2f", $0.aheadSeconds))s, "
+            + "empty=\($0.bufferEmpty), floor \(floor)s"
+            + (liveJoinPlacementClause(reading: $0).map { "; " + $0 } ?? "")
+        } ?? "no reading of its own was taken before it ended, so the cushion named at the refusal is "
+            + "the last one measured (floor \(floor)s)"
+        let ahead = reading.map { String(format: "%.2f", $0.aheadSeconds) } ?? "n/a"
+        switch outcome {
+        case .crossed:
+            return head + "the wait was still standing \(stood)s after the refusal when the buffer "
+                + "reached the floor (ahead \(ahead)s, floor \(floor)s); observed only, the decision "
+                + "is still taken at the edges"
+        case .holdEnded:
+            return head + "the wait ended \(stood)s after the refusal without the buffer reaching the "
+                + "floor (\(seen))"
+        case .cutShort:
+            let sample = reading.map { "last sample ahead \(String(format: "%.2f", $0.aheadSeconds))s" }
+                ?? "this witness took no sample of its own"
+            return head + "the wait was cut short at an edge \(stood)s after the refusal, so the cushion "
+                + "had crossed the floor by then (\(sample), floor \(floor)s)"
+        case .itemReplaced:
+            return head + "the wait was still standing \(stood)s after the refusal when the item was "
+                + "replaced, so this join was abandoned rather than resolved (\(seen))"
+        case .hostGone:
+            return head + "the wait was still standing \(stood)s after the refusal when the host went "
+                + "away (\(seen))"
+        case .budgetSpent:
+            return head + "the wait was still standing after \(stood)s of sampling and the buffer had "
+                + "not reached the floor (\(seen))"
+        }
+    }
+
+    /// The decision's own ending when there was nothing left to decide (#440 round 5). Pure, because the
+    /// hold that produces it is 70 ms long and no harness reproduces it on demand.
+    ///
+    /// It is not a defect that no decision was taken: the buffer reading is asynchronous, so a hold that
+    /// ends while it is in flight has to be left alone rather than acted on from a state that no longer
+    /// exists (AE#422). What was a defect is that this said nothing, which reads exactly like a lever
+    /// that was never armed for the path at all.
+    nonisolated static func liveJoinDecisionAbandoned(afterSeconds: Double, rolled: Bool) -> String {
+        "AE#440 live join: the hold was over "
+        + (rolled ? "and the rate had rolled " : "")
+        + "by the time the buffer reading came back \(String(format: "%.2f", afterSeconds))s later, "
+        + "so no decision was taken on it"
+    }
+
+    /// Sampling cadence and budget for the witness above. A quarter second is well under the shortest
+    /// hold either report measured (1.55 s), and five seconds outlives the longest (2.81 s) without
+    /// leaving a sampler running behind a session that has moved on.
+    nonisolated static let liveJoinHoldWitnessInterval: Double = 0.25
+    nonisolated static let liveJoinHoldWitnessSamples: Int = 20
+
+    nonisolated static func secondsSince(_ start: DispatchTime) -> Double {
+        Double(DispatchTime.now().uptimeNanoseconds - start.uptimeNanoseconds) / 1_000_000_000
+    }
+
+    /// AE#440 + AE#422: both figures the live-join guard weighs, read once and off the main actor.
+    ///
+    /// This runs while AVPlayer is holding a presented frame, which on the starved half of the two
+    /// mechanisms is precisely the state where the media server is least likely to answer. A
+    /// synchronous `isPlaybackBufferEmpty` there is the shape AE#422 measured at 13.3 s of fully
+    /// blocked app, and the depth needs two more reads on top of it.
+    nonisolated static func liveJoinBufferReading(_ item: AVPlayerItem) async -> LiveJoinBufferReading {
+        await AVFoundationOffMain.read(item, on: Self.offMainReadQueue) { item in
+            let now = item.currentTime().seconds
+            let ranges = item.loadedTimeRanges.map { value -> (Double, Double) in
+                let r = value.timeRangeValue
+                return (r.start.seconds, (r.start + r.duration).seconds)
+            }
+            // Contiguous from the playhead, not the sum of every loaded range: an island past a gap
+            // cannot sustain a rate that has to cross the gap to reach it.
+            let ahead = NativeAVPlayerHost.contiguousBufferedEnd(ranges: ranges, now: now) - now
+            let placement = NativeAVPlayerHost.liveJoinPlacement(ranges: ranges, now: now)
+            return LiveJoinBufferReading(bufferEmpty: item.isPlaybackBufferEmpty, aheadSeconds: ahead,
+                                         playheadSeconds: now,
+                                         loadedRangeCount: placement.count,
+                                         nearestRangeOffsetSeconds: placement.nearestOffset,
+                                         itemStatus: item.status)
+        }
+    }
+
+    struct LiveJoinBufferReading: Sendable {
+        let bufferEmpty: Bool
+        let aheadSeconds: Double
+        /// Where the item says it is, which is the axis every other number here is measured against.
+        var playheadSeconds: Double = .nan
+        /// How many loaded ranges the item holds at all.
+        var loadedRangeCount: Int = 0
+        /// Signed distance from the playhead to the nearest loaded range that does not contain it:
+        /// positive when the nearest one STARTS that far ahead, negative when the nearest one ENDED
+        /// that far behind. nil when a range contains the playhead, or when there are none.
+        var nearestRangeOffsetSeconds: Double? = nil
+        /// AVPlayer's own verdict on the item, read in the same batch as everything above it.
+        /// nil only where a caller builds a reading without one.
+        var itemStatus: AVPlayerItem.Status? = nil
+    }
+
+    /// AE#447 follow-up: `ahead 0.00s` is two different facts and the line printed one word for both.
+    ///
+    /// `contiguousBufferedEnd` returns the playhead itself whenever no range touches it, so an item
+    /// that has placed NOTHING AT ALL and an item that holds media somewhere else entirely read
+    /// identically, while `empty=false` (AVPlayer's own answer about the item) is true in both. Those
+    /// two need opposite investigations: nothing placed points at the fetch, placed elsewhere points at
+    /// the item and the playlist disagreeing about where the media sits. A field report that has to be
+    /// cross-referenced against a 1 Hz verbose `[LagDiag] fwd=-` to tell them apart is one nobody reads
+    /// that way, which is how a 20 s wedge arrived with the discriminating fact already in the capture
+    /// and unread.
+    nonisolated static func liveJoinPlacement(ranges: [(Double, Double)],
+                                              now: Double) -> (count: Int, nearestOffset: Double?) {
+        let usable = ranges.filter { $0.0.isFinite && $0.1.isFinite }
+        guard now.isFinite, !usable.isEmpty else { return (usable.count, nil) }
+        // The same tolerance the contiguity test uses, so "contains the playhead" means the same thing
+        // in both places and a range can never be reported as both.
+        if usable.contains(where: { $0.0 <= now + 1.0 && $0.1 >= now }) { return (usable.count, nil) }
+        let offsets = usable.map { $0.0 > now ? $0.0 - now : $0.1 - now }
+        let nearest = offsets.min(by: { abs($0) < abs($1) })
+        return (usable.count, nearest)
+    }
+
+    /// AE#509: the item's own verdict, said out loud by the account that describes the wedge.
+    ///
+    /// `item.status` is otherwise carried by a KVO observer that fires on a CHANGE, so an item that
+    /// never leaves `.unknown` produces no status line at all: the engine is silent about the item in
+    /// exactly the state where the item is the question. A 20 s field wedge arrived with "nothing
+    /// placed" from here and `.unknown` from the host's own private dump, and only the pair of them
+    /// said anything. The two readings point opposite ways: `.unknown` is AVPlayer never accepting the
+    /// media (look at the segment bytes), `.readyToPlay` is an accepted item that places nothing (look
+    /// at the fetch).
+    nonisolated static func liveJoinStatusClause(_ status: AVPlayerItem.Status?) -> String {
+        switch status {
+        case .unknown:
+            return ", and the item's own status has not left unknown, so AVPlayer has not accepted "
+                + "the media at all"
+        case .readyToPlay:
+            return ", on an item AVPlayer has accepted (status readyToPlay)"
+        case .failed:
+            return ", on an item AVPlayer has failed (status failed)"
+        case .none:
+            return ""
+        @unknown default:
+            return ""
+        }
+    }
+
+    /// The placement clause the two accounts below carry when the cushion reads zero. nil when a range
+    /// contains the playhead: there the depth is the whole story and this would only add noise.
+    nonisolated static func liveJoinPlacementClause(reading: LiveJoinBufferReading) -> String? {
+        guard reading.aheadSeconds <= 0 else { return nil }
+        let head = reading.playheadSeconds.isFinite
+            ? String(format: "%.2f", reading.playheadSeconds) + "s"
+            : "an unreadable position"
+        let status = liveJoinStatusClause(reading.itemStatus)
+        if reading.loadedRangeCount == 0 {
+            return "the item holds no loaded range at all, so nothing has been placed on its axis "
+                + "since it was mounted (playhead \(head))" + status
+        }
+        guard let offset = reading.nearestRangeOffsetSeconds else {
+            // A range does contain the playhead and the depth is simply zero: starved at the edge.
+            return "the item holds \(reading.loadedRangeCount) loaded range(s) and the playhead sits "
+                + "inside one of them with nothing ahead of it (playhead \(head))" + status
+        }
+        let where_ = offset > 0
+            ? "starts \(String(format: "%.2f", offset))s AHEAD of it"
+            : "ended \(String(format: "%.2f", -offset))s BEHIND it"
+        return "the item holds \(reading.loadedRangeCount) loaded range(s) but none at the playhead: "
+            + "the nearest \(where_) (playhead \(head))" + status
     }
 
     func play() {
@@ -948,8 +1655,13 @@ final class NativeAVPlayerHost {
         // Only resume what the viewer was playing: an item that ends while the transport is parked
         // must stay parked.
         guard playIntent, !didReachEnd else { return false }
-        let playhead = avPlayer.currentTime().seconds
-        let seekEnd = seekableRangeEndSeconds
+        // AE#422: one batched off-main reading. A premature end IS a state where the media server is
+        // misreporting, so "one read at a rare event" (the note that used to stand on
+        // `seekableRangeEndSeconds`) is not the cheap thing it looks like: the reporter measured a
+        // single such read holding the main thread for 13.3 s.
+        let reading = await prematureEndReading()
+        let playhead = reading.playhead
+        let seekEnd = reading.seekableEnd
         guard AetherEngine.prematureEndRecoveryQualifies(
             isLive: isLiveSession,
             duration: duration,
@@ -966,38 +1678,49 @@ final class NativeAVPlayerHost {
             "[NativeAVPlayerHost] #\(sessionID) AE#287 premature end: playhead="
             + "\(String(format: "%.3f", playhead))s duration=\(String(format: "%.3f", duration))s "
             + "seekableEnd=\(String(format: "%.3f", seekEnd ?? -1))s "
-            + "loadedEnd=\(String(format: "%.3f", loadedRangeEndSeconds ?? -1))s; "
+            + "loadedEnd=\(String(format: "%.3f", reading.loadedEnd ?? -1))s; "
             + "\(String(format: "%.1f", duration - playhead))s of the presentation lies past the end "
             + "AVPlayer reported, re-seeking in place (attempt \(prematureEndRecoveryAttempts))",
             category: .engine)
+        let sid = sessionID
         await seek(to: playhead)
+        // The session may have been handed over while the seek was in flight; a retired session
+        // must not restart the player under its successor.
+        guard sessionID == sid else { return true }
         avPlayer.play()
         prematureEndRecoveryInFlight = false
         timeControlStatus = avPlayer.timeControlStatus
+        let resumedAt = await prematureEndReading().playhead
         EngineLog.emit(
             "[NativeAVPlayerHost] #\(sessionID) AE#287 resumed: rate=\(avPlayer.rate) "
-            + "t=\(String(format: "%.3f", avPlayer.currentTime().seconds))s",
+            + "t=\(String(format: "%.3f", resumedAt))s",
             category: .engine)
         return true
     }
 
-    /// End of AVPlayer's last seekable time range, in item seconds: the extent of the presentation it
-    /// parsed from the playlist. Read from the item rather than the `seekableEnd` KVO mirror, which
-    /// exists to keep the LIVE edge off a tick-cadence read (#134); this is one read at a rare event.
-    private var seekableRangeEndSeconds: Double? {
-        guard let last = playerItem?.seekableTimeRanges.last?.timeRangeValue else { return nil }
-        let end = CMTimeGetSeconds(CMTimeAdd(last.start, last.duration))
-        return end.isFinite ? end : nil
+    /// AE#422: the three figures the #287 recovery needs, read once and off the main actor.
+    private func prematureEndReading() async -> PrematureEndReading {
+        guard let item = playerItem else {
+            return PrematureEndReading(playhead: 0, seekableEnd: nil, loadedEnd: nil)
+        }
+        return await AVFoundationOffMain.read(item, on: Self.offMainReadQueue) { item in
+            func endOf(_ ranges: [NSValue]) -> Double? {
+                guard let last = ranges.last?.timeRangeValue else { return nil }
+                let end = CMTimeGetSeconds(CMTimeAdd(last.start, last.duration))
+                return end.isFinite ? end : nil
+            }
+            return PrematureEndReading(
+                playhead: item.currentTime().seconds,
+                seekableEnd: endOf(item.seekableTimeRanges),
+                loadedEnd: endOf(item.loadedTimeRanges))
+        }
     }
 
-    /// Raw end of AVPlayer's last loaded time range, in item seconds; diagnostics only. It is NOT the
-    /// #287 witness: measured at a premature end, AVPlayer has already trimmed this range back to the
-    /// exhaustion point, so it corroborates the mistake instead of refuting it.
-    private var loadedRangeEndSeconds: Double? {
-        guard let last = playerItem?.loadedTimeRanges.last?.timeRangeValue else { return nil }
-        let end = CMTimeGetSeconds(CMTimeAdd(last.start, last.duration))
-        return end.isFinite ? end : nil
-    }
+    /// AE#287 witnesses, now read through `prematureEndReading()`. `seekableEnd` is the extent of the
+    /// presentation AVPlayer parsed from the playlist, read from the item rather than the KVO mirror
+    /// (which exists to keep the LIVE edge off a tick-cadence read, #134). `loadedEnd` is diagnostics
+    /// only and is NOT the witness: measured at a premature end, AVPlayer has already trimmed that
+    /// range back to the exhaustion point, so it corroborates the mistake instead of refuting it.
 
     /// Resolve only when the seek physically lands (loopback source lands seeks seconds after the call; issue #37).
     /// seekInFlight suppresses the periodic observer across the wait; only the latest seekGeneration clears it.
@@ -1145,7 +1868,19 @@ final class NativeAVPlayerHost {
     func setRate(_ value: Float) {
         // Non-zero rate counts as play intent (must survive replaceCurrentItem swap like play() does).
         playIntent = (value != 0)
+        // #436: `play()` is rate 1.0 by definition, and it is re-issued from paths no client can see:
+        // the readyToPlay re-assert after an item swap, interruption and background resume, the #287
+        // premature-end recovery, plus AVKit's own transport and the remote command centre calling
+        // play() straight on this player. `defaultRate` is what AVPlayer starts at when told to play,
+        // so recording the speed there is what makes it survive all of them, with no rate write in
+        // anyone's resume window. Setting `rate` does not update it (AVPlayer.h), hence both.
+        if value != 0 { avPlayer.defaultRate = value }
         avPlayer.rate = value
+    }
+
+    func setResumeRate(_ rate: Float) {
+        guard rate != 0 else { return }
+        avPlayer.defaultRate = rate
     }
 
     var volume: Float {
@@ -1163,7 +1898,24 @@ final class NativeAVPlayerHost {
 
     // MARK: - Internal
 
+    /// AE#443: folds a departing item's access-log totals into the session's.
+    ///
+    /// Both fields are per-entry totals and the entries belong to the item, so nothing here survives
+    /// the swap on its own. `sessionTotal` skips entries that report a field as unavailable, which is
+    /// why a nil is a zero contribution rather than a reason to drop the fold.
+    private func retireItemCounters(_ item: AVPlayerItem) {
+        guard let events = item.accessLog()?.events else { return }
+        retiredItemTransferredBytes &+= LiveTelemetrySampler.sessionTotal(
+            perEntry: events.map(\.numberOfBytesTransferred)) ?? 0
+        retiredItemDroppedFrames &+= LiveTelemetrySampler.sessionTotal(
+            perEntry: events.map(\.numberOfDroppedVideoFrames)) ?? 0
+    }
+
     private func unloadCurrentItem(inPlaceSwap: Bool = false) {
+        // Invalidating KVO does not cancel callbacks already queued onto the main actor. Retire
+        // their session now so they drop on their `sessionID == sid` guard, including during the
+        // handover gap where the old item is still attached and still producing them.
+        sessionID = 0
         if let to = timeObserver {
             avPlayer.removeTimeObserver(to)
             timeObserver = nil
@@ -1174,6 +1926,8 @@ final class NativeAVPlayerHost {
         rateObservation = nil
         timeControlObservation?.invalidate()
         timeControlObservation = nil
+        waitingReasonObservation?.invalidate()
+        waitingReasonObservation = nil
         seekableObservation?.invalidate()
         seekableObservation = nil
         layerReadyObservation?.invalidate()
@@ -1183,8 +1937,8 @@ final class NativeAVPlayerHost {
         }
         notificationObservers.removeAll()
         accessLogCount = 0
-        // Clear terminal flags: keepNativeHost reload reuses the host and @Published replays on subscribe; stale failureMessage/didReachEnd corrupt the new session (issue #15).
-        failureMessage = nil
+        // Clear terminal flags: keepNativeHost reload reuses the host and @Published replays on subscribe; stale failure/didReachEnd corrupt the new session (issue #15).
+        failure = nil
         didReachEnd = false
         // #315: same reason. The layer itself still reads true for a few tens of ms past this point
         // (AVFoundation clears it after the swap), so the published value leads the layer here on
@@ -1198,11 +1952,13 @@ final class NativeAVPlayerHost {
         // #168: a reused host must not report the prior session's dynamic range before the new item resolves.
         detectedVideoFormat = nil
         detectedVideoFrameRate = nil
+        detectedVideoCodecName = nil
         // #168 follow-up: the carriage verdict belongs to the outgoing item.
         carriageWatchdogTask?.cancel()
         carriageWatchdogTask = nil
-        carriageWatchdogArmed = false
+        ingestFallbackArmed = false
         remoteHLSVideoCarriageRejected = false
+        remoteHLSOriginRefused = false
         carriageProbeTask?.cancel()
         carriageProbeTask = nil
         carriageProbeEvidence = .pending
@@ -1227,6 +1983,9 @@ final class NativeAVPlayerHost {
         avPlayer.replaceCurrentItem(with: nil)
         playerItem = nil
         isReady = false
+        // AE#443: a fresh load is a fresh session, so the retired items' bytes go with the old one.
+        retiredItemTransferredBytes = 0
+        retiredItemDroppedFrames = 0
         currentTime = 0
         renderedTime = 0
         duration = 0
@@ -1373,7 +2132,7 @@ final class NativeAVPlayerHost {
         if RemoteHLSIngestFallback.shouldRerouteOnSettledEvidence(
             carriageEvidence: carriageProbeEvidence,
             videoTrackCount: currentVideoTrackCount(),
-            armed: carriageWatchdogArmed,
+            armed: ingestFallbackArmed,
             alreadyRejected: remoteHLSVideoCarriageRejected
         ) {
             EngineLog.emit(
@@ -1441,7 +2200,7 @@ final class NativeAVPlayerHost {
                       self.playerItem === item else { return }
                 switch deadline.tick(isReady: self.isReady,
                                      carriageRerouted: self.remoteHLSVideoCarriageRejected,
-                                     hasFailed: self.failureMessage != nil) {
+                                     hasFailed: self.failure != nil) {
                 case .keepWaiting:
                     continue
                 case .disarm:
@@ -1453,7 +2212,7 @@ final class NativeAVPlayerHost {
                         + "failure in \(Int(budgetSeconds.rounded()))s; surfacing a terminal state (#334)",
                         category: .engine
                     )
-                    self.failureMessage = message
+                    self.failure = PlaybackErrorInfo(kind: .noPlayableTrackWithinBudget, message: message)
                     return
                 }
             }
@@ -1530,24 +2289,30 @@ final class NativeAVPlayerHost {
     /// format instead of the `.sdr` default. Called at readyToPlay and again at first `.playing` (an HLS
     /// video track can be absent from `item.tracks` at the readyToPlay instant). No-op for the item once it
     /// has been replaced; leaves `detectedVideoFormat` nil while no video track resolves (audio-only black).
+    ///
+    /// AE#515: this runs on every native session, the loopback route included, where the engine reads it
+    /// as a Dolby Vision label upgrade rather than as the format itself. The line used to name itself
+    /// `remote-HLS` on both, which cost a reporter time on a log where the route was the question.
     @MainActor
     private func publishDetectedVideoFormat(from item: AVPlayerItem) async {
-        guard playerItem === item else { return }
+        let sid = sessionID
+        guard sid != 0, playerItem === item else { return }
         for itemTrack in item.tracks {
             guard let assetTrack = itemTrack.assetTrack, assetTrack.mediaType == .video else { continue }
             guard let cm = try? await assetTrack.load(.formatDescriptions).first else { continue }
             let rate = (try? await assetTrack.load(.nominalFrameRate)).map(Double.init)
-            guard playerItem === item else { return }
+            guard sessionID == sid, playerItem === item else { return }
             let subType = CMFormatDescriptionGetMediaSubType(cm)
             let ext = CMFormatDescriptionGetExtensions(cm) as? [String: Any] ?? [:]
             let transfer = ext[kCMFormatDescriptionExtension_TransferFunction as String] as? String
             let fmt = RemoteHLSFormatDetection.videoFormat(transferFunction: transfer, videoSubType: subType)
-            // Rate before format: the engine's format sink reads detectedVideoFrameRate when it fires.
+            // Rate and codec before format: the engine's format sink reads both when it fires.
             if let rate, rate > 0 { detectedVideoFrameRate = rate }
+            detectedVideoCodecName = RemoteHLSFormatDetection.codecName(videoSubType: subType)
             if detectedVideoFormat != fmt {
                 detectedVideoFormat = fmt
                 EngineLog.emit(
-                    "[NativeAVPlayerHost] #\(sessionID) remote-HLS videoFormat=\(fmt) "
+                    "[NativeAVPlayerHost] #\(sessionID) item videoFormat=\(fmt) "
                     + "subType='\(fourccString(subType))' transfer=\(transfer ?? "nil") "
                     + "rate=\(rate.map { String(format: "%.3f", $0) } ?? "nil")",
                     category: .engine
@@ -1644,9 +2409,21 @@ final class NativeAVPlayerHost {
         #endif
     }
 
-    /// Warn when EAC3/AC3 multichannel plays into a stereo-only HDMI route. Atmos excluded (ch=2 MAT carrier is correct for Atmos passthrough). Cause: Sonos Arc reports ch=2 LPCM after boot or HDMI handshake glitch; fix is power-cycling the sink. Not a pipeline bug (dec3 bitstream is identical across runs).
-    private static func warnIfEAC3SurroundOnStereoRoute(_ item: AVPlayerItem, sid: Int) async {
+    /// Warn when EAC3/AC3 multichannel plays into a stereo-only HDMI route. Cause: Sonos Arc reports
+    /// ch=2 LPCM after boot or HDMI handshake glitch; fix is power-cycling the sink. Not a pipeline
+    /// bug (dec3 bitstream is identical across runs).
+    ///
+    /// AE#520: Atmos is excluded, and until this the exclusion existed only in the docstring and in
+    /// the warning's own closing sentence. Every EAC3+JOC session matches the condition by
+    /// construction, because a 6-channel `ec-3` track tunnelling through a 2-channel MAT carrier is
+    /// what correct Atmos passthrough looks like, so the line fired on exactly the sessions it then
+    /// told the reader to ignore it for. The reporter had to reason it away himself while chasing a
+    /// real defect. The route cannot answer this (a MAT carrier and a stereo LPCM route both report
+    /// two channels); the session can, and now says so through the contract.
+    private static func warnIfEAC3SurroundOnStereoRoute(_ item: AVPlayerItem, sid: Int,
+                                                        isAtmosStreamCopy: Bool) async {
         #if os(iOS) || os(tvOS)
+        guard !isAtmosStreamCopy else { return }
         var trackChannels: Int = 0
         var codecID: String = ""
         for itemTrack in item.tracks {
@@ -1732,4 +2509,26 @@ final class NativeAVPlayerHost {
         return parts.joined(separator: " ")
     }
 
+}
+
+extension NativeAVPlayerHost {
+    /// AE#495: classify a failed item before publishing it. AVFoundation's own error is what
+    /// `item.error` reports (`-11800` and friends), and a refused certificate rides one or two levels
+    /// below it in `NSUnderlyingErrorKey`, so a host reading domain and code alone sees AVFoundation
+    /// giving up and nothing about why. Everything that is not a trust refusal keeps
+    /// `nativeItemFailed` exactly as before.
+    ///
+    /// `relayRefusalCode` is the same verdict reached one hop away. With the AE#495 relay mounted the
+    /// player's request went to loopback and came back a plain 502, so the chain it would have been
+    /// read off no longer exists on this side; the relay lost the handshake and remembers it.
+    nonisolated static func itemFailureInfo(desc: String, itemError: Error?,
+                                            relayRefusalCode: Int? = nil) -> PlaybackErrorInfo {
+        if let code = TransportSecurityFailure.code(in: itemError) ?? relayRefusalCode {
+            return PlaybackErrorInfo(kind: .sourceCertificateRejected,
+                                     message: TransportSecurityFailure.sentence(for: code),
+                                     underlyingDomain: NSURLErrorDomain,
+                                     underlyingCode: code)
+        }
+        return PlaybackErrorInfo(kind: .nativeItemFailed, message: desc, underlying: itemError)
+    }
 }

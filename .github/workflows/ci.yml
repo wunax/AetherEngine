@@ -40,6 +40,25 @@ jobs:
       - name: swift test
         run: swift test
 
+      - name: Software VOD packet-cache regressions
+        run: |
+          bash Scripts/test-software-packet-coverage.sh
+          bash Scripts/test-software-video-packet-coverage.sh
+          bash Scripts/test-software-packet-disk-fifo.sh
+          bash Scripts/test-software-packet-read-ahead.sh
+          bash Scripts/test-software-read-admission.sh
+          bash Scripts/test-software-stored-packet.sh
+
+      - name: Partial H.264 composition-offset runtime regression
+        run: |
+          command -v ffmpeg >/dev/null || brew install ffmpeg
+          bash Scripts/test-h264-partial-composition-controls.sh
+
+      # The transport probe is a device harness and runs nowhere in CI, so nothing else would keep
+      # it compiling. A harness that stopped building is discovered by the person who needed it.
+      - name: build the transport probe (AE#377)
+        run: swift build --build-tests --package-path Probes/TransportProbe
+
   build-tvos:
     name: xcodebuild (tvOS Simulator)
     runs-on: macos-15
@@ -57,6 +76,19 @@ jobs:
             -scheme AetherEngine \
             -destination 'generic/platform=tvOS Simulator' \
             -derivedDataPath .build/xcode-tvos \
+            CODE_SIGNING_ALLOWED=NO
+
+      # The transport probe also builds as an app-hosted test bundle, because a SwiftPM test target
+      # is tool-hosted and tool-hosted testing does not exist on device destinations. That project
+      # runs nowhere in CI either, and the person who discovers it stopped building is the one who
+      # needed it that evening.
+      - name: Build the transport probe's device harness (AE#377)
+        run: |
+          xcodebuild build-for-testing \
+            -project Probes/TransportProbe/Device/TransportProbe.xcodeproj \
+            -scheme TransportProbe \
+            -destination 'generic/platform=tvOS Simulator' \
+            -derivedDataPath .build/xcode-probe \
             CODE_SIGNING_ALLOWED=NO
 
   build-ios:
@@ -101,3 +133,19 @@ jobs:
             -destination 'generic/platform=visionOS Simulator' \
             -derivedDataPath .build/xcode-visionos \
             CODE_SIGNING_ALLOWED=NO
+
+  # The docs site (aetherengine-website) validates every heading anchor at build time, but it
+  # lives in another repo and only builds AFTER a push to main, so a broken anchor ships first
+  # and is found second: `docs/api.md` linked `formats.md#dolby-vision` against a heading that
+  # slugs to `#dolby-vision-signaling`, and the site build failed on every dispatch from 6.58.0
+  # until someone looked. Same check, here, before the merge. Ubuntu on purpose: it needs no
+  # toolchain and no network, so it reports in seconds while the macOS jobs are still starting.
+  docs-links:
+    name: docs links
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate relative links and heading anchors in the published docs
+        run: python3 Scripts/check-doc-links.py
