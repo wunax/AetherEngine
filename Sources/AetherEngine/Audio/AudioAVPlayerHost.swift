@@ -43,6 +43,9 @@ final class AudioAVPlayerHost {
     /// shared singletons is what produces the half-working state.
     let nowPlayingSession: MPNowPlayingSession
     #endif
+    /// Sodalite#175: false for a `.secondary` engine, which never claims Now Playing. Set per load, the
+    /// host outlives a role change.
+    var ownsNowPlaying: Bool
 
     // MARK: - Private state
 
@@ -55,6 +58,9 @@ final class AudioAVPlayerHost {
     private var failObserver: NSObjectProtocol?
     private var stallObserver: NSObjectProtocol?
     private var errorLogObserver: NSObjectProtocol?
+    private var itemDiagnostics: AVPlayerItemDiagnostics?
+    private let diagnosticPool: ItemDiagnosticReadPool
+    private let diagnosticRead: AVPlayerItemDiagnostics.Read
 
     /// Rebuffer inputs for the current item; reset per `load()` / `stop()`. `hasStartedPlaying` latches
     /// on the first `.playing` so the pre-roll wait of a fresh item never reads as a stall;
@@ -81,7 +87,12 @@ final class AudioAVPlayerHost {
 
     // MARK: - Init
 
-    init() {
+    init(ownsNowPlaying: Bool = true,
+         diagnosticPool: ItemDiagnosticReadPool = .shared,
+         diagnosticRead: @escaping AVPlayerItemDiagnostics.Read = ItemDiagnosticSnapshot.read) {
+        self.ownsNowPlaying = ownsNowPlaying
+        self.diagnosticPool = diagnosticPool
+        self.diagnosticRead = diagnosticRead
         #if os(tvOS) || os(iOS)
         nowPlayingSession = MPNowPlayingSession(players: [avPlayer])
         // Apple's documented path for a bare AVPlayer (WWDC22 110338, MPNowPlayingSession.h): the session
@@ -92,7 +103,7 @@ final class AudioAVPlayerHost {
         // manual-publish design whose MPMediaItemArtwork closure was non-@Sendable and tripped
         // dispatch_assert_queue_fail when MediaPlayer requested the bitmap off-actor.
         nowPlayingSession.automaticallyPublishesNowPlayingInfo = true
-        nowPlayingSession.becomeActiveIfPossible(completion: { _ in })
+        if ownsNowPlaying { nowPlayingSession.becomeActiveIfPossible(completion: { _ in }) }
         #endif
     }
 
@@ -100,6 +111,7 @@ final class AudioAVPlayerHost {
     /// Home overlay + remote commands alive across a background pause).
     func becomeActiveNowPlaying() {
         #if os(tvOS) || os(iOS)
+        guard ownsNowPlaying else { return }
         nowPlayingSession.becomeActiveIfPossible(completion: { _ in })
         #endif
     }
@@ -127,6 +139,18 @@ final class AudioAVPlayerHost {
         item.nowPlayingInfo = pendingNowPlayingInfo.isEmpty ? nil : pendingNowPlayingInfo
         #endif
         playerItem = item
+        let diagnostics = AVPlayerItemDiagnostics(item: item, pool: diagnosticPool, read: diagnosticRead)
+        itemDiagnostics = diagnostics
+        diagnostics.onSnapshot = { [weak self, weak diagnostics] snapshot, _ in
+            guard let self, let diagnostics, self.itemDiagnostics === diagnostics else { return }
+            for event in diagnostics.newErrors(in: snapshot) {
+                guard self.itemDiagnostics === diagnostics else { return }
+                EngineLog.emit(
+                    "[AudioAVPlayerHost] item error log: domain=\(event.domain) status=\(event.code) "
+                    + "comment=\(event.comment ?? "-") uri=\(event.uri ?? "-")",
+                    category: .swPlayback)
+            }
+        }
 
         failure = nil
         didReachEnd = false
@@ -274,15 +298,10 @@ final class AudioAVPlayerHost {
             forName: AVPlayerItem.newErrorLogEntryNotification,
             object: item,
             queue: .main
-        ) { notification in
-            // Read the item off the notification, not `self.playerItem`: nothing here touches the host, and a
-            // load() that swapped the property would leave the line describing the wrong item (or none).
-            guard let event = (notification.object as? AVPlayerItem)?.errorLog()?.events.last else { return }
-            EngineLog.emit(
-                "[AudioAVPlayerHost] item error log: domain=\(event.errorDomain) status=\(event.errorStatusCode) "
-                + "comment=\(event.errorComment ?? "-") uri=\(event.uri ?? "-")",
-                category: .swPlayback
-            )
+        ) { [weak diagnostics] _ in
+            MainActor.assumeIsolated {
+                diagnostics?.request(.error)
+            }
         }
 
         avPlayer.replaceCurrentItem(with: item)
@@ -409,6 +428,8 @@ final class AudioAVPlayerHost {
     /// Remove time observer, invalidate KVO, unregister notification observers. Idempotent: each handle is niled
     /// after removal so a second call (load() then stop()) can't double-remove.
     private func teardownObservers() {
+        itemDiagnostics?.cancel()
+        itemDiagnostics = nil
         if let timeObserver {
             avPlayer.removeTimeObserver(timeObserver)
             self.timeObserver = nil

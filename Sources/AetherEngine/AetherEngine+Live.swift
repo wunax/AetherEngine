@@ -3,9 +3,24 @@ import CoreGraphics
 
 extension AetherEngine {
 
-    /// Frame from the DVR segment cache at `atSessionSeconds` (seekableLiveRange axis). No network: converts session time to raw output via seam history, then decodes locally. nil when no native live session, time outside resident window, or decode fails.
+    /// Frame from the live DVR window at `atSessionSeconds` (seekableLiveRange axis), decoded
+    /// locally with no network.
+    ///
+    /// Two sessions can answer, and both read a buffer the session already holds rather than opening
+    /// a second connection (a live source is forward-only, so a second demuxer could not seek it).
+    /// A native session decodes from its DVR segment cache after converting session time to raw
+    /// output via seam history. A software session has no such cache, so it decodes out of its own
+    /// packet ring (#544), which is the same buffer the scrubber seeks within. nil when neither is
+    /// live, when the time is outside the resident window, or when the decode fails.
     public func liveScrubThumbnail(atSessionSeconds seconds: Double, maxWidth: Int = 320) async -> CGImage? {
-        guard isLive, let session = nativeVideoSession else { return nil }
+        guard isLive else { return nil }
+        guard let session = nativeVideoSession else {
+            guard let host = softwareHost else { return nil }
+            let gen = loadGeneration
+            let image = await host.liveScrubStill(atSessionSeconds: seconds, maxWidth: maxWidth)
+            // A zap between the request and the frame would hand the new channel the old one's picture.
+            return loadGeneration == gen ? image : nil
+        }
         // seekableLiveRange is output-time + seam shift; segment table and tfdt live on raw output. Resolve newest seam (inverts $currentTime fold).
         let outputSeconds: Double
         outputSeconds = presentationAxis.itemSeconds(forSourceSeconds: seconds)
@@ -23,7 +38,8 @@ extension AetherEngine {
             scrubThumbnailExtractors.append(hit)
             extractor = hit.extractor
         } else {
-            extractor = FrameExtractor(reader: DataIOReader(data: source.data), formatHint: "mp4")
+            guard let reader = source.makeReader() else { return nil }
+            extractor = FrameExtractor(reader: reader, formatHint: "mp4")
             scrubThumbnailExtractors.append((source.segmentIndex, extractor))
             while scrubThumbnailExtractors.count > 2 {
                 let evicted = scrubThumbnailExtractors.removeFirst()
@@ -380,6 +396,45 @@ extension AetherEngine {
         Swift.max(0, producerFloorSession - (itemSeekableStart + shift))
     }
 
+    /// AE#684: what a native live item starts ON, once per item.
+    ///
+    /// Reported from the field: after an item rebuild placed mid-segment (`segment 26 + 1.91s`) sound
+    /// and picture were slightly apart, and together again after the next rebuild, which landed on a
+    /// boundary (`segment 129 + 0.03s`). The served media measures aligned on the harness (see
+    /// `docs/cli.md`), and nothing on macOS can observe what AVPlayer's audio renderer does with it,
+    /// so the line states the two facts a device capture needs beside the viewer's verdict: where in
+    /// which segment the item started, and where that segment's sound begins against its picture.
+    /// The AE#440 line beside it says whether the start was forced with `playImmediately`, which in
+    /// that capture was true for the one item reported out of sync and for none of the other four.
+    @MainActor
+    func noteLiveItemStart() {
+        guard isLive, let host = nativeHost, let session = nativeVideoSession else { return }
+        let itemSeconds = host.currentTime
+        let outputSeconds = itemSeconds + liveItemAxisOffsetSeconds
+        EngineLog.emit(
+            Self.liveItemStartAccount(
+                item: host.itemGeneration, itemSeconds: itemSeconds,
+                heads: session.liveSegmentHeads(atOutputSeconds: outputSeconds)),
+            category: .engine)
+    }
+
+    nonisolated static func liveItemStartAccount(
+        item: Int, itemSeconds: Double,
+        heads: (index: Int, secondsIntoSegment: Double, pictureStart: Double, sound: (first: Double, last: Double)?)?
+    ) -> String {
+        let head = "[AetherEngine] #684 item #\(item) starts at its own "
+            + "\(String(format: "%.3f", itemSeconds))s"
+        guard let heads else { return head + ", in no segment the producer lists yet" }
+        let place = ": segment \(heads.index) + \(String(format: "%.3f", heads.secondsIntoSegment))s, "
+            + "whose picture opens at \(String(format: "%.3f", heads.pictureStart))s"
+        guard let sound = heads.sound else { return head + place + " and whose sound was not recorded" }
+        let lead = (heads.pictureStart - sound.first) * 1000
+        return head + place + " and whose sound runs "
+            + "\(String(format: "%.3f", sound.first))..\(String(format: "%.3f", sound.last))s "
+            + "(it opens \(String(format: "%.0f", abs(lead))) ms "
+            + (lead >= 0 ? "before" : "after") + " the picture)"
+    }
+
     /// AE#446 round 4: the three readings a rejoin's placement is argued from, on one line.
     ///
     /// They were only ever available separately, which is why an item's clock and an item's seekable
@@ -437,10 +492,19 @@ extension AetherEngine {
         guard var w = liveWindow else { return }
         w.noteEdge(edgeSessionTime)
         w.notePlayhead(currentTime)
-        w.noteResidentFloor(residentLiveFloorSessionSeconds())
+        w.noteResidentFloor(residentLiveFloorSessionSeconds() ?? softwareHost?.dvrResidentFloorSessionSeconds)
         // Sodalite#104 round 4: the cadence the playlist declares, which outranks how the source
         // happened to deliver. nil on the paths that serve no playlist of ours.
         w.noteTargetDuration(liveTargetDurationSeconds)
+        // Sodalite#104 round 2: does this tick describe a session keeping up by playback alone? Only
+        // such a tick's distance says what THIS source costs a client at the edge, and the samples are
+        // rate-limited so twelve of them span a stretch of media rather than a stretch of ticks (the
+        // publish rate follows `$currentTime`, not the wall clock).
+        let advance = lastPublishedLivePlayhead.map { currentTime - $0 } ?? 0
+        let sampleDue = lastLiveCadenceSamplePlayhead.map { currentTime - $0 >= 0.5 } ?? true
+        let tracking = state == .playing && !isSeeking && advance > 0 && advance < 1.5 && sampleDue
+        if tracking { lastLiveCadenceSamplePlayhead = currentTime }
+        w.settleEdgeVerdict(tracking: tracking)
         auditLiveRejoinPlacement()
         liveWindow = w
         // AE#442: tick-to-tick advancement, not a running maximum: a backward DVR seek drops the
@@ -461,7 +525,9 @@ extension AetherEngine {
                 + "edge=\(String(format: "%.2f", w.edgeTime))s "
                 + "lastEdgeStep=\(String(format: "%.2f", w.lastEdgeStepSeconds))s "
                 + "targetDuration=\(w.targetDurationSeconds.map { String(format: "%.2f", $0) + "s" } ?? "none") "
-                + "tolerance=\(String(format: "%.2f", w.edgeToleranceSeconds))s",
+                + "trackingCadence=\(w.trackingCadenceSeconds.map { String(format: "%.2f", $0) + "s" } ?? "none") "
+                + "tolerance=\(String(format: "%.2f", w.edgeToleranceSeconds))s "
+                + "exitAbove=\(String(format: "%.2f", w.edgeToleranceSeconds + LiveWindow.edgeExitSlack))s",
                 category: .session
             )
         }
@@ -492,11 +558,17 @@ extension AetherEngine {
         Task { @MainActor [weak self] in
             guard let self else { return }
             let ahead = await self.avPlayerBufferAheadSeconds()
+            let generation = self.nativeHost?.itemGeneration ?? -1
             guard ahead < Self.liveThinRunwaySeconds else {
+                // This item has held the floor, so a thin reading on it from here on is a decay.
+                self.liveRunwayHealthyGeneration = generation
                 self.liveThinRunwayNoted = false
                 return
             }
-            guard !self.liveThinRunwayNoted else { return }
+            guard Self.reportsThinLiveRunway(itemGeneration: generation,
+                                             healthyGeneration: self.liveRunwayHealthyGeneration,
+                                             alreadyNoted: self.liveThinRunwayNoted)
+            else { return }
             self.liveThinRunwayNoted = true
             EngineLog.emit(
                 "[AetherEngine] #524 the client is running thin: it holds "
@@ -511,6 +583,30 @@ extension AetherEngine {
     /// AE#524: under this much fetched content a live client is one late delivery from a stall.
     /// Measured on a healthy session: the sawtooth bottoms out around 3 s.
     static let liveThinRunwaySeconds: Double = 2.0
+
+    /// AE#524 round 2: whether a thin reading is a session decaying, or an item that has not fetched yet.
+    ///
+    /// The line was born from a session that decayed: 57 s of healthy fetching, then a deficit that
+    /// accumulated until the runway was gone. A fresh mount reads identically and means the opposite.
+    /// Reported from the field on AE#440, 17 ms after a load: `0.00s of fetched runway, playhead 0.00s
+    /// against a seekable edge of 0.00s`, a non-measurement in the shape of a measurement.
+    ///
+    /// Time since load does not separate the two, because an in-place swap (#446 rejoin) mounts an
+    /// empty item on a session whose playhead and edge are real and holds nothing for about 190 ms.
+    /// The ITEM separates them: a thin reading counts once the item being measured has been seen
+    /// holding the floor, and health does not travel across a swap.
+    ///
+    /// A join that never reaches the floor therefore never reports here, and that is the intent: it
+    /// never had a runway to run thin on, and the join's own lines and `playbackStalled` describe it.
+    /// This line answers one question, whether a session that was healthy is decaying.
+    nonisolated static func reportsThinLiveRunway(
+        itemGeneration: Int,
+        healthyGeneration: Int?,
+        alreadyNoted: Bool
+    ) -> Bool {
+        guard let healthyGeneration, healthyGeneration == itemGeneration else { return false }
+        return !alreadyNoted
+    }
 
     /// AE#446 round 4: who asked for a seek. The two differ in exactly two places, both about a live
     /// session that advertises no DVR window: whether the seek is refused outright, and whether its
@@ -591,6 +687,23 @@ extension AetherEngine {
         return (sessionTarget, clockTarget)
     }
 
+    /// Sodalite#104 round 3: where a software live seek lands, given where it was asked to land.
+    ///
+    /// The software path plays out of a ring the reader fills at the rate the source delivers, so a
+    /// landing AT the frontier has nothing ahead of it: the pump finds the ring dry, the clock parks,
+    /// and it resumes once `rebufferResumeLeadSeconds` of audio stands ahead of it. On a real-time
+    /// source that lead arrives exactly as slowly as it is deep, and the frontier moves on by the same
+    /// amount meanwhile, so the session resumes that far behind the frontier after a frozen picture
+    /// of the same length. Measured from a device on a tuner: `lead=0.13s` to `lead=2.05s` in 1.92 s
+    /// on every Return to Live, while a rewind into content the ring already held reached its first
+    /// frame in 223 to 258 ms.
+    ///
+    /// Landing the lead behind the frontier reaches the same place with the same cushion and spends
+    /// nothing on the way. A target the ring already holds that lead for is untouched.
+    nonisolated static func softwareLiveLanding(requested: Double, window: LiveWindow) -> Double {
+        window.clamp(Swift.min(requested, window.edgeTime - AudioLookaheadPolicy.rebufferResumeLeadSeconds))
+    }
+
     /// AE#454: how close the fresh item has to be to the place it was asked for before the correcting
     /// seek is not worth its cost.
     ///
@@ -638,20 +751,39 @@ extension AetherEngine {
 
     /// Seek to the current live edge. No-op when not live.
     public func seekToLiveEdge() async {
-        guard isLive, let w = liveWindow else { return }
+        // Sodalite#104 round 3: both early exits discard a press the viewer made, so both say so, the
+        // same way `seek(to:)` logs its refusals. Silence here reads exactly like a press that never
+        // arrived.
+        guard isLive, let w = liveWindow else {
+            EngineLog.emit("[AetherEngine] seekToLiveEdge() ignored: no live session (state=\(state), live=\(isLive))",
+                           category: .engine)
+            return
+        }
         // Live-only (no DVR window): seek(to:) refuses; drive native host directly to seekableEnd as the recovery move after eviction.
         guard w.windowSeconds != nil else {
-            if let host = nativeHost {
-                let clockTarget = max(0, host.seekableEnd)
-                EngineLog.emit(
-                    "[AetherEngine] live-only edge snap: clockTarget=\(String(format: "%.1f", clockTarget))",
-                    category: .engine
-                )
-                await host.seek(to: clockTarget)
-                nativeClockSeconds = clockTarget
-                clock.currentTime = clockTarget + playlistShiftSeconds
-                clock.sourceTime = currentTime
+            guard let host = nativeHost else {
+                EngineLog.emit("[AetherEngine] seekToLiveEdge() ignored: live-only session with no native item to snap",
+                               category: .engine)
+                return
             }
+            let clockTarget = max(0, host.seekableEnd)
+            EngineLog.emit(
+                "[AetherEngine] live-only edge snap: clockTarget=\(String(format: "%.1f", clockTarget))",
+                category: .engine
+            )
+            let loadGen = loadGeneration
+            let seekGen = currentSeekGeneration
+            await host.seek(to: clockTarget)
+            // Audit CORE-7: the native host survives a native-to-native zap, so this seek can finish
+            // against the next channel's item, and a scrub started meanwhile owns the clock too.
+            guard loadGeneration == loadGen, currentSeekGeneration == seekGen else {
+                EngineLog.emit("[AetherEngine] live-only edge snap superseded; clock left to the successor",
+                               category: .engine)
+                return
+            }
+            nativeClockSeconds = clockTarget
+            clock.currentTime = clockTarget + playlistShiftSeconds
+            clock.sourceTime = currentTime
             return
         }
         await seek(to: w.edgeTime)

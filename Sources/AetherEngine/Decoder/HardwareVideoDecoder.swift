@@ -25,6 +25,11 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// mirror SoftwareVideoDecoder.extractHDR10PlusBytes). Flag kept so host wiring stays identical to SW path.
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
     var onA53Captions: (@Sendable ([CCDataParser.CCTriplet], Double) -> Void)?
+    var onDecodedFormat: (@Sendable (DecodedVideoFormat) -> Void)?
+    private var streamColor = ColorDescription.unspecified
+    private var streamCodecID = AV_CODEC_ID_NONE
+    private var streamProfile = AV_PROFILE_UNKNOWN
+    private var reportedPixelBufferType: OSType = 0
 
     /// Skip pre-seek RASL frames to avoid the "fast forward" effect; decoded for reference but not delivered.
     /// Guarded by `skipLock` not `lock`: close() holds `lock` across VTDecompressionSessionWaitForAsynchronousFrames,
@@ -151,21 +156,20 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         formatDescription = formatDesc
 
-        // 2. Require hardware on tvOS 17+ so VT fails outright rather than silently falling back to SW
-        //    (which would show only as pathological CPU + frame drops at 4K). Deployment target is tvOS 26
-        //    so the if-available branch is always taken in production.
-        var decoderSpec: NSDictionary?
-        if #available(tvOS 17.0, iOS 17.0, *) {
-            decoderSpec = [
-                kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true,
-            ]
-        }
+        // 2. Require hardware so VT fails outright rather than silently falling back to SW
+        //    (which would show only as pathological CPU + frame drops at 4K).
+        let decoderSpec: NSDictionary = [
+            kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true,
+        ]
 
         // 3. Pixel buffer attributes: 10-bit biplanar for HDR, 8-bit for SDR; IOSurface-backed for Metal rendering.
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
         let isHDRTransfer = ColorAttachments.isHDRTransfer(codecpar.pointee.color_trc)
         let use10Bit = bitsPerSample > 8 || isHDRTransfer
 
+        streamColor = ColorDescription(codecpar: codecpar)
+        streamCodecID = codecpar.pointee.codec_id
+        streamProfile = codecpar.pointee.profile
         self.colorPrimaries = ColorAttachments.primaries(codecpar.pointee.color_primaries)
         self.colorTransfer = ColorAttachments.transfer(codecpar.pointee.color_trc)
         self.colorMatrix = ColorAttachments.matrix(codecpar.pointee.color_space)
@@ -206,13 +210,11 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         session = createdSession
 
         // 5. Pass through per-frame HDR metadata for correct tone mapping; unknown-key set returns -12911 on older OSes (swallowed).
-        if #available(tvOS 17.0, iOS 17.0, *) {
-            VTSessionSetProperty(
-                createdSession,
-                key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
-                value: kCFBooleanTrue
-            )
-        }
+        VTSessionSetProperty(
+            createdSession,
+            key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
+            value: kCFBooleanTrue
+        )
 
         EngineLog.emit(
             "[HardwareVideoDecoder] opened HEVC \(width)x\(height) "
@@ -228,7 +230,7 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         lock.lock()
         // AE#492: see `SoftwareVideoDecoder.decode`. Same rule, same lock as `flush()`.
         if let epoch, epoch != _feedEpoch { lock.unlock(); return }
-        guard let session = session, let formatDesc = formatDescription else {
+        guard session != nil, let formatDesc = formatDescription else {
             lock.unlock()
             return
         }
@@ -259,19 +261,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             copied.deallocate()
             return
         }
-        let ptsRaw = packet.pointee.pts
-        let dtsRaw = packet.pointee.dts
-        let durRaw = packet.pointee.duration
-        let timescale = max(timeBase.den, 1)
-
-        let pts = (ptsRaw != Int64.min)
-            ? CMTimeMake(value: ptsRaw * Int64(timeBase.num), timescale: timescale)
-            : CMTime.invalid
-        let dts = (dtsRaw != Int64.min)
-            ? CMTimeMake(value: dtsRaw * Int64(timeBase.num), timescale: timescale)
-            : CMTime.invalid
-        let dur = (durRaw > 0)
-            ? CMTimeMake(value: durRaw * Int64(timeBase.num), timescale: timescale)
+        let pts = SourceTimestampBounds.cmTime(ticks: packet.pointee.pts, timeBase: timeBase)
+        let dts = SourceTimestampBounds.cmTime(ticks: packet.pointee.dts, timeBase: timeBase)
+        let dur = packet.pointee.duration > 0
+            ? SourceTimestampBounds.cmTime(ticks: packet.pointee.duration, timeBase: timeBase)
             : CMTime.invalid
 
         var timing = CMSampleTimingInfo(duration: dur, presentationTimeStamp: pts, decodeTimeStamp: dts)
@@ -310,6 +303,12 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             }
         }
 
+        // Audit DEC-4: the epoch check and the send sit under one hold of `lock`, or a flush landing
+        // while the sample buffer is built lets a pre-seek packet into VT after it. Safe to hold:
+        // the output callback never takes `lock`, and `close()` already holds it across the VT wait.
+        lock.lock()
+        if let epoch, epoch != _feedEpoch { lock.unlock(); return }
+        guard let session = self.session else { lock.unlock(); return }
         // Async decode with temporal queueing; callback fires on VT's internal queue.
         var infoFlags = VTDecodeInfoFlags()
         let decodeStatus = VTDecompressionSessionDecodeFrame(
@@ -319,9 +318,10 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             frameRefcon: nil,
             infoFlagsOut: &infoFlags
         )
+        lock.unlock()
         if decodeStatus != noErr {
             EngineLog.emit(
-                "[HardwareVideoDecoder] decode error \(decodeStatus) at pts=\(ptsRaw)",
+                "[HardwareVideoDecoder] decode error \(decodeStatus) at pts=\(packet.pointee.pts)",
                 category: .swPlayback
             )
         }
@@ -412,7 +412,25 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             CVBufferRemoveAttachment(imageBuffer, kCVImageBufferPixelAspectRatioKey)
         }
 
+        reportDecodedFormat(imageBuffer)
         onFrame?(imageBuffer, pts, nil)
+    }
+
+    /// VideoToolbox decodes straight into the display buffer, so the buffer IS the decoded picture; its
+    /// colour is what this decoder attached, which is the stream's declaration.
+    private func reportDecodedFormat(_ buffer: CVImageBuffer) {
+        guard let onDecodedFormat else { return }
+        let type = CVPixelBufferGetPixelFormatType(buffer)
+        guard type != reportedPixelBufferType else { return }
+        reportedPixelBufferType = type
+        onDecodedFormat(DecodedVideoFormat(
+            frame: VideoStreamFormat(
+                pixelFormat: DecodedVideoFormat.libavPixelFormat(forPixelBufferType: type),
+                declaredBitDepth: 0,
+                color: streamColor,
+                codecID: streamCodecID,
+                profile: streamProfile),
+            pixelBufferFormat: DecodedVideoFormat.fourCC(type)))
     }
 }
 

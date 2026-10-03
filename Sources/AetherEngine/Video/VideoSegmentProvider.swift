@@ -16,7 +16,7 @@ struct NativeSubtitleRenditionInfo: Sendable, Equatable {
 
 /// Single source of truth for sliding live window size. Playlist firstVisible and cache evictBelow
 /// both read this so they can never drift (drift = playlist lists a segment the cache deleted, or vice versa).
-/// effectiveWindowSeconds = dvrWindowSeconds ?? liveOnlyFloorSeconds;
+/// effectiveWindowSeconds = dvrWindowSeconds clamped to [0, 1 day] ?? liveOnlyFloorSeconds;
 /// windowSegmentCount = max(minSafeSegments, ceil(effective / targetSegmentDurationSeconds)).
 struct LiveWindowSizing {
     /// Live-only floor: 60 s so disk and playlist stay finite even without DVR seek.
@@ -58,9 +58,17 @@ struct LiveWindowSizing {
     /// has to: comparing the served count against a value that already carries the clamps would report
     /// every clamped window as unclamped.
     func requestedSegmentCount(observedSegmentDurationSeconds: Double?) -> Int {
-        let effective = dvrWindowSeconds ?? Self.liveOnlyFloorSeconds
+        let effective = Self.effectiveWindowSeconds(dvrWindowSeconds)
         let divisor = max(max(0.5, targetSegmentDurationSeconds), observedSegmentDurationSeconds ?? 0)
         return Int(ceil(effective / divisor))
+    }
+
+    /// Audit SEG-107: the window is a host value, and `.infinity` ("keep everything"), NaN or anything
+    /// past `Int` trapped the conversion above. A day is far deeper than the playlist ceiling ever
+    /// serves, and keeps the log's `requested x cadence` product in range.
+    static func effectiveWindowSeconds(_ dvrWindowSeconds: Double?) -> Double {
+        guard let window = dvrWindowSeconds, !window.isNaN else { return liveOnlyFloorSeconds }
+        return min(max(window, 0), Double(LiveEdgePolicy.maxCoveredWholeSeconds))
     }
 
     /// AE#443: how many segments of the observed size the session's disk allowance holds.
@@ -98,33 +106,22 @@ enum LiveEdgePolicy {
     /// Never serve an empty or single-segment live playlist (a 1-segment window is an instant -12888).
     static let minStartupSegments = 2
 
+    /// AE#594 arm B, env-gated (`AETHER_BOUNDED_START_FLOOR=1`) because it is a measurement arm and
+    /// not a policy: it floors `fastZap`'s bounded start at the holdback, leaving the outer
+    /// wall-clock deadline as the only shortcut. Read once, so a run cannot change arms midway.
+    static let boundedStartFloorArmed =
+        ProcessInfo.processInfo.environment["AETHER_BOUNDED_START_FLOOR"] == "1"
+
+    /// AE#686, env-gated (`AETHER_FIRST_SERVE_LATCH_ALL=1`) for the same reason: it extends #684's
+    /// first-serve latch from ingest sessions to sources the engine cuts itself, so the second plain
+    /// manifest request no longer waits out a second grace. Read once.
+    static let firstServeLatchAllArmed =
+        ProcessInfo.processInfo.environment["AETHER_FIRST_SERVE_LATCH_ALL"] == "1"
+
     /// AVPlayer's unchanged-playlist patience: it tolerates a playlist that has not changed for this
     /// multiple of the served TARGETDURATION before drawing `-12888`. The one number the cadence floor
     /// is answerable to.
     static let unchangedPlaylistPatienceMultiplier: Double = 1.5
-
-    /// AE#446 round 7: how long a live source may be quiet before the window it still holds is served
-    /// as a finished asset (`VideoSegmentProvider.liveOutageEndlist`).
-    ///
-    /// Deliberately NOT the patience multiplier above. That one is where the CLIENT starts saying the
-    /// source is late (`-12888`) and where the blocking-reload advert is withdrawn, both cheap and both
-    /// reversible. Closing the window is neither: an item that has read an ENDLIST never reloads its
-    /// playlist, so the source coming back is only expressible as an item swap, and the viewer pays for
-    /// it with a visible interruption at the end of the runway. Sizing an irreversible commitment by a
-    /// threshold chosen for a cheap withdrawal spent it on every hiccup one target duration long.
-    /// Measured in the field on a 1 s-segment stack (TARGETDURATION 2, so the withdrawal threshold is
-    /// 3.0 s): a 3.006 s stall in the source read committed a session that still held 14 s of runway to
-    /// a swap 17 s later, with the source delivering again 0.6 s after the decision was taken.
-    ///
-    /// The ceiling is what the client will actually sit through with the window still open, which is
-    /// far more than the closing threshold ever needed. Measured on the harness with the close
-    /// suppressed and no blocking-reload advert (which is the state this window is always in past the
-    /// patience threshold, since #446 withdraws the advert there): AVPlayer kept fetching the resident
-    /// runway for 77 s past the freeze at TARGETDURATION 6, about 13 x TD: 20 fetches, 13 `-12888`
-    /// lines across 20 polls, and it stopped on the last listed segment rather than on patience. Three is a
-    /// quarter of that ceiling and twice the client's own patience: the source gets to be late twice
-    /// over before a decision the item cannot take back is made on its behalf.
-    static let outageCloseSilenceMultiplier: Double = 3.0
 
     /// AE#523: jitter headroom on a MEASURED delivery cadence.
     ///
@@ -136,34 +133,64 @@ enum LiveEdgePolicy {
     /// missed ones one.
     static let sourceCadenceJitterMargin: Double = 1.25
 
-    /// AE#523: deliveries a source may miss before the window it still holds is closed. See
-    /// `outageCloseSilenceSeconds`.
-    static let outageCloseCadenceMultiplier: Double = 2.0
+    /// AE#523 round 2: the content a close still needs in front of the consumer, as a multiple of the
+    /// served TARGETDURATION.
+    ///
+    /// Closing the window is only worth anything while the consumer can still be TOLD. An item that
+    /// walks off the end of an OPEN window does not get a `didPlayToEndTime` to hand the session a
+    /// controlled swap: it stalls at an edge that is not moving, and about half a minute later the
+    /// client rejoins forward on its own and the position is gone (measured on the harness with the
+    /// close suppressed entirely: a 30 s outage came back POSITION LOST, 4 segments skipped, against
+    /// `position held` with it). So the wait ends one poll before the content does, and not sooner.
+    ///
+    /// One poll is about `0.81 x TD` with the blocking-reload advert withdrawn, which is the state
+    /// every close candidate is in (measured over three harness runs: 31, 35 and 38 polls at a mean gap
+    /// of 4.83, 4.85 and 4.86 s against TARGETDURATION 6). A whole target duration is that poll plus a
+    /// fifth of one in margin, and it can never be less than a segment, since `EXT-X-TARGETDURATION` is
+    /// by definition the longest one the playlist carries.
+    static let outageCloseDepthReserveMultiplier: Double = 1.0
 
-    /// AE#446 round 7: the deadline in seconds, for a session whose TARGETDURATION is this.
+    /// The reserve in seconds, for a session whose TARGETDURATION is this.
+    static func outageCloseDepthReserveSeconds(targetDuration: Int) -> Double {
+        outageCloseDepthReserveMultiplier * Double(targetDuration)
+    }
+
+    /// AE#446 round 7, rewritten by AE#523 round 2: the last moment at which closing the window can
+    /// still be served, for a session whose TARGETDURATION is this.
     ///
-    /// Bounded above by the producer's own patience with a source that cuts nothing
-    /// (`HLSSegmentProducer.liveSourceStarvationTimeoutSeconds`, 35 s): past that the read is given up
-    /// and handed to the host, and a window that has not been closed by then never will be. That bound
-    /// is not hypothetical at a large TARGETDURATION, which is exactly the bursty-relay source this
-    /// live path exists for (#167): a 14 s seal from an arrival cadence would put `3 x TD` at 42 s, on
-    /// the far side of an exit at 35. A patience-worth of margin is kept ahead of it, so the client has
-    /// polls left to be handed the closed playlist in.
+    /// This used to be the close's main trigger, a deadline on the silence: `3 x TD` in round 7, and
+    /// two of the source's own deliveries once AE#523 measured the source instead of the client. It is
+    /// not a trigger any more, because it was never on a different axis from the runway it was paired
+    /// with. While the source is quiet the consumer keeps walking the window, so what is left of the
+    /// clock and what is left of the content fall together and the pair has one degree of freedom: for
+    /// anyone holding more than a deadline's worth of content the clock reached zero first, every time,
+    /// and the irreversible decision was taken with the content that would have paid for the wait still
+    /// in hand. The runway bound could only ever fire at the first moment the question was asked.
     ///
-    /// Bounded below by the moment the source is late at all: a deadline under that would close the
+    /// Measured on the harness, a viewer 30 s inside the window against a 22 s freeze at TARGETDURATION
+    /// 6: late at 10.07 s of silence with 24.0 s of runway, closed at 20.10 s of silence with the same
+    /// 24.0 s of runway, item swapped, largest step 28.98 s, and the source was delivering again 2 s
+    /// after the decision. Reported from the field on 6.84.0 as 5 closes in 40 gaps of a 45 minute
+    /// session, each with 5.8 to 8.5 s of runway in hand and the source back within seconds.
+    ///
+    /// What is left is the one clock bound that is not about the content: the producer gives up a
+    /// source that cuts nothing after `HLSSegmentProducer.liveSourceStarvationTimeoutSeconds` (35 s)
+    /// and hands the session to the host, and the deferral that holds that exit off
+    /// (`VideoSegmentProvider.outageRunwayAheadOfConsumer`) only applies to a window already CLOSED. A
+    /// window not closed by then never will be. The close therefore happens a patience short of the
+    /// exit, which is what leaves the client polls to be handed the closed playlist in, and arms the
+    /// deferral before the exit can fire. The margin has to cover a poll, because the decision is only
+    /// ever taken while a playlist is being built: measured on the harness at TARGETDURATION 6, a
+    /// 26.0 s ceiling was acted on at 30.15 s of silence, 4.85 s ahead of the exit, and a patience is
+    /// `1.5 x TD` against a poll at `0.81 x TD`.
+    ///
+    /// Bounded below by the moment the source is late at all: a ceiling under that would close the
     /// window before the question can even be asked.
-    static func outageCloseSilenceSeconds(targetDuration: Int,
+    static func outageCloseCeilingSeconds(targetDuration: Int,
                                           cadenceSeconds: Double? = nil) -> Double {
-        let td = Double(targetDuration)
-        let patience = unchangedPlaylistPatienceMultiplier * td
+        let patience = unchangedPlaylistPatienceMultiplier * Double(targetDuration)
         let late = sourceLateSeconds(targetDuration: targetDuration, cadenceSeconds: cadenceSeconds)
-        // AE#523: a deadline of `3 x TD` is under two of this source's own deliveries when its rhythm is
-        // coarser than the target duration, so the deadline carries the same floor the lateness question
-        // does. Two rhythms, because one missed delivery is what lateness already means; the deadline is
-        // the point at which waiting for a second one has stopped being worth an item's runway.
-        let fromCadence = (cadenceSeconds ?? 0) * outageCloseCadenceMultiplier
-        return max(late, min(max(outageCloseSilenceMultiplier * td, fromCadence),
-                             HLSSegmentProducer.liveSourceStarvationTimeoutSeconds - patience))
+        return max(late, HLSSegmentProducer.liveSourceStarvationTimeoutSeconds - patience)
     }
 
     /// AE#523: how long THIS source may be quiet before it is called late.
@@ -192,40 +219,54 @@ enum LiveEdgePolicy {
         return min(max(patience, cadence * sourceCadenceJitterMargin), ceiling)
     }
 
-    /// AE#520: does the content in front of the consumer end the wait before the clock does?
+    /// AE#523 round 2: has the wait run out of the content it is being waited with?
     ///
-    /// Waiting is only free while there is something to wait WITH. A consumer that walks off the end of
-    /// an open window does not get a `didPlayToEndTime` to hand the session a controlled swap: it stalls
-    /// at an edge that is not moving, and past about half a minute of that the item dies and the client
-    /// rejoins forward on its own (measured on the harness with the close suppressed entirely: a 30 s
-    /// outage came back `POSITION LOST`, 4 segments skipped, against `position held` with it). So the
-    /// deadline is one bound on the wait and the runway is the other.
+    /// AE#520 round 2: and the content is everything the consumer can still play, not only the part
+    /// the window still lists above its fetch point. Those two are the same number for a deeply
+    /// timeshifted viewer and nowhere near it for one at the edge, whose buffer is most of what it
+    /// has: measured on the harness at TARGETDURATION 6, the window closed on 4.0 s listed while
+    /// AVPlayer held another 4.9 s, and the source delivered again 1.84 s later. Deferring costs
+    /// nothing in the seam it was avoiding, because the swap lands when the consumer reaches the end
+    /// of the closed window and not when the ENDLIST is served (measured in the same run: closed at
+    /// +70.51, swapped at +89.5 with 0.79 s of buffer left).
     ///
-    /// AE#446 round 7 wrote the second one as a CONSTANT, two target durations of content, on the
-    /// premise that a stalled client makes several polls per target duration. Both halves were wrong,
-    /// and the constant is what AE#520 reported as Atmos dropping on live:
+    /// Waiting is only free while there is something to wait WITH, and it is only useful while the
+    /// consumer can still be TOLD. A consumer that walks off the end of an OPEN window does not get a
+    /// `didPlayToEndTime` to hand the session a controlled swap: it stalls at an edge that is not
+    /// moving, and past about half a minute of that the item dies and the client rejoins forward on its
+    /// own (measured on the harness with the close suppressed entirely: a 30 s outage came back
+    /// `POSITION LOST`, 4 segments skipped, against `position held` with it). So the window closes one
+    /// poll before the content runs out (`outageCloseDepthReserveSeconds`), and otherwise not at all
+    /// until the producer is about to give the source up (`outageCloseCeilingSeconds`).
     ///
-    /// - The client polls about ONCE per target duration, not several times. Measured over three
-    ///   harness runs with the advert withdrawn (which is the state every close candidate is in):
-    ///   31, 35 and 38 polls at a mean gap of 4.83, 4.85 and 4.86 s against TARGETDURATION 6, so
-    ///   0.81 x TD per poll. Two target durations is two and a half polls, not "a comfortable few".
-    /// - A viewer at the live edge holds the holdback, `3 x TD`, and is not asked about any of this
-    ///   until the source is late at `1.5 x TD`, by which point half of that is spent. It therefore
-    ///   stands at `1.5 x TD` and UNDER a `2 x TD` floor at the very first moment the question can be
-    ///   asked. The floor fired at once for every viewer who had not deliberately rewound, so round 7's
-    ///   `3 x TD` deadline was unreachable for exactly the viewer it was written for, and the effective
-    ///   close threshold stayed the cheap `1.5 x TD` that round set out to remove.
+    /// Two earlier readings of the same bound, and why neither is the comparison:
     ///
-    /// So the runway is compared against the clock rather than against a number: it ends the wait only
-    /// when the content ahead will not carry it to the deadline. Both are seconds, and one of them is
-    /// already a measured, argued bound. Measured on the harness, same command line in both arms:
-    /// a 12 s gap at TARGETDURATION 6 with 12.0 s of runway closed the window and swapped the item
-    /// before, and is absorbed with no ENDLIST and no swap after, at an identical playhead (89.40 s
-    /// against 89.60 s of advance, largest step 1.10 s in both). A 30 s outage holds its position in
-    /// both arms.
-    static func outageCloseOnRunway(runwaySeconds: Double, silenceSeconds: Double,
-                                    deadlineSeconds: Double) -> Bool {
-        runwaySeconds <= max(0, deadlineSeconds - silenceSeconds)
+    /// - AE#446 round 7 wrote it as a CONSTANT, two target durations of content, on the premise that a
+    ///   stalled client makes several polls per target duration. Both halves were wrong, and the
+    ///   constant is what AE#520 reported as Atmos dropping on live. The client polls about ONCE per
+    ///   target duration, not several times (measured over three harness runs with the advert
+    ///   withdrawn, which is the state every close candidate is in: 31, 35 and 38 polls at a mean gap
+    ///   of 4.83, 4.85 and 4.86 s against TARGETDURATION 6, so `0.81 x TD` per poll). And a viewer at
+    ///   the live edge holds the holdback, `3 x TD`, and is not asked about any of this until the
+    ///   source is late at `1.5 x TD`, by which point half of it is spent: the floor fired at once for
+    ///   every viewer who had not deliberately rewound, so round 7's `3 x TD` deadline was unreachable
+    ///   for exactly the viewer it was written for.
+    /// - AE#520 replaced the constant with the CLOCK: the wait ended when the content ahead would not
+    ///   carry it to the close deadline. That removed the reported swap (measured on the harness, same
+    ///   command line in both arms: a 12 s gap at TARGETDURATION 6 with 12.0 s of runway closed the
+    ///   window and swapped the item before, and is absorbed with no ENDLIST and no swap after, at an
+    ///   identical playhead, 89.40 s against 89.60 s of advance, largest step 1.10 s in both). But the
+    ///   deadline is not a second axis. `runway + silence` is what a quiet source holds fixed, so
+    ///   `runway <= deadline - silence` is decided the first time it is asked and never changes its
+    ///   answer afterwards: a consumer holding more than a deadline's worth of content was never closed
+    ///   on by this bound at all, and the deadline closed it instead with every second of that content
+    ///   still in hand.
+    ///
+    /// The reading below is uniformly more patient than AE#520's, other than in the last poll before
+    /// the old deadline, where a thin runway now closes one poll earlier than a clock that was about to
+    /// close it anyway.
+    static func outageCloseOnDepth(depthSeconds: Double, targetDuration: Int) -> Bool {
+        depthSeconds <= outageCloseDepthReserveSeconds(targetDuration: targetDuration)
     }
 
     /// The TARGETDURATION a measured arrival cadence requires: enough that `1.5 x TD` of patience covers
@@ -238,6 +279,66 @@ enum LiveEdgePolicy {
     /// three of holdback (measured: 1.07-1.09 s of wall clock per zap).
     static func targetDurationForCadence(_ cadenceSeconds: Double) -> Int {
         wholeSecondsCovering(cadenceSeconds / unchangedPlaylistPatienceMultiplier)
+    }
+
+    /// AE#684: the TARGETDURATION an ingested upstream's segment duration requires, which is the whole
+    /// of it and not `targetDurationForCadence`'s two thirds.
+    ///
+    /// The division by 1.5 is right for a measured gap because the meter hands over a robust maximum.
+    /// A segment duration is the other end of the distribution: the period the upstream delivers at
+    /// when nothing at all is late, since it cannot publish a segment before it has finished one. Every
+    /// real delivery is that period plus the upstream's jitter plus this reader's own reload interval
+    /// (half a segment, the RFC's), so a patience of exactly one period is under all of them. It only
+    /// looked covered while the served segments were the upstream's own, where `ceil(max EXTINF)` puts
+    /// the whole segment into the value anyway. `.fastZap` re-cuts each upstream segment at its GOPs,
+    /// that term then reads the GOP, and a 6 s upstream sealed at `ceil(6 / 1.5)` = 4: a 6.0 s patience
+    /// for deliveries measured in the field at 6.17 to 6.83 s, -12888 on the first one that also missed
+    /// a poll, a skipped reload after it and a stall with the content already listed.
+    ///
+    /// Re-cutting changes how finely the window is listed, not how often it changes, so the playlist
+    /// promises what a playlist of the upstream's segments would: at least their longest duration.
+    ///
+    /// Bounded by `upstreamSegmentSealCeilingSeconds`: above it the term stops growing and
+    /// `targetDurationForCadence` (two thirds of the segment) is the larger one again.
+    static func targetDurationForUpstreamSegment(_ segmentSeconds: Double) -> Int {
+        guard !segmentSeconds.isNaN else { return 0 }
+        return wholeSecondsCovering(Swift.min(segmentSeconds, upstreamSegmentSealCeilingSeconds))
+    }
+
+    /// AE#684: the longest upstream segment the seal takes whole.
+    ///
+    /// A holdback is `3 x` the value, and the live-only window is 60 s
+    /// (`LiveWindowSizing.liveOnlyFloorSeconds`): a 20 s segment taken whole would ask the client to
+    /// sit a whole window behind an edge that window can barely list. At 10, segments up to 10 s are
+    /// asked for whole and a 20 s one seals 14, as it did before the term existed. What is asked for
+    /// is then paid only as far as the join reaches (`targetDurationTheJoinCanPay`), and the join is
+    /// not deepened for it, so in practice a 10 s provider lands at 9. (The join's one addition,
+    /// `HLSPlaylistTracker.phaseEqualisedJoinDepth`, only lifts a tune to the depth another phase
+    /// of the same listing already takes.)
+    static let upstreamSegmentSealCeilingSeconds: Double = 10
+
+    /// AE#684: the upstream-segment seal, as far as the join can pay for it.
+    ///
+    /// A seal is a holdback of `3 x` itself, and a holdback the first window cannot hold is not
+    /// protection, it is a start the client spends waiting. The join is three upstream segments on
+    /// anything longer than about 5 s and stays that deep (one more would be one more download on
+    /// every zap, AE#678; the exception is an upstream whose segment lengths alternate, where a tune
+    /// is lifted to the depth its other phase already takes, 6 s / 4 s to four), and its last GOP
+    /// stays open until the next upstream delivery: three 6 s
+    /// segments are 18 s joined and 16 s cut, against the 18 s a seal of 6 asks for. So once the
+    /// reader has handed the whole join over and the cutter has nothing left to read, the seal is the
+    /// largest value that cut content covers, never under what it was without the upstream term and
+    /// never over the full one: 16 s pays for 5 (patience 7.5 s where the old rule gave 6.0 s), 28 s
+    /// of a 10 s provider for 9.
+    ///
+    /// Whether the join is spent is a FACT the reader states (`joinIsSpent`), not arithmetic on
+    /// EXTINF: a playlist that rounds its durations up (6.3 for 6 s of media) never adds up to what
+    /// was cut, and a tolerance on the sum decided every such start wrongly.
+    static func targetDurationTheJoinCanPay(full: Int, withoutUpstreamSegment base: Int,
+                                            finalizedSeconds: Double) -> Int {
+        guard finalizedSeconds.isFinite, finalizedSeconds > 0 else { return Swift.max(base, 0) }
+        let affordable = Int((servedSeconds(finalizedSeconds) / 3).rounded(.down))
+        return Swift.max(base, Swift.min(full, affordable))
     }
 
     /// A duration as the playlist actually serves it: `#EXTINF` is written with `%.3f`, so a millisecond
@@ -259,9 +360,19 @@ enum LiveEdgePolicy {
     }
 
     /// Whole seconds of promise covering a measured duration, taken at the served resolution.
+    ///
+    /// Total: a duration from a hostile or broken source (infinite, NaN, beyond `Int`) must not trap the
+    /// playlist writer. An unbounded one saturates at `maxCoveredWholeSeconds`, which keeps `3 x TD`
+    /// arithmetic far from overflow; NaN and anything at or below zero cover nothing.
     static func wholeSecondsCovering(_ seconds: Double) -> Int {
-        Int(servedSeconds(seconds).rounded(.up))
+        guard !seconds.isNaN else { return 0 }
+        let covered = servedSeconds(seconds).rounded(.up)
+        guard covered < Double(maxCoveredWholeSeconds) else { return maxCoveredWholeSeconds }
+        return covered > 0 ? Int(covered) : 0
     }
+
+    /// One day. Far above any real segment or cadence, far below where `Int` arithmetic on it overflows.
+    static let maxCoveredWholeSeconds = 86_400
 
     /// AE#454: the served `EXT-X-START:TIME-OFFSET` for a rejoin, or nil when this playlist cannot
     /// carry the placement.
@@ -293,19 +404,74 @@ enum LiveEdgePolicy {
     }
 
     /// Served `#EXT-X-TARGETDURATION`, in whole seconds: `>= ceil(max EXTINF)` (HLS requirement), floored
-    /// by `ceil(1.5 x cut target)` (widens AVPlayer's unchanged-playlist patience, anti -12888) and by
-    /// what the observed cadence needs to stay inside that patience. `cutTargetSeconds` /
-    /// `cadenceFloorSeconds` are nil for VOD/EVENT. Every term is taken at the resolution the playlist
-    /// serves (`servedSeconds`), so the value covers the EXTINFs the client is actually handed and no
-    /// sub-millisecond noise can buy a whole second of holdback.
+    /// by `ceil(1.5 x cut target)` (widens AVPlayer's unchanged-playlist patience, anti -12888), by
+    /// what the observed cadence needs to stay inside that patience, and by the longest segment an
+    /// ingested upstream delivers in (`targetDurationForUpstreamSegment`, AE#684). `cutTargetSeconds` /
+    /// `cadenceFloorSeconds` are nil for VOD/EVENT, `upstreamSegmentSeconds` for everything but an
+    /// ingest. Every term is taken at the resolution the playlist serves (`servedSeconds`), so the
+    /// value covers the EXTINFs the client is actually handed and no sub-millisecond noise can buy a
+    /// whole second of holdback.
+    ///
+    /// AE#670: `segmentsAreCutHere` adds `ceil(1.5 x max EXTINF)` where that headroom has no other source
+    /// (`gopHeadroomApplies`).
     static func targetDurationSeconds(maxSegmentDuration: Double,
                                       cutTargetSeconds: Double?,
-                                      cadenceFloorSeconds: Double?) -> Int {
+                                      cadenceFloorSeconds: Double?,
+                                      segmentsAreCutHere: Bool = false,
+                                      upstreamSegmentSeconds: Double? = nil) -> Int {
         var td = wholeSecondsCovering(max(1.0, maxSegmentDuration))
         if let cut = cutTargetSeconds { td = max(td, wholeSecondsCovering(cut * 1.5)) }
+        if gopHeadroomApplies(cutTargetSeconds: cutTargetSeconds, segmentsAreCutHere: segmentsAreCutHere) {
+            td = max(td, targetDurationForGOPHeadroom(maxSegmentDuration))
+        }
         if let floor = cadenceFloorSeconds { td = max(td, targetDurationForCadence(floor)) }
+        if let upstream = upstreamSegmentSeconds { td = max(td, targetDurationForUpstreamSegment(upstream)) }
         return td
     }
+
+    /// AE#670: does the sealed value need headroom over the GOPs seen so far?
+    ///
+    /// A cut target under a second never bounds a segment: the cutter waits for the next keyframe, so
+    /// every segment it cuts is one whole source GOP, and the value is sealed from the first few of them.
+    /// A broadcast's GOPs are not regular (reported: 1.0 to 2.4 s, sealed on three 1.000 s ones), and a
+    /// later longer one then breaks `EXTINF <= TD` and holds the playlist unchanged past AVPlayer's
+    /// patience. `.standard` has that headroom already in its `1.5 x cut target` floor, and an ingest
+    /// is bounded by the upstream segment its GOPs were cut from (`targetDurationForUpstreamSegment`;
+    /// AE#447 keeps TD 2 on 2.000 s ones), so only the engine's own sub-second cut needs it from the
+    /// segments.
+    static func gopHeadroomApplies(cutTargetSeconds: Double?, segmentsAreCutHere: Bool) -> Bool {
+        guard segmentsAreCutHere, let cut = cutTargetSeconds else { return false }
+        return cut < 1.0
+    }
+
+    /// AE#670: the smallest TARGETDURATION under which a GOP 1.5 x the longest seen would still be
+    /// served without fault: listed legally (RFC 8216 4.3.3.1 compares the EXTINF ROUNDED TO THE NEAREST
+    /// integer with TD) and finalized inside AVPlayer's `1.5 x TD` patience with
+    /// `gopHeadroomDeliveryMarginSeconds` to spare.
+    ///
+    /// Round 2: the first version took `ceil(1.5 x max EXTINF)`, which asks the virtual GOP for more than
+    /// any real segment is asked for and puts a cliff a millisecond wide into the seal. Reported on a
+    /// 59.94 fps source with 1.001 s GOPs: a 79-frame segment (1.318 s) sealed 2, an 80-frame one
+    /// (1.335 s, 2.002 x 1.5) sealed 3, a 9 s holdback a 6.6 s rebuild backlog could not hold, and the
+    /// first frame came 2.5 s later. Under TD 2 a GOP of 2.499 s still lists and leaves 0.5 s of patience,
+    /// so segments up to 1.666 s now seal 2, and the reporter's TD 2 sessions that later met 1.485 s ones
+    /// ran without a stall or -12888. Never above the first version: `round <= ceil`, and the patience
+    /// term only binds where the GOP is too short for the rounding to (TD 1 leaves a listed 1.5 x GOP no
+    /// patience at all, so 1.0 s GOPs keep their TD 2).
+    static func targetDurationForGOPHeadroom(_ maxSegmentSeconds: Double) -> Int {
+        guard maxSegmentSeconds.isFinite else { return wholeSecondsCovering(maxSegmentSeconds) }
+        let longerGOP = servedSeconds(maxSegmentSeconds * 1.5)
+        guard longerGOP > 0 else { return 0 }
+        let listed = wholeSecondsCovering(longerGOP.rounded(.toNearestOrAwayFromZero))
+        let patient = wholeSecondsCovering((longerGOP + gopHeadroomDeliveryMarginSeconds)
+                                           / unchangedPlaylistPatienceMultiplier)
+        return max(listed, patient)
+    }
+
+    /// AE#670 round 2: how long before AVPlayer's patience runs out a GOP 1.5 x the longest seen must
+    /// have been finalized. Half a second is what the first version already accepted for the 2.4 s GOP
+    /// it was reported for (TD 2, patience 3.0 s), so the relaxation gives up nothing that one kept.
+    static let gopHeadroomDeliveryMarginSeconds: Double = 0.5
 
     /// AVPlayer's default (and our explicitly advertised) live-edge holdback: `3 x TARGETDURATION`, the
     /// RFC 8216bis floor for `EXT-X-SERVER-CONTROL:HOLD-BACK`.
@@ -332,10 +498,12 @@ enum LiveEdgePolicy {
                                         maxSegmentDuration: Double,
                                         cutTargetSeconds: Double?,
                                         cadenceFloorSeconds: Double?,
+                                        segmentsAreCutHere: Bool = false,
                                         windowSegmentCount: Int) -> Bool {
         let td = targetDurationSeconds(maxSegmentDuration: maxSegmentDuration,
                                        cutTargetSeconds: cutTargetSeconds,
-                                       cadenceFloorSeconds: cadenceFloorSeconds)
+                                       cadenceFloorSeconds: cadenceFloorSeconds,
+                                       segmentsAreCutHere: segmentsAreCutHere)
         return startupCushionSatisfied(
             segmentCount: segmentCount,
             summedDurationSeconds: summedDurationSeconds,
@@ -473,11 +641,34 @@ enum CadenceFloorTerm {
 /// line why the session will hold this value for its whole life. Every term but `selfReported` feeds
 /// the max; `selfReported` is what the upstream CLAIMED, printed beside what was measured.
 struct LiveTargetDurationDerivation {
-    let value: Int
+    var value: Int
     let maxSegmentDuration: Double
     let cutTargetFloor: Double?
+    var gopHeadroomApplies = false
     let cadenceFloor: CadenceFloorTerm
+    /// AE#684: the longest segment an ingested upstream has served, nil off the ingest path.
+    var upstreamSegment: Double? = nil
+    /// AE#684 review: set when the join could not pay for the full upstream-segment seal: what it
+    /// held, what of that is cut, and the value the terms alone would have sealed.
+    var joinBound: (backlogSeconds: Double, finalizedSeconds: Double, full: Int)? = nil
     let selfReported: Double?
+
+    /// The upstream-segment term as both seal lines state it, nil off the ingest path.
+    var upstreamSegmentAccount: String? {
+        guard let upstreamSegment else { return nil }
+        var text = "upstream segment \(LiveEdgePolicy.seconds(upstreamSegment))s "
+            + "(one delivery, however finely it is cut here"
+        if upstreamSegment > LiveEdgePolicy.upstreamSegmentSealCeilingSeconds {
+            text += ", taken up to \(LiveEdgePolicy.seconds(LiveEdgePolicy.upstreamSegmentSealCeilingSeconds))s"
+        }
+        text += ")"
+        if let joinBound {
+            text += ", of which the join pays \(value)s of \(joinBound.full)s "
+                + "(\(LiveEdgePolicy.seconds(joinBound.finalizedSeconds))s cut of the "
+                + "\(LiveEdgePolicy.seconds(joinBound.backlogSeconds))s it listed)"
+        }
+        return text
+    }
 
     /// One line, in the order the terms are maxed. Reads as an argument for the number it reports.
     var account: String {
@@ -485,7 +676,13 @@ struct LiveTargetDurationDerivation {
         if let cutTargetFloor {
             terms.append("1.5 x cut target \(LiveEdgePolicy.seconds(cutTargetFloor * 1.5))s")
         }
+        if gopHeadroomApplies {
+            terms.append("1.5 x max EXTINF \(LiveEdgePolicy.seconds(maxSegmentDuration * 1.5))s "
+                + "needs \(LiveEdgePolicy.targetDurationForGOPHeadroom(maxSegmentDuration))s "
+                + "(each segment is one whole GOP)")
+        }
         terms.append(cadenceFloor.account)
+        if let upstreamSegmentAccount { terms.append(upstreamSegmentAccount) }
         let claim = selfReported.map {
             "; upstream advertises \(LiveEdgePolicy.seconds($0))s (reported, not used)"
         } ?? ""
@@ -522,6 +719,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private let cache: SegmentCache
     /// Immutable for VOD; grows under stateLock for live (producer appends via appendLiveSegment).
     private var segments: [HLSVideoEngine.Segment]
+    private let iFrameSourceLock = NSLock()
+    private var _iFrameSource: IFrameSegmentSource?
     private let isLive: Bool
     /// Sequential-origin session: playlist grows with finalized real durations (see _seqDurations).
     private let sequentialAppendPlaylist: Bool
@@ -529,9 +728,23 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private let liveWindowSizing: LiveWindowSizing
     /// Only `.fastZap` sessions may serve a shallow first window after a bounded grace.
     private let allowsBoundedDegradedStart: Bool
+    /// AE#594 arm B: skip the bounded branch, so the wait ends at the full holdback cushion or at the
+    /// outer wall-clock deadline. Measurement arm, off unless the environment asks for it.
+    private let boundedStartFloorsAtHoldback: Bool
+    /// AE#686 arm: the first-serve latch also covers a source the engine cuts itself. Measurement arm,
+    /// off unless the environment asks for it.
+    private let firstServeLatchCoversEngineCut: Bool
     /// AE#374: whether the first-serve gate has already reported the interval it held. Read and written
     /// only under `firstSegmentCondition`, inside `waitForFirstLiveSegment` and its two account helpers.
     private var didAccountForFirstServe = false
+    /// AE#686: whether the first repeat pass through the gate has been reported. Same lock.
+    private var didAccountForRepeatServe = false
+    /// AE#684: on an ingest the gate is a FIRST-serve gate. Every `/media.m3u8` request without an
+    /// `_HLS_msn` re-enters it, and AVPlayer opens a session with two of them back to back, so a
+    /// bounded start (served under the holdback, after its grace) held the second request for a
+    /// whole second grace: measured 2.012 s to the first manifest and 2.02 s more before `init.mp4`
+    /// was asked for. Read for ingest sessions only (see the gate); same lock as the flag above.
+    private var firstManifestServed = false
     /// Host override for blocking-reload (`LoadOptions.liveBlockingReload`): nil = auto (observed policy for
     /// ingest, on by default for signal-less live), true/false = force. Wins over the policy (#167).
     private let blockingReloadOverride: Bool?
@@ -635,6 +848,17 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private let stateLock = NSLock()
     /// Separate from stateLock so the manifest handler can block without holding the segment-list lock.
     private let firstSegmentCondition = NSCondition()
+    /// How many callers are parked in the three gates that share the condition above. Guarded by
+    /// it, which is what makes it worth having: a reader from another thread only gets the lock
+    /// while a waiter is inside `wait()`, so a non-zero read PROVES the waiter parked. Tests used
+    /// to sleep a tenth of a second and call that parked, which is a margin against scheduling and
+    /// the first thing an oversubscribed machine takes away.
+    private var parkedWaiters = 0
+    var parkedWaiterCount: Int {
+        firstSegmentCondition.lock()
+        defer { firstSegmentCondition.unlock() }
+        return parkedWaiters
+    }
     /// Set by cancelWaiters() on stop(). Without it, parked LL-HLS blocking-reload threads sleep
     /// their full timeout (18-30 s) and can write stale playlists into a recycled fd of the next session.
     private var waitersCancelled = false
@@ -650,6 +874,11 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// stopped delivering. See `liveDeliveryStalled`.
     private var _lastLiveSegmentFinalizedAt: Date?
     private var _liveDeliveryStalledLatched = false
+    /// AE#520 round 2: how long the consumer can keep playing out of what it already holds, or nil
+    /// where nothing can say (software path, no item mounted). Set by `HLSVideoEngine`; a closure over
+    /// a mirror, because the close that reads it runs on a playlist-build thread.
+    var consumerBufferedSecondsProvider: (@Sendable () -> Double?)?
+
     /// AE#523: the source's own delivery rhythm, which is what the outage decision is judged against.
     private var _liveDeliveryCadence = SourceDeliveryCadenceMeter()
     /// AE#446 round 2: once ENDLIST has been served it can never be withdrawn to the item that saw it,
@@ -658,6 +887,11 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// AE#446 round 7: whether the current late-source episode has been reported. The window now
     /// outlives a source that is merely late, so the log has to say that it did.
     private var _liveOutageSourceLateNoted = false
+    /// AE#523 round 2: how close the episode came to a close, so the line that reports an absorbed gap
+    /// can say whether it was comfortable. Without them a session that rode both bounds to the edge
+    /// reads exactly like one that was never in danger, which is the difference the next round needs.
+    private var _liveOutageEpisodeMaxSilence = 0.0
+    private var _liveOutageEpisodeMinDepth = Double.greatestFiniteMagnitude
     /// AE#454: where a rejoin wants the NEXT item to begin, addressed by CONTENT (which segment, how
     /// far into it) rather than by a clock. The window slides between arming this and the fresh item
     /// fetching the playlist that carries it, so a seconds value would name a different place by the
@@ -729,6 +963,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         sequentialAppendPlaylist: Bool = false,
         liveWindowSizing: LiveWindowSizing = LiveWindowSizing(targetSegmentDurationSeconds: 4.0, dvrWindowSeconds: nil),
         allowsBoundedDegradedStart: Bool = false,
+        boundedStartFloorsAtHoldback: Bool = false,
+        firstServeLatchCoversEngineCut: Bool = false,
         blockingReloadOverride: Bool? = nil,
         liveCadencePolicy: LiveCadencePolicy? = nil,
         restartHandler: ((Int) -> Void)? = nil,
@@ -758,6 +994,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.sequentialAppendPlaylist = sequentialAppendPlaylist
         self.liveWindowSizing = liveWindowSizing
         self.allowsBoundedDegradedStart = allowsBoundedDegradedStart
+        self.boundedStartFloorsAtHoldback = boundedStartFloorsAtHoldback
+        self.firstServeLatchCoversEngineCut = firstServeLatchCoversEngineCut
         self.blockingReloadOverride = blockingReloadOverride
         self.liveCadencePolicy = liveCadencePolicy
         self.codecsString = codecsString
@@ -788,6 +1026,29 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.currentShiftSeconds = currentShiftSeconds
         self.segmentPlacedHandler = segmentPlacedHandler
         self.segmentServedHandler = segmentServedHandler
+    }
+
+    /// AE#684: where a live segment's sound begins and ends on the output axis, by segment index.
+    /// Diagnostic only: it lets an item start say what it started its audio from. Bounded, oldest out.
+    private var _liveSegmentSound: [Int: (first: Double, last: Double)] = [:]
+    static let liveSegmentSoundRetained = 1024
+
+    func noteLiveSegmentSound(index: Int, firstSeconds: Double, lastSeconds: Double) {
+        stateLock.lock()
+        _liveSegmentSound[index] = (firstSeconds, lastSeconds)
+        _liveSegmentSound.removeValue(forKey: index - Self.liveSegmentSoundRetained)
+        stateLock.unlock()
+    }
+
+    /// AE#684: the segment an output-axis position falls in, with its picture's start and its
+    /// sound's span. nil for a position no listed segment covers.
+    func liveSegmentHeads(atOutputSeconds seconds: Double)
+        -> (index: Int, secondsIntoSegment: Double, pictureStart: Double, sound: (first: Double, last: Double)?)? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard let idx = Self.thumbnailSegmentIndex(atSeconds: seconds, segments: segments) else { return nil }
+        return (idx, Swift.max(0, seconds - segments[idx].startSeconds), segments[idx].startSeconds,
+                _liveSegmentSound[idx])
     }
 
     /// Append a finalized live segment. Index must equal segments.count; out-of-order ignored.
@@ -873,6 +1134,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         let deadline = Date(timeIntervalSinceNow: timeout)
         firstSegmentCondition.lock()
         defer { firstSegmentCondition.unlock() }
+        parkedWaiters += 1
+        defer { parkedWaiters -= 1 }
         while true {
             stateLock.lock()
             let ready = _seqAdvertisableCount >= Self.sequentialStartupSegments || _seqEnded
@@ -1294,6 +1557,19 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             // Cache gate: backwardWindow=20 covers Continuous-Audio handover refetches (~7-10 segments
             // backward); unconditional proactive restart re-armed the FLAC bridge and caused audible glitches.
             if cache.peekURL(index: index) != nil {
+                // A sequential origin has no restart to offer (its pump can only read from byte 0)
+                // and keeps every segment it cut, so a resident target is served from the cache.
+                // The contiguity scan below would read the plan indices its cutter left as holes
+                // (no URI, never listed) as a gap and hand the refusal a source failure to publish,
+                // which is what an AirPlay hop back to the loopback item did at 22 s in.
+                if sequentialAppendPlaylist {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] declareTarget backward jump \(previousTarget) -> \(index): "
+                        + "resident on a sequential origin, served from the cache",
+                        category: .session
+                    )
+                    return
+                }
                 let frontier = cache.contiguousForwardFrontier(from: index)
                 let front = activeMarchFront
                 if Self.residentBackwardTargetKeepsProducer(
@@ -1515,6 +1791,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 if let bytes = cache.fetch(index: index, timeout: repositionWaitSlice) {
                     return logServed(index: index, bytes: bytes, totalStart: totalStart, restarted: true)
                 }
+                // Audit SEG-3: a closed cache answers fetch at once, so riding a restart that
+                // outlives stop() would spin this thread until the ride cap.
+                if cache.isClosed { break }
             }
             return logServed(index: index, bytes: nil, totalStart: totalStart, restarted: true)
         }
@@ -1766,18 +2045,24 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// an end. The gate is the consumer's own fetch point.
     ///
     /// AE#446 round 7: and not for a source that is merely LATE. The decision costs the item that sees
-    /// it, so it waits for `LiveEdgePolicy.outageCloseSilenceMultiplier` rather than firing the moment
-    /// the source misses its cadence, which is where the cheap and reversible half of this fix (the
-    /// blocking-reload withdrawal, `liveDeliveryStalled`) belongs.
+    /// it, so the moment the source misses its cadence is where the cheap and reversible half of this
+    /// fix belongs (the blocking-reload withdrawal, `liveDeliveryStalled`) and not this one.
     ///
-    /// AE#520: the wait's second bound, the runway, is a comparison against that deadline and not a
-    /// constant. As a constant it was shorter than what an edge viewer holds when the question is first
-    /// asked, so it decided every ordinary live session and the deadline above decided none of them.
-    /// `LiveEdgePolicy.outageCloseOnRunway` carries the measurement.
+    /// AE#523 round 2: what ends the wait is the CONTENT. The window stays live while the consumer
+    /// still holds more than one poll's worth of it ahead of its own fetch point
+    /// (`LiveEdgePolicy.outageCloseOnDepth`), whatever the clock says, and the clock keeps only the
+    /// bound it owns alone: the producer is about to give the source up
+    /// (`LiveEdgePolicy.outageCloseCeilingSeconds`). Both earlier readings, round 7's constant and
+    /// AE#520's comparison against the close deadline, are argued at those two.
     var liveOutageEndlist: Bool {
         let consumerTarget = cache.targetIndex
         // Read before the lock: the ingest's meter takes a lock of its own.
         let ingestCadence = liveTargetDurationFloorSeconds
+        // AE#520 round 2: and so does the consumer's own depth, which is a closure over a mirror the
+        // telemetry sampler writes at 1 Hz. It can therefore be up to a tick stale, which is a second of
+        // overstatement at worst and is covered by the reserve the close keeps in front of itself: the
+        // alternative, an AVFoundation read on the playlist-build thread, is not one.
+        let buffered = max(0, consumerBufferedSecondsProvider?() ?? 0)
         stateLock.lock()
         if _liveOutageEndlistLatched {
             stateLock.unlock()
@@ -1788,72 +2073,106 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         let targetDuration = liveTargetDurationSeal.value
         let late = sourceIsLateLocked(ingestCadenceSeconds: ingestCadence)
         let cadence = cadenceSecondsLocked(ingest: ingestCadence)
-        let deadline = targetDuration.map {
-            LiveEdgePolicy.outageCloseSilenceSeconds(targetDuration: $0, cadenceSeconds: cadence)
+        let ceiling = targetDuration.map {
+            LiveEdgePolicy.outageCloseCeilingSeconds(targetDuration: $0, cadenceSeconds: cadence)
         }
-        let quiet: Bool = {
-            guard let silence, let deadline else { return false }
-            return silence > deadline
+        // The clock's only remaining say: past this the producer gives the source up, so a window not
+        // closed here would never be closed at all.
+        let pastCeiling: Bool = {
+            guard let silence, let ceiling else { return false }
+            return silence > ceiling
         }()
         let runway = runwayAheadOfConsumerLocked(fetchPoint: consumerTarget)
-        // AE#520: what is left of the wait, on the same axis as the runway. Both are seconds, so the
-        // content bound is a comparison against the clock rather than a constant of its own.
-        let clockLeft = max(0, (deadline ?? 0) - (silence ?? 0))
+        // AE#520 round 2: what the consumer can still play, which is what the wait is actually spending.
+        // The listed-but-unfetched half alone closed an edge viewer's window 1.84 s before its source
+        // delivered again, with 4.0 s listed and 4.9 s already in hand.
+        let depth = runway + buffered
+        // AE#523 round 2: what the close itself needs in front of the consumer to be worth serving.
+        let reserve = targetDuration.map {
+            LiveEdgePolicy.outageCloseDepthReserveSeconds(targetDuration: $0)
+        } ?? 0
         // One line per episode, at both ends of it: a source that goes late and comes back without the
         // window ever closing is the case this round exists for, and it is otherwise invisible.
         let noteWentLate = late && !_liveOutageSourceLateNoted
         let noteCameBack = !late && _liveOutageSourceLateNoted
+        if late {
+            _liveOutageEpisodeMaxSilence = Swift.max(_liveOutageEpisodeMaxSilence, silence ?? 0)
+            _liveOutageEpisodeMinDepth = Swift.min(_liveOutageEpisodeMinDepth, depth)
+        }
+        let episodeMaxSilence = _liveOutageEpisodeMaxSilence
+        let episodeMinDepth = _liveOutageEpisodeMinDepth
+        if noteCameBack {
+            _liveOutageEpisodeMaxSilence = 0
+            _liveOutageEpisodeMinDepth = .greatestFiniteMagnitude
+        }
         _liveOutageSourceLateNoted = late
         stateLock.unlock()
 
-        let hasRunway = consumerTarget >= 0 && consumerTarget + 1 < total
-        if isLive, noteWentLate, let silence, let targetDuration, let deadline {
+        // AE#520 round 2: the same depth decides whether there is anything to serve as a finished
+        // asset. The gate used to ask whether SEGMENTS were listed above the fetch point, which is the
+        // half-measure this round is about in its other half: a consumer that has fetched everything
+        // and is playing out of its own buffer has content ahead of it, and it is exactly the consumer
+        // an ENDLIST hands a controlled `didPlayToEndTime` instead of a stall. Measured with the gate
+        // left as it was: an edge viewer against a 30 s freeze walked its depth down to 0.1 s with the
+        // window never closed, then ran dry and rejoined forward, 4 segments skipped.
+        let hasDepth = consumerTarget >= 0 && depth > 0
+        if isLive, noteWentLate, let silence, let targetDuration, let ceiling {
             EngineLog.emit(
                 "[VideoSegmentProvider] #446 the source has missed its cadence "
                 + "(quiet \(String(format: "%.2f", silence))s, "
                 + (cadence.map { "it delivers every \(String(format: "%.2f", $0))s" }
                    ?? "no rhythm measured yet, TARGETDURATION \(targetDuration)s")
                 + "); "
-                + (hasRunway
-                   ? "the consumer is at \(consumerTarget) of \(total) with "
-                     + "\(String(format: "%.1f", runway))s of runway, and the window stays live until "
-                     + "\(String(format: "%.1f", deadline))s of silence, or sooner if that runway "
-                     + "would not carry the wait that far (\(String(format: "%.1f", clockLeft))s of it "
-                     + "left)"
-                   : "the consumer is at the end of what the window holds, so there is no runway to "
-                     + "serve as a finished asset"),
+                + (hasDepth
+                   ? "the consumer is at \(consumerTarget) of \(total) and can play for "
+                     + "\(String(format: "%.1f", depth))s without being handed anything "
+                     + "(\(String(format: "%.1f", runway))s listed, "
+                     + "\(String(format: "%.1f", buffered))s already in hand), and the window stays "
+                     + "live while more than \(String(format: "%.1f", reserve))s of that is left to "
+                     + "tell it in, and in any case no longer than "
+                     + "\(String(format: "%.1f", ceiling))s of silence"
+                   : "the consumer has nothing left to play, so there is nothing to serve as a "
+                     + "finished asset"),
                 category: .session
             )
         }
-        if isLive, noteCameBack, let deadline {
+        if isLive, noteCameBack {
             EngineLog.emit(
                 "[VideoSegmentProvider] #446 the source is cutting again and the window was never "
-                + "closed (silence stayed under \(String(format: "%.1f", deadline))s); no ENDLIST, no "
-                + "item swap, nothing for the viewer to see",
+                + "closed (it was quiet for \(String(format: "%.2f", episodeMaxSilence))s at the "
+                + "widest, and the consumer never fell below "
+                + "\(String(format: "%.1f", episodeMinDepth))s of playable depth against the "
+                + "\(String(format: "%.1f", reserve))s a close would have needed); no ENDLIST and no "
+                + "item swap. A source that hands its backlog over at once on the way back can still "
+                + "step the picture, which is not this decision's to give",
                 category: .session
             )
         }
 
-        // The wait is bounded from both ends: by the clock, and by the content left to wait with.
-        let outOfRunway = late && LiveEdgePolicy.outageCloseOnRunway(
-            runwaySeconds: runway, silenceSeconds: silence ?? 0, deadlineSeconds: deadline ?? 0)
-        guard isLive, hasRunway, quiet || outOfRunway else { return false }
+        // AE#523 round 2: the wait ends with the content, or with the producer's patience for a source
+        // that cuts nothing. Not with a deadline: that one shares the runway's axis and only ever beat
+        // it to the decision.
+        let outOfRunway = late && LiveEdgePolicy.outageCloseOnDepth(
+            depthSeconds: depth, targetDuration: targetDuration ?? 0)
+        guard isLive, hasDepth, pastCeiling || outOfRunway else { return false }
         stateLock.lock()
         _liveOutageEndlistLatched = true
         // The episode is accounted for by the line below; leaving it armed would have the fresh item's
         // first build after the swap report an outage that was very much closed.
         _liveOutageSourceLateNoted = false
+        _liveOutageEpisodeMaxSilence = 0
+        _liveOutageEpisodeMinDepth = .greatestFiniteMagnitude
         stateLock.unlock()
         EngineLog.emit(
             "[VideoSegmentProvider] #446 the source stopped delivering with the consumer at "
             + "\(consumerTarget) of \(total) (quiet \(String(format: "%.2f", silence ?? 0))s, "
-            + "\(String(format: "%.1f", runway))s of runway left"
-            + (quiet
-               ? ", past the \(String(format: "%.1f", deadline ?? 0))s deadline for TARGETDURATION "
-                 + "\(targetDuration.map(String.init) ?? "?")s"
-               : ", which will not carry the wait to the \(String(format: "%.1f", deadline ?? 0))s "
-                 + "deadline (\(String(format: "%.1f", clockLeft))s of it left), so the wait has run "
-                 + "out of content rather than out of clock")
+            + "\(String(format: "%.1f", depth))s of playable depth left, "
+            + "\(String(format: "%.1f", runway))s of it still to fetch"
+            + (outOfRunway
+               ? ", at or under the \(String(format: "%.1f", reserve))s the close itself needs to reach "
+                 + "the consumer, so the wait has run out of content"
+               : ", past the \(String(format: "%.1f", ceiling ?? 0))s at which the producer gives up a "
+                 + "source that cuts nothing, so a window left open here would never be closed at all")
             + "); serving the rest of the window as a finished asset (ENDLIST) so AVPlayer keeps "
             + "fetching the runway it already holds instead of striking out on an unchanged playlist",
             category: .session
@@ -1875,6 +2194,23 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// while segments remain above it, the session is still handing out pictures and the source read
     /// must not be abandoned under it. Once the consumer has walked to the end of what the window
     /// holds, nothing is being delivered any more and the starvation exit is the honest answer again.
+    ///
+    /// The `latched` term reads like an accident, and it is not. Dropping it, so an OPEN window with
+    /// runway defers the exit too, would let the close wait for the producer's real give-up point
+    /// (the 35 s window plus six re-arms, 245 s) instead of for its first one, and on paper that
+    /// removes every swap an outage shorter than the runway costs a deeply timeshifted viewer. It was
+    /// built and measured, and it loses the thing the close exists to keep. Harness, a viewer 45 s
+    /// inside the window against a 40 s freeze, same fixture in both arms:
+    ///
+    ///     closed at 30.17s of silence, 28.0s of runway left   VERDICT: position held
+    ///     never closed, the gap was absorbed                  VERDICT: POSITION LOST (forward
+    ///                                                                  step 248.49s)
+    ///
+    /// The ENDLIST is not only what buys this deferral, it is what turns the source's return into an
+    /// item swap at the place the viewer held. Leave the window open and the return is AVPlayer's to
+    /// interpret: the tail moves again, it re-anchors to a live edge that ran on without it, and the
+    /// position is gone (AE#446 round 2 measured the same mechanism at a forward step of 117.76 s).
+    /// So the deferral is a consequence of having closed, not a reason not to.
     var outageRunwayAheadOfConsumer: Bool {
         let consumerTarget = cache.targetIndex
         stateLock.lock()
@@ -1890,9 +2226,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// so the condition that closes it has to be able to become false again. Call under stateLock.
     ///
     /// AE#446 round 7: this is the strict reading, and the close deliberately asks a second, wider
-    /// question of its own (`LiveEdgePolicy.outageCloseSilenceSeconds`) because that decision cannot be
-    /// taken back. The recovery stays here: "delivering again" has to mean the source is back on its
-    /// rhythm, not merely quieter than the close allows.
+    /// question of its own (the runway the close still needs, and the producer's own patience with a
+    /// source that cuts nothing) because that decision cannot be taken back. The recovery stays here:
+    /// "delivering again" has to mean the source is back on its rhythm, not merely quieter than the
+    /// close allows.
     ///
     /// AE#523: the rhythm is the SOURCE's, measured, floored by the client's patience. A source coarser
     /// than its advertised target duration used to be late on every ordinary delivery, and the close
@@ -2135,17 +2472,57 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         let floor: CadenceFloorTerm = liveCadencePolicy.map { policy in
             policy.targetDurationFloorSeconds.map { CadenceFloorTerm.measured($0) } ?? .pending
         } ?? .unmeasurable
+        let cutHere = liveCadencePolicy == nil
+        let upstreamSegment = liveCadencePolicy?.upstreamSegmentDurationSeconds
         return LiveTargetDurationDerivation(
             value: LiveEdgePolicy.targetDurationSeconds(
                 maxSegmentDuration: maxSegmentDuration,
                 cutTargetSeconds: cutTarget,
-                cadenceFloorSeconds: floor.seconds
+                cadenceFloorSeconds: floor.seconds,
+                segmentsAreCutHere: cutHere,
+                upstreamSegmentSeconds: upstreamSegment
             ),
             maxSegmentDuration: maxSegmentDuration,
             cutTargetFloor: cutTarget,
+            gopHeadroomApplies: LiveEdgePolicy.gopHeadroomApplies(cutTargetSeconds: cutTarget,
+                                                                  segmentsAreCutHere: cutHere),
             cadenceFloor: floor,
+            upstreamSegment: upstreamSegment,
             selfReported: liveCadencePolicy?.selfReportedTargetDurationSeconds
         )
+    }
+
+    /// AE#684 review: the derivation the first-serve gate judges its cushion against, which is the
+    /// full one unless an ingest's join is exhausted short of it
+    /// (`LiveEdgePolicy.targetDurationTheJoinCanPay`). Only the gate asks this: once it has sealed,
+    /// the value is frozen, and a later build's fuller candidate is the drift line's to report.
+    ///
+    /// `joinIsSpent` has to have been read BEFORE `snap` was taken. The fact is monotone, so a
+    /// snapshot taken after it was true holds everything the join will ever cut; asked the other way
+    /// round, the cutter can append its last segment and park between the two reads, and the seal is
+    /// paid from the sum without it (4 where the window holds 5).
+    func firstServeTargetDuration(
+        _ snap: (count: Int, summed: Double, maxDuration: Double),
+        joinIsSpent: Bool?
+    ) -> LiveTargetDurationDerivation {
+        var derivation = currentLiveTargetDuration(maxSegmentDuration: snap.maxDuration)
+        guard derivation.upstreamSegment != nil,
+              snap.count >= LiveEdgePolicy.minStartupSegments,
+              joinIsSpent == true
+        else { return derivation }
+        let backlog = liveCadencePolicy?.joinBacklogSeconds ?? 0
+        let base = LiveEdgePolicy.targetDurationSeconds(
+            maxSegmentDuration: snap.maxDuration,
+            cutTargetSeconds: derivation.cutTargetFloor,
+            cadenceFloorSeconds: derivation.cadenceFloor.seconds,
+            segmentsAreCutHere: false,
+            upstreamSegmentSeconds: nil)
+        let paid = LiveEdgePolicy.targetDurationTheJoinCanPay(
+            full: derivation.value, withoutUpstreamSegment: base, finalizedSeconds: snap.summed)
+        guard paid < derivation.value else { return derivation }
+        derivation.joinBound = (backlog, snap.summed, derivation.value)
+        derivation.value = paid
+        return derivation
     }
 
     /// Takes the seal and, on the call that actually takes it, publishes the derivation. The value is
@@ -2177,6 +2554,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 + "\(resolved.value)s, later candidate \(candidate.value)s "
                 + "(max segment \(String(format: "%.3f", maxSegmentDuration))s, "
                 + candidate.cadenceFloor.account
+                + (candidate.upstreamSegmentAccount.map { ", " + $0 } ?? "")
                 + ")",
                 category: .session
             )
@@ -2229,10 +2607,21 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         var degradedGrace: TimeInterval?
         firstSegmentCondition.lock()
         defer { firstSegmentCondition.unlock() }
+        parkedWaiters += 1
+        defer { parkedWaiters -= 1 }
         while true {
             if waitersCancelled { return false }
+            // Ingest sessions only. A source the engine cuts itself keeps the gate it had: there the
+            // second request's wait is part of where the session ends up behind the producing edge,
+            // which is AE#594's question and not this one's. AE#686 measures it behind an arm.
+            if firstManifestServed, liveCadencePolicy != nil || firstServeLatchCoversEngineCut {
+                accountForRepeatServe(since: enteredAt, note: "first-serve latch")
+                return true
+            }
+            // Spent first, snapshot second (see `firstServeTargetDuration`).
+            let spent = liveCadencePolicy?.joinIsSpent
             let snap = liveCushionSnapshot()
-            let target = currentLiveTargetDuration(maxSegmentDuration: snap.maxDuration)
+            let target = firstServeTargetDuration(snap, joinIsSpent: spent)
             if LiveEdgePolicy.startupCushionSatisfied(segmentCount: snap.count,
                                                        summedDurationSeconds: snap.summed,
                                                        targetDuration: target.value,
@@ -2242,6 +2631,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 return true
             }
             if allowsBoundedDegradedStart,
+               !boundedStartFloorsAtHoldback,
                snap.count >= LiveEdgePolicy.minStartupSegments,
                degradedDeadline == nil {
                 let grace = LiveEdgePolicy.fastZapDegradedGraceSeconds(
@@ -2250,12 +2640,18 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 degradedGrace = grace
                 degradedDeadline = Date().addingTimeInterval(grace)
             }
-            let effectiveDeadline = degradedDeadline.map { min(deadline, $0) } ?? deadline
+            var effectiveDeadline = degradedDeadline.map { min(deadline, $0) } ?? deadline
+            // AE#684: a join becomes spent when the cutter parks on an empty reader, which is no
+            // event this condition hears. While that is still to come, look again shortly.
+            if spent == false {
+                effectiveDeadline = min(effectiveDeadline, Date().addingTimeInterval(Self.joinSpentPollSeconds))
+            }
             if !firstSegmentCondition.wait(until: effectiveDeadline) {
                 // Re-read after the timed-out wait: an append racing the deadline would otherwise be judged
                 // on the stale snapshot (waitForLiveSegment below already does this).
+                let afterSpent = liveCadencePolicy?.joinIsSpent
                 let after = liveCushionSnapshot()
-                let afterTarget = currentLiveTargetDuration(maxSegmentDuration: after.maxDuration)
+                let afterTarget = firstServeTargetDuration(after, joinIsSpent: afterSpent)
                 if LiveEdgePolicy.startupCushionSatisfied(segmentCount: after.count,
                                                           summedDurationSeconds: after.summed,
                                                           targetDuration: afterTarget.value,
@@ -2300,6 +2696,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         }
     }
 
+    /// How often the gate asks an ingest whether its join is spent. Well under a frame of start latency.
+    static let joinSpentPollSeconds: TimeInterval = 0.025
+
     /// AE#374: one account per live session, emitted at whichever exit ends the first-serve gate.
     ///
     /// Every `/media.m3u8` request without an `_HLS_msn` re-enters the gate, so without the latch a
@@ -2312,7 +2711,11 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         warning: Bool = false,
         note: String? = nil
     ) {
-        guard !didAccountForFirstServe else { return }
+        firstManifestServed = true
+        guard !didAccountForFirstServe else {
+            accountForRepeatServe(since: entered, note: note)
+            return
+        }
         didAccountForFirstServe = true
         let account = LiveEdgePolicy.firstServeAccount(
             waitedSeconds: Self.secondsSince(entered),
@@ -2322,6 +2725,19 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         )
         EngineLog.emit(
             "[HLSVideoEngine] \(warning ? "WARNING: " : "")\(account)"
+            + (note.map { ", \($0)" } ?? ""),
+            category: .session
+        )
+    }
+
+    /// AE#686: AVPlayer opens with two plain manifest requests, and how long the second one waited is
+    /// the measurement the latch arm is about. Reported once, from whichever exit let it through.
+    private func accountForRepeatServe(since entered: DispatchTime, note: String?) {
+        guard !didAccountForRepeatServe else { return }
+        didAccountForRepeatServe = true
+        EngineLog.emit(
+            "[HLSVideoEngine] repeat live manifest request held "
+            + "\(LiveEdgePolicy.seconds(Self.secondsSince(entered)))s"
             + (note.map { ", \($0)" } ?? ""),
             category: .session
         )
@@ -2365,6 +2781,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         let deadline = Date().addingTimeInterval(timeout)
         firstSegmentCondition.lock()
         defer { firstSegmentCondition.unlock() }
+        parkedWaiters += 1
+        defer { parkedWaiters -= 1 }
         while true {
             if waitersCancelled { return false }
             stateLock.lock()
@@ -2389,6 +2807,23 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     /// AE#446: how often a blocking-reload hold re-asks whether the source is still alive.
     static let liveHoldRecheckSeconds: TimeInterval = 1.0
+    /// AE#682. Set once by the session after the routing decision, before the playback URL leaves
+    /// `start()`; cleared when the session falls back to the media playlist or stops.
+    func setIFrameSource(_ source: IFrameSegmentSource?) {
+        iFrameSourceLock.lock()
+        _iFrameSource = source
+        iFrameSourceLock.unlock()
+    }
+
+    private var iFrameSource: IFrameSegmentSource? {
+        iFrameSourceLock.lock(); defer { iFrameSourceLock.unlock() }
+        return _iFrameSource
+    }
+
+    var iFrameRenditionServed: Bool { iFrameSource != nil }
+    func iFrameInitSegment() -> Data? { iFrameSource?.initSegment() }
+    func iFrameSegment(at index: Int) -> Data? { iFrameSource?.fragment(at: index) }
+
     var masterCodecs: String? { codecsString }
     var masterSupplementalCodecs: String? { supplementalCodecsString }
     var masterResolution: (width: Int, height: Int)? {
