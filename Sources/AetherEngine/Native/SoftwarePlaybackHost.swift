@@ -1289,7 +1289,7 @@ final class SoftwarePlaybackHost {
         lastRate = newRate
         pausedByHost = false
         if !demuxLoopStarted, let output = audioOutput {
-            output.attachVideoLayer(renderer.displayLayer)
+            output.attachVideoRenderer(renderer.videoRenderer)
             demuxLoopStarted = true
             startDemuxLoop()
         }
