@@ -988,6 +988,16 @@ say so on the tracker rather than working around it.
 | `setSoftwareVideoFrameTimeObserver(_:)`, `softwarePresentationTimebase` | The software-path equivalent, a `SoftwareVideoFrameTimeObserver` over `SoftwareVideoFrameTime` (`presentation`, `generation`), in ascending presentation order, on the same axis as the cues. `generation` moves on every renderer flush. |
 | `FrameExtractor` | Off-playback stills: `thumbnail(at:maxWidth:)`, `snapshot(at:maxSize:)`, `prewarm()`, `shutdown()`, over a URL or an `IOReader`. Opens its own demuxer, so it needs a source that tolerates a second connection. |
 
+## SharePlay (coordinated playback)
+
+| Symbol | Notes |
+| --- | --- |
+| `playbackCoordinator` | An `AVDelegatingPlaybackCoordinator` owned by the engine rather than by a backend, so a route change (AVPlayerLayer, software display layer) neither registers a second participant nor drops the coordinated item. Hand it to the `GroupSession`. |
+| `transitionToCoordinatedPlaybackItem(identifier:initialTime:initialRate:)` | Names the loaded item to the group and proposes its starting timing. Call it after each `load()` with a stable identifier; the same coordinator carries across backend and layer replacements. Group commands that arrive before the session is ready are held until it is, instead of being refused the way `seek(to:)` refuses them while loading. A nil identifier leaves the group item. |
+| `endCoordinatedPlayback()` | Leaves the group item and restores the stall-waiting behaviour that coordinated playback suspends. |
+| `$isWaitingForCoordinatedPlayback` | True while the group holds playback, waiting for a participant to be ready or for a start. Cleared as soon as frames actually advance, so a host can drive a "waiting for others" indicator from it. |
+| `$coordinatedPlaybackIntendedRate` | The rate the group last asked for; 0 while paused or waiting. |
+
 ## Now Playing and the audio session
 
 | Symbol | Notes |
