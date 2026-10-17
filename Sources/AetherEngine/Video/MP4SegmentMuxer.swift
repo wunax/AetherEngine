@@ -47,10 +47,10 @@ final class MP4SegmentMuxer {
     enum DoviConfigPolicy: Sendable, Equatable {
         /// Stream-copy the record unchanged. Genuine P5, and P8.x on a DV panel.
         case keep
-        /// Drop `AV_PKT_DATA_DOVI_CONF` before write_header. P7's base layer and P8.2 (hvc1 + dvcC
-        /// trips VT -12906), and P8.x on a non-DV panel (-11868).
+        /// Drop `AV_PKT_DATA_DOVI_CONF` before write_header. P8.2 (hvc1 + dvcC trips VT -12906), AVC
+        /// Profile 9, and any source served as its base layer (`dolbyVisionHandling = .baseLayerOnly`).
         case strip
-        /// Rewrite to a valid P8.1: `dv_profile=8`, `compat=1`, `el_present=0`. P7-on-DV-panel
+        /// Rewrite to a valid P8.1: `dv_profile=8`, `compat=1`, `el_present=0`. P7 on every display
         /// (paired with the per-packet RPU conversion) and the malformed "P8.6" compat id (#53).
         case rewriteToProfile81
         /// Rewrite to P5: `dv_profile=5`, `compat=0`, `el_present=0`. AE#455, opt-in. The bitstream
@@ -72,6 +72,10 @@ final class MP4SegmentMuxer {
         /// has numOfArrays=0 (in-band parameter sets) and the engine rebuilt a proper hvcC with
         /// VPS/SPS/PPS arrays; the mp4 muxer writes extradata directly into the hvcC/avcC box.
         let extradataOverride: [UInt8]?
+        /// The video samples are Annex B while `extradataOverride` is a length-prefixed record: the
+        /// muxer converts each sample itself and keeps its in-band parameter sets, which movenc's own
+        /// `hvc1` conversion would drop. See `AnnexBSampleConverter`.
+        let convertsAnnexBSamples: Bool
         /// The session's framing verdict for this track (audit BIT-104); nil gives the muxer its own.
         let nalFramingLatch: NALFramingLatch?
 
@@ -82,6 +86,7 @@ final class MP4SegmentMuxer {
             doviConfig: DoviConfigPolicy = .keep,
             colorOverride: ColorOverride? = nil,
             extradataOverride: [UInt8]? = nil,
+            convertsAnnexBSamples: Bool = false,
             nalFramingLatch: NALFramingLatch? = nil
         ) {
             self.codecpar = codecpar
@@ -90,6 +95,7 @@ final class MP4SegmentMuxer {
             self.doviConfig = doviConfig
             self.colorOverride = colorOverride
             self.extradataOverride = extradataOverride
+            self.convertsAnnexBSamples = convertsAnnexBSamples
             self.nalFramingLatch = nalFramingLatch
         }
     }
@@ -97,16 +103,36 @@ final class MP4SegmentMuxer {
     struct AudioConfig {
         let codecpar: UnsafePointer<AVCodecParameters>
         let timeBase: AVRational
+        /// A complete sample entry box that replaces the one movenc writes for this track in the init
+        /// segment (#731). Set for APAC, which movenc cannot write: the track is muxed as a stand-in
+        /// codec and its entry swapped here (see `APACSampleEntry`).
+        let soundSampleEntryOverride: Data?
         /// AE#458: ISO 639-2/T for the track's `mdhd`. Nil writes nothing, leaving movenc's `und`.
         let language: String?
 
         init(codecpar: UnsafePointer<AVCodecParameters>,
              timeBase: AVRational,
+             soundSampleEntryOverride: Data? = nil,
              language: String? = nil) {
             self.codecpar = codecpar
             self.timeBase = timeBase
+            self.soundSampleEntryOverride = soundSampleEntryOverride
             self.language = language
         }
+    }
+
+    /// `initBytes` with the audio track's sample entry replaced by `entry` (#731). An init without a
+    /// parseable sound track is forwarded unchanged and logged: AVPlayer then fails the audio naming
+    /// the stand-in codec, which is easier to read than corrupt bytes.
+    static func installingSoundSampleEntry(_ entry: Data?, in initBytes: Data) -> Data {
+        guard let entry else { return initBytes }
+        if let replaced = APACSampleEntry.replacingSoundSampleEntry(in: initBytes, with: entry) { return replaced }
+        EngineLog.emit(
+            "[MP4SegmentMuxer] ERROR: audio sample entry override could not be installed "
+            + "(no sound track in the \(initBytes.count) B init); AVPlayer will read the stand-in",
+            category: .session
+        )
+        return initBytes
     }
 
     /// Result of a segment cut. `deferredAwaitingAudioSampleEntry` is a THIRD state, distinct from both
@@ -146,6 +172,9 @@ final class MP4SegmentMuxer {
     /// Same volume as cache adopt target so rename is metadata-only.
     private let sessionDir: URL
     private var currentStagingPath: URL
+    /// The current segment's staging file. Only appended to, then renamed as it stands on adoption,
+    /// which is what lets progressive delivery read it while it is written.
+    var stagingURL: URL { currentStagingPath }
     private var fd: Int32 = -1
     private var formatContext: UnsafeMutablePointer<AVFormatContext>?
     private var pb: UnsafeMutablePointer<AVIOContext>?
@@ -171,6 +200,8 @@ final class MP4SegmentMuxer {
     /// length-prefixed at all. Latched at init: it is a property of the configuration record that
     /// lands in the sample entry, and the AE#561 sanitizer walks every video sample with it.
     private let videoNALLengthPrefixSize: Int?
+    /// Latched from `VideoConfig.convertsAnnexBSamples`.
+    private let convertsAnnexBVideoSamples: Bool
     /// AE#561 harness switch: the sanitizer removes the only shape that reproduces a segment Apple's
     /// parser refuses, so the rung underneath it (the software-path escalation) would have nothing to
     /// be measured against. Read once from the environment, never set in a shipped configuration.
@@ -275,6 +306,7 @@ final class MP4SegmentMuxer {
         maxBufferedFragmentSeconds: Double = 8.0,
         audioMoovPrimeFrame: [UInt8]? = nil,
         audioDelaySeconds: Double = 0,
+        onStorageExhausted: (@Sendable () -> Void)? = nil,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
         self.currentSegmentIndex = initialSegmentIndex
@@ -284,6 +316,7 @@ final class MP4SegmentMuxer {
         self.audioNeedsParsedPacketForMoov =
             audio.map { Self.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
         self.videoNALFraming = video.nalFramingLatch ?? NALFramingLatch()
+        self.convertsAnnexBVideoSamples = video.convertsAnnexBSamples
         // AE#561: the override, when there is one, is the record that reaches the sample entry. Both
         // carry the same width (the #19 rebuild keeps the source header's first 22 bytes), so this
         // only matters for a source whose own extradata is missing or Annex B.
@@ -306,16 +339,25 @@ final class MP4SegmentMuxer {
         let firstPath = Self.stagingPath(forSegmentIndex: initialSegmentIndex,
                                          in: sessionDir)
         self.currentStagingPath = firstPath
-        let firstFd = try Self.openPosix(path: firstPath)
+        let firstFd: Int32
+        do {
+            firstFd = try Self.openPosix(path: firstPath)
+        } catch {
+            if Self.isOutOfSpace(error) { onStorageExhausted?() }
+            throw error
+        }
         self.fd = firstFd
 
         // Ref-typed counter shared with the splitter closure (closure can't capture self during init).
         let counter = ByteCounter()
         counter.fd = firstFd
+        counter.onStorageExhausted = onStorageExhausted
         self.byteCounter = counter
 
+        let sampleEntryOverride = audio?.soundSampleEntryOverride
         self.splitter = FragmentSplitter(
             onHeaderComplete: { initBytes in
+                let initBytes = Self.installingSoundSampleEntry(sampleEntryOverride, in: initBytes)
                 // AE#187 defense-in-depth: strip a zero-sample video `sdtp` from the fragmented init before
                 // forwarding it. The pinned FFmpegBuild (n8.1.2) never writes it, so this is a no-op there;
                 // it neutralizes the box only for a consumer that links an older FFmpeg (a -force_load'ed
@@ -332,6 +374,7 @@ final class MP4SegmentMuxer {
                     if n < 0 {
                         let err = errno
                         if err == EINTR { continue }
+                        if err == ENOSPC { counter.onStorageExhausted?() }
                         counter.writeFailed = true
                         return
                     }
@@ -350,6 +393,9 @@ final class MP4SegmentMuxer {
         let allocRet = avformat_alloc_output_context2(&ctxOut, nil, "mp4", "segment.m4s")
         guard allocRet == 0, let ctx = ctxOut else {
             close(firstFd)
+            // deinit runs for a throwing init once every stored property is set, and would close
+            // this number a second time, by then possibly another socket's or file's.
+            self.fd = -1
             try? FileManager.default.removeItem(at: firstPath)
             throw MuxerError.allocFailed(code: allocRet)
         }
@@ -360,6 +406,7 @@ final class MP4SegmentMuxer {
             avformat_free_context(ctx)
             self.formatContext = nil
             close(firstFd)
+            self.fd = -1
             try? FileManager.default.removeItem(at: firstPath)
             throw MuxerError.avioAllocFailed
         }
@@ -633,6 +680,12 @@ final class MP4SegmentMuxer {
 
         let streamIndex = packet.pointee.stream_index
 
+        // Before the AE#561 sanitizer, which walks the sample as the length-prefixed chain the
+        // record declares. A packet with no start code is written as it came.
+        if convertsAnnexBVideoSamples, streamIndex == videoOutputStreamIndex {
+            _ = AnnexBSampleConverter.convertToLengthPrefixed(packet)
+        }
+
         // #64 mid-segment flush bound: cap libavformat's interleaver RAM on a very long segment
         // (degenerate sparse-keyframe plan, or an audio stream that decodes to nothing) by emitting a
         // moof+mdat into the current staging file before the buffered span grows without bound. Tracked
@@ -889,6 +942,7 @@ final class MP4SegmentMuxer {
             self.currentSegmentIndex = nextIdx
             byteCounter.fd = nextFd
         } catch {
+            if Self.isOutOfSpace(error) { byteCounter.onStorageExhausted?() }
             // isWedged: splitter would silently discard next fragment bytes until the pump failed a cut later.
             EngineLog.emit(
                 "[MP4SegmentMuxer] open next staging file seg-\(nextIdx) FAILED: \(error)",
@@ -916,6 +970,10 @@ final class MP4SegmentMuxer {
             return nil
         }
 
+        // Drain first, as the cut does. A fragment flush with packets still in the interleaver takes the
+        // first queued packet's DTS as the track end, and when check_pkt had clamped the written samples
+        // above it, movenc's get_cluster_duration aborts the process (StreamX crash 2026-10-10).
+        _ = av_interleaved_write_frame(ctx, nil)
         _ = av_write_frame(ctx, nil)
         _ = av_write_trailer(ctx)
 
@@ -963,6 +1021,11 @@ final class MP4SegmentMuxer {
             throw MuxerError.openStagingFileFailed(errno: errno)
         }
         return fd
+    }
+
+    private static func isOutOfSpace(_ error: Error) -> Bool {
+        if case MuxerError.openStagingFileFailed(let code) = error { return code == ENOSPC }
+        return false
     }
 
     // MARK: - Internal cleanup
@@ -1157,20 +1220,18 @@ final class MP4SegmentMuxer {
     /// target; when it is illegal too there is nothing to copy from and inventing a value would be a guess.
     /// Bisected on the reporter's asset: `min_blocksize` alone decides whether the session opens, and
     /// `total_samples` (equally wrong there, describing the pre-cut source) does not, so nothing else moves.
+    /// A field this repair leaves below CoreMedia's real floor of 192 never gets here: the audio route
+    /// bridges that stream instead (AE#764, `FLACStreamInfo`).
     static func sanitizedFLACExtradata(
         _ codecpar: UnsafePointer<AVCodecParameters>
     ) -> [UInt8]? {
-        guard codecpar.pointee.codec_id == AV_CODEC_ID_FLAC,
-              let extradata = codecpar.pointee.extradata,
-              codecpar.pointee.extradata_size >= Int32(flacStreamInfoSize) else { return nil }
+        guard let (minBlockSize, maxBlockSize) = FLACStreamInfo.blockSizes(codecpar),
+              let repaired = FLACStreamInfo.repairedMinBlockSize(min: minBlockSize, max: maxBlockSize),
+              let extradata = codecpar.pointee.extradata else { return nil }
 
         var bytes = [UInt8](UnsafeBufferPointer(start: extradata, count: Int(codecpar.pointee.extradata_size)))
-        let minBlockSize = UInt16(bytes[0]) << 8 | UInt16(bytes[1])
-        let maxBlockSize = UInt16(bytes[2]) << 8 | UInt16(bytes[3])
-        guard minBlockSize < flacMinimumBlockSize, maxBlockSize >= flacMinimumBlockSize else { return nil }
-
-        bytes[0] = UInt8(maxBlockSize >> 8)
-        bytes[1] = UInt8(maxBlockSize & 0xFF)
+        bytes[0] = UInt8(repaired >> 8)
+        bytes[1] = UInt8(repaired & 0xFF)
         EngineLog.emit(
             "[MP4SegmentMuxer] FLAC STREAMINFO min_blocksize=\(minBlockSize) is illegal, "
             + "clamped to max_blocksize=\(maxBlockSize) so dfLa passes CoreMedia validation",
@@ -1178,10 +1239,6 @@ final class MP4SegmentMuxer {
         )
         return bytes
     }
-
-    /// FLAC `STREAMINFO` payload length, and the spec's floor for both blocksize fields.
-    private static let flacStreamInfoSize = 34
-    private static let flacMinimumBlockSize: UInt16 = 16
 
     /// Replace codecpar.extradata using av_malloc + AV_INPUT_BUFFER_PADDING_SIZE pad.
     private static func replaceExtradata(
@@ -1211,6 +1268,8 @@ private final class ByteCounter {
     var fd: Int32 = -1
     var bytesWrittenCurrentSegment: Int = 0
     var writeFailed: Bool = false
+    /// Reports a staging write that hit a full volume to the session's cache.
+    var onStorageExhausted: (@Sendable () -> Void)?
     var lifetimeFragmentBytes: Int = 0
     var fragmentCuts: Int = 0
 }

@@ -1,6 +1,6 @@
 # aetherctl
 
-A standalone macOS CLI shipped alongside the library for repro work without going through TestFlight + Apple TV. Most subcommands operate on a media source URL (`file://` or `http(s)://`); `live`, `dvr`, `hlsfixture`, and `hlslive` run against built-in synthetic fixtures.
+A standalone macOS CLI shipped alongside the library for repro work without going through TestFlight + Apple TV. It builds with the package's traits, so the optional components ([README › Optional components](../README.md#optional-components)) are in it only when it is built with them: `swift run --traits TrueHDObjectAudio,DTSXObjectAudio,DualLayerDolbyVision,DolbyVisionStillReshaping aetherctl …` for `--atmos-bed`, `play --fel`, `--cycle-el`, `--dv-pin` and `feltest`, and for Profile 5 / 10.0 stills in `extract` and `play --host-calls` (`DolbyVisionStillReshaping`; without it those stills print as nil). Most subcommands operate on a media source URL (`file://` or `http(s)://`); `live`, `dvr`, `hlsfixture`, and `hlslive` run against built-in synthetic fixtures.
 
 ```bash
 swift run aetherctl probe <url>          # dump container + streams + duration, exit
@@ -10,6 +10,8 @@ swift run aetherctl segverify <url>      # SW-decode each loopback segment in is
 swift run aetherctl swdecode <url>       # open SoftwareVideoDecoder, decode N packets, report
 swift run aetherctl play <url>           # full load+play session smoke test: 1 Hz telemetry, cue log, host-call mimicry
 swift run aetherctl dovitest <url>       # convert a DV Profile 7 stream to 8.1, dump for dovi_tool
+swift run aetherctl feltest <url>        # test Dolby Vision Profile 7 FEL dual-layer Metal reconstruction
+swift run aetherctl dvsurvey <url>       # survey per-frame Dolby Vision L1 / L2 metadata, pick a --dv-pin frame
 swift run aetherctl pktdump <url>        # dump raw demuxer packet timing (dts/pts/keyframe) per open profile
 swift run aetherctl dualsubs <file> ...  # dual subtitle-track render probe (--primary / --secondary stream index)
 swift run aetherctl extract <url>        # FrameExtractor still-image extraction + leak testing
@@ -27,19 +29,19 @@ swift run aetherctl smbtest <smb-url>    # play a file off an SMB2/3 share via t
 swift run aetherctl <url>                # alias for serve (backwards compat)
 ```
 
-Twenty-one subcommands plus the bare-URL `serve` alias.
+Twenty-three subcommands plus the bare-URL `serve` alias.
 
 ## probe
 
 Opens the demuxer, prints the codec / resolution / frame rate of the video track, the audio track list (codec, channels, language, Atmos flag), the subtitle track list, the parsed container metadata (`MediaMetadata`: title / artist / album / albumArtist + embedded cover art presence), then exits. No HLS server is started.
 
-`--detect-hdr10plus` and `--detect-atmos` add the opt-in detail passes of `AetherEngine.probe(url:detecting:)`, and both can be given at once (one open, one connection). HDR10+ is the interesting one to watch: the bare `probe` reads only what the container declares, and ST 2094-40 is declared nowhere, so a carrying source prints `format: hdr10` without the flag and `format: hdr10Plus` plus `HDR10+: ST 2094-40 metadata seen` with it. `not seen` means "not inside the scan budget", not "proven absent".
+`--detect-hdr10plus` and `--detect-atmos` add the opt-in detail passes of `AetherEngine.probe(url:detecting:)`, and both can be given at once (one open, one connection). HDR10+ is the interesting one to watch: the bare `probe` reads only what the container declares, and ST 2094-40 is declared nowhere, so a carrying source prints `format: hdr10` without the flag and `format: hdr10Plus` plus `HDR10+: ST 2094-40 metadata seen` with it. `not seen` means "not inside the scan budget", not "proven absent". `--detect-hdr-vivid` adds the HDR Vivid (CUVA) check to the same packet pass and prints `HDR Vivid: CUVA metadata seen`; `format:` stays `hlg` / `hdr10`, since Vivid rides that base (#699).
 
 ```bash
 swift run aetherctl probe --detect-hdr10plus /path/to/hdr10plus.mkv
 ```
 
-`Scripts/make-hdr10plus-fixture.py <dir>` builds a ~1 KB HEVC/PQ fixture that carries a real ST 2094-40 T.35 SEI (and prints it base64, which is how the two fixtures embedded in `HDR10PlusProbeIntegrationTests` were made). It verifies itself: it only emits the file when `ffprobe -show_frames` reports `HDR Dynamic Metadata SMPTE2094-40` on it, so the payload is one FFmpeg's own parser accepts rather than a byte pattern that resembles one.
+`Scripts/make-hdr10plus-fixture.py <dir>` builds a ~1 KB HEVC/PQ fixture that carries a real ST 2094-40 T.35 SEI (and prints it base64, which is how the two fixtures embedded in `HDR10PlusProbeIntegrationTests` were made). It verifies itself: it only emits the file when `ffprobe -show_frames` reports `HDR Dynamic Metadata SMPTE2094-40` on it, so the payload is one FFmpeg's own parser accepts rather than a byte pattern that resembles one. With `--vivid` it builds an HEVC/HLG fixture carrying a CUVA HDR Vivid SEI instead, verified the same way against ffprobe's `CUVA` side data (the fixture in `HDRVividProbeTests`).
 
 ## serve
 
@@ -65,13 +67,15 @@ open 'http://127.0.0.1:<port>/<token>/master.m3u8'   # macOS QuickTime
 
 `--native-subs <index>` turns on the native WebVTT subtitle renditions (the `LoadOptions.prepareNativeSubtitles` path a full session uses): the engine calls `requestNativeSubtitleTrack()` before `start()`, then `attachAllNativeSubtitleStores()` after start. Every non-bitmap text track is served as a language-tagged `EXT-X-MEDIA:TYPE=SUBTITLES` rendition (`DEFAULT=NO,AUTOSELECT=NO`) in the master playlist, backed by a per-track `subs_N.m3u8` WebVTT media playlist. (An earlier design muxed `mov_text`/tx3g traks into the fMP4; in-band timed text is not HLS-conformant and AVPlayer rejected it, so the WebVTT rendition replaced it, see [formats.md › Native subtitle renditions](formats.md#native-subtitle-renditions-webvtt-for-pip-airplay-and-external-display).) The `<index>` value is legacy and now ignored, kept only for CLI compatibility: every non-bitmap track is always declared, and actual track selection happens via the host API in a full session, not from this flag. `curl` the `master.m3u8` (or open it in QuickTime) to verify the `SUBTITLES` group + `subs_N.m3u8` endpoints enumerate every language as a legible `AVMediaSelection` group. Omit the flag to reproduce the default behavior (no renditions, output identical to before).
 
-`--iframes` lists an I-frame rendition in the master (the `LoadOptions.serveIFramePlaylist` path a full session uses, AE#682): the engine calls `requestIFramePlaylist()` before `start()`. The master then carries `#EXT-X-I-FRAME-STREAM-INF` and the server answers `iframe.m3u8`, `iframe_init.mp4` and `iframe<N>.mp4`, one keyframe per segment. The log line `[HLSVideoEngine] i-frame rendition: served segments=<n>` or `absent reason=<reason>` says which it was. `curl` the playlist and a fragment next to the printed playback URL to look at them.
+`--iframes` lists an I-frame rendition in the master (the `LoadOptions.serveIFramePlaylist` path a full session uses, AE#682): the engine calls `requestIFramePlaylist()` before `start()`. The master then carries `#EXT-X-I-FRAME-STREAM-INF` and the server answers `iframe.m3u8`, `iframe_init.mp4` and `iframe<N>.mp4`, one still per segment: the source's keyframe for SDR, a tone-mapped Motion JPEG (`CODECS="mjpg"`) for HDR and Dolby Vision. The log line `[HLSVideoEngine] i-frame rendition: served segments=<n> format=keyframes|jpeg` or `absent reason=<reason>` says which it was. `curl` the playlist and a fragment next to the printed playback URL to look at them.
 
 `--prewarm` / `--prewarm-bytes N` (AE#551, `play` only) warm the source before the load, the way a host warms the next episode, and print what was retained and how long it took. The load that follows adopts those bytes: its reads inside the warm head cost no request, and its data connection starts at the warm frontier instead of byte zero. Measure it against a REAL origin. On loopback the round trip it removes costs nothing to begin with, which is exactly the trap the #281 tail prefetch was built out of.
 
 `--throttle-kbps N` is a TEST-ONLY slow-CDN simulation: it caps source-IO delivery to N kbit/s. Set it below the stream bitrate to starve the producer below real-time and provoke AVPlayer rebuffers (for example the #92 open-GOP repro). Also available on `seektest` and `play`.
 
 `--start-position S` starts the session at S seconds, the resume anchor a host passes to `load(url:startPosition:)`. Also available on `play`.
+
+`--atmos-bed <layout>` is `LoadOptions.objectAudioRendering = .apac(layout)` (`5.1.2`, `5.1.4`, `7.1.2`, `7.1.4` or `9.1.6`, #731, #744), rendered only by a build with the `TrueHDObjectAudio` / `DTSXObjectAudio` traits: a TrueHD Atmos or DTS:X track is rendered into that bed and served as APAC, so a master reads `CODECS="…,apac.31.03"` (up to 12 channels) or `apac.31.04` (16), and the log carries `TrueHD Atmos: objects rendered into …` (or `DTS:X: bed, heights and objects rendered into …`) and the `[SpatialAudioBridge] bed levels` lines. A DTS-HD MA track that LibDTSX does not confirm as DTS:X logs `DTS-HD MA track is not DTS:X LibDTSX renders (…); keeping the channel bridge` instead. `--audio-index <n>` serves source stream `n`, as a host's audio picker would. Dolby's Unfold demo, whose TrueHD Atmos track is stream 1: `serve --no-dv --atmos-bed 7.1.4 --audio-index 1 unfold.m2ts`.
 
 `--audio-delay <ms>` parks the server with the AE#464 audio offset already in its muxer, which is how the DELIVERED offset is measured rather than argued about: fetch the media playlist and walk its segments, then read the first audio and video packet timestamps out of `init.mp4` + a segment with `ffprobe -show_entries packet=stream_index,pts_time`. On a 30 fps H.264 + AAC fixture the source's own alignment is +21.8 ms, `--audio-delay 200` reads +221.8 ms and `--audio-delay -150` reads -128.2 ms, i.e. exactly the offset asked for, with the video timestamp unchanged in every arm.
 
@@ -103,6 +107,9 @@ swift run aetherctl play --live --dvr-window 1800 --audio-stats <url>           
 swift run aetherctl play --live --native-hls <master.m3u8>      # nativeRemoteHLS bypass (carriage watchdog + #293 probe)
 swift run aetherctl play --sidecar de=/tmp/de.srt --subs de <master.m3u8>   # declare a sidecar at load (#316)
 swift run aetherctl play --native-hls --trust-any-certificate <https master.m3u8>  # the AE#495 origin relay
+swift run aetherctl play --fel <p7-file.mkv>                    # opt in to the Profile 7 FEL dual-layer route (off by default, like LoadOptions.preferDualLayerDolbyVision; --no-fel / --no-dual-layer are accepted and do nothing)
+swift run aetherctl play --fel --surface --cycle-el 10 <p7-file.mkv>   # flip the residual off and on every 10 s over a visible window (--window is the same flag)
+swift run aetherctl play --fel --surface --dv-pin 'darkest:240,period:2' <url>   # DEBUG: pulse a pinned frame's DV metadata (from dvsurvey)
 ```
 
 `--host-calls nativesubs,nativerender@N,subsoff@N,subson@N` drives the NATIVE SUBTITLE RENDITION path
@@ -247,11 +254,13 @@ gate: `AE#464: audio delay = +150 ms stands, but this session cannot re-anchor a
 re-anchor and re-cuts. Before round 2 the gate read `liveWindow != nil`, which is true for both, so the
 live-only session took a rebuild that rejoins at the edge.
 
-`--reload-applying <key>=<value>` (repeatable, with one shared `--reload-applying-at <ms>`, default +20 s) corrects a `LoadOption` on the playing session through `reloadAtCurrentPosition(applying:)` (#460). Keys: `header.<Name>`, `audio-bridge`, `preferred-audio`, `decode-path`, `is-live`, which is there to drive the refusal, since a field that names the session has to be observably refused rather than observably ignored, and `autoplay`, which drives the third answer: a field the session owns, neither refused nor applied. Both outcomes print, which is the pair a host's recovery ladder has to tell apart. Pair it with a header-logging origin to read the correction from the other end: with `--header "X-Auth: stale"` at load and `--reload-applying header.X-Auth=fresh`, the origin log shows three requests carrying the stale value, then three carrying the fresh one, and the transport telemetry carries straight through the rebuild (`resumed at 10.90s from 9.90s`).
+`--reload-applying <key>=<value>` (repeatable, with one shared `--reload-applying-at <ms>`, default +20 s) corrects a `LoadOption` on the playing session through `reloadAtCurrentPosition(applying:)` (#460). Keys: `header.<Name>`, `audio-bridge`, `preferred-audio`, `decode-path`, `prefer-dual-layer-dv` (alias `fel-mode`, `true|false`: `LoadOptions.preferDualLayerDolbyVision`, so a running session can be moved on or off the Profile 7 FEL route), `is-live`, which is there to drive the refusal, since a field that names the session has to be observably refused rather than observably ignored, and `autoplay`, which drives the third answer: a field the session owns, neither refused nor applied. Both outcomes print, which is the pair a host's recovery ladder has to tell apart. Pair it with a header-logging origin to read the correction from the other end: with `--header "X-Auth: stale"` at load and `--reload-applying header.X-Auth=fresh`, the origin log shows three requests carrying the stale value, then three carrying the fresh one, and the transport telemetry carries straight through the rebuild (`resumed at 10.90s from 9.90s`).
 
 `play --sw` sets `LoadOptions.preferredDecodePath = .software` (#461), the shipping per-session lever, rather than the process-global `setForceSoftwarePathForTesting` it drove before; that hook is still what `live --sw` and `dvr` use, since those harnesses run several sessions and want every one of them on the software host. `--reload-applying decode-path=software` is the same lever applied to a session that is already playing: on the 300 s H.264 fixture the run dispatches `codec=27 → native`, takes the correction at t=9.90 s and comes back `codec=27 → software` at 10.81 s, playing. On a live load the override reaches the same routing decision, which is the case with no alternative, since the #2 capability gate is VOD-only for H.264 / HEVC and such a live session is never classified at all.
 
 `play --no-sw-escalation` sets `LoadOptions.escalatesToSoftwarePath = false` (AE#629), and every `play` run prints an `ESCALATION at <s> duringStartup=<bool> absorbed=<domain>/<code> <kind>` line when the AE#561 rebuild is taken. The pair is the A/B for a host's own fallback ladder. On a 40 s HEVC fixture from `Scripts/nal-overrun-fixture.py --after 20`, played with `AETHER_DISABLE_NAL_SANITIZER=1`, the default arm prints `ESCALATION at 12.00s duringStartup=false absorbed=CoreMediaErrorDomain/-19602 nativeItemFailed`, rebuilds on the software path and plays to the end (`VERDICT: OK`). The declining arm prints no escalation, goes to `.error` with `-19602` at 12.00 s and exits 2.
+
+`play --fel` sets `LoadOptions.preferDualLayerDolbyVision = true`, the opt-in to the Profile 7 FEL dual-layer route, which a build without the `DualLayerDolbyVision` trait accepts and ignores (`--cycle-el` exits 64 there). It is off by default, as it is in the engine, so a plain `play` runs the route a host gets; `--no-fel` and `--no-dual-layer` are accepted as no-ops. `--surface` (or `--window`, the same flag) presents into a 1280x720 window, macOS only, so the picture can be looked at. `--cycle-el <seconds>` (at least 0.1) flips the FEL residual off and on every period, starting with the full result, and posts the current mode as a label over the picture and in the window title: the off phase is what a minimal enhancement layer decodes to, so the window is an A/B of the residual on the same frames. It changes only a session on the dual-layer route, so it wants `--fel` (without it `play` prints a note) and a surface to be seen on. `--dv-pin <spec>` arms the on-device consumption test in a DEBUG build of `aetherctl` with the `DualLayerDolbyVision` trait (a release build, or one without the trait, refuses the flag with exit 64): after composition it substitutes a captured frame's Dolby Vision metadata on a duty cycle, leaving the pixels untouched, so a visible pulse can only come from the metadata. The spec is the grammar `dvsurvey` prints, such as `darkest:240,period:2`; a spec with no capture rule is refused with exit 64. See [dolby-vision-fel.md](dolby-vision-fel.md).
 
 `--drop-audio` forces every audio pipeline to fail, so the AE#462 video-only drop is observable without a source this build has no decoder for: the loopback cascade skips both the stream-copy probe and the bridge, and `SoftwarePlaybackHost` refuses its decoder open. The run then prints `audio delivery=droppedNoPipeline pipeline=none`, which is the pair a host reads (the typed fact plus the human label), against `delivery=streamCopy` / `bridged` / `decoded` on the same source without the flag. It is loud in the log on purpose, in both the CLI line and the engine's own, because a forced classification read as a real one would be worse than no harness.
 
@@ -271,10 +280,27 @@ asking again every drain cycle. The observable is the range count, in the origin
 point is that there is no second ask to refuse. Two shapes are worth running deliberately, because
 they are the two the flag has to survive: a long uninterrupted read, and a PAUSE, which must end the
 connection after five seconds and cost exactly one re-request at the frontier when playback resumes.
+On a finite HEVC-in-MPEG-TS HLS VOD (the AE#268 ingest) the same flag puts the playlist and every
+segment on one persistent HTTP/1.1 connection (AE#732); the observable there is the
+`[HLSVODIngest] AE#732 connection ... open` and `... closed after N requests reason=...` lines, one
+pair per connection, and a run without seeks should show exactly one.
+
+`--progressive-segments` sets `LoadOptions.progressiveSegmentDelivery`: each VOD segment is served
+while it is written. Run it against a throttled origin and compare the `FIRSTFRAME` and first
+`PHASE playing` times with and without the flag; the session log shows `serving while it is written`
+for every segment that went out that way. On a local or fast source the segments are cut before
+AVPlayer asks and the two runs look the same.
 
 `--max-concurrent-requests N` sets `LoadOptions.maxConcurrentSourceRequests` (#377): the most requests the reader may have open against the origin at once, across every path it fetches on. `1` also switches off the speculative parallel paths, which is the shape of a connection-metered CDN. Count the requests in the origin's own log, or read the `[AVIOReader]` connection lines, with and without the flag.
 
 `--assert-dv` sets `LoadOptions.panelPresentsDolbyVision` (AE#493), the host's assertion that its display presents Dolby Vision. macOS has no per-mode display capability API, so a Mac run plays a Dolby Vision source as its HDR10 base layer (`effective-format=hdr10`) until the host says otherwise; the flag moves that label and the tvOS criteria request. It does not change the packaging of a Profile 5 / 8.1 / 8.4 source (those carry their `dvcC` and `SUPPLEMENTAL-CODECS` on every display since 6.72.0 / 6.73.0), while Profile 7 and AV1 Dolby Vision are still gated on it. A wrong claim costs one in-place media-playlist fallback, not the item.
+
+`--native-video-frame-diagnostics` enables the opt-in SDR native-loopback decoded-output
+observer from `LoadOptions.nativeVideoFrameDiagnostics`. It logs progress, output gaps and
+observation delays without suppressing the player layer or claiming physical display proof.
+
+`play --native-video-frame-recovery` separately enables bounded SDR native decoded-output repair;
+it is off by default and does not follow from enabling diagnostics. See [diagnostics](api.md#diagnostics).
 
 `--picture-probe` attaches an `AVPlayerItemVideoOutput` to the running item and decodes the source
 time out of the picture itself, which is the one axis question nothing else here can answer: every
@@ -403,6 +429,17 @@ round 11 documents on both sides of that thread.
 
 `--start-position S` starts at a resume anchor, the same one `serve` takes. `--sw` forces the software path for a source that would route native, which is how a native-only fixture exercises the SW pipeline.
 
+A run with `--start-position` and nothing else that repositions (no `--seek-every`, no host calls besides `play`, no audio switch) is also judged on where the resume LANDS: a clock that reads more than a second behind the anchor in the first three ticks exits 2 with `VERDICT: resume clock fell behind its anchor`. That is AE#724, and the plain clock-advances check could not see it, because the session it broke kept advancing, only from the wrong place. A resume on a long-GOP source repositions to the keyframe before its target, so its first decoded audio sample arrives up to a GOP early, and the software host used to move its clock back onto that sample. Ten-second GOPs reproduce it, two-second ones never do:
+
+```bash
+ffmpeg -f lavfi -i testsrc2=size=320x180:rate=24 -f lavfi -i sine=frequency=440:sample_rate=48000 \
+  -t 30 -c:v libx264 -preset ultrafast -g 240 -keyint_min 240 -sc_threshold 0 -c:a aac gop240.mp4
+aetherctl play --sw --start-position 17.3 --seconds 5 file://$PWD/gop240.mp4
+aetherctl play --sw --paused --host-calls play --start-position 17.3 --seconds 5 file://$PWD/gop240.mp4
+```
+
+Before the fix both read `clock re-anchored to first sample: anchor=9.984s (load anchor 17.300s ...)` and `cur=10.8` at the first tick; after it `cur=18.2` and no re-anchor. `--paused` alone (no `play`) is not judged, but its ticks are the observable for the second half of the same report: a paused resume read `cur=0.00` until play, because the host published its still unarmed synchronizer over the anchor, and now reads `cur=17.30`.
+
 `--malloc-census` turns on the large-allocation census (`AetherEngine.setLargeAllocationCensusEnabled`) for the run, for tracing a footprint that grows where the segment budget says it should not. Besides the 30 s sample it arms a jump trigger, which exists because the 30 s memprobe cannot catch a failure that completes inside one sample (every kill on #220 was that shape): a counter polled at `--census-hz N` runs the zone walk once it climbs `--census-threshold-mb N` above its running high-water. Both flags are inert without `--malloc-census`.
 
 `--audio-stats` installs the engine audio tap and watches the decoded PCM itself: an `AGAP` line for every source-PTS discontinuity > 2 ms between consecutive buffers, and per-second `alead` (last decoded audio PTS minus the synchronizer clock) plus `abufs` (buffers delivered) appended to the telemetry. `alead` is the audio renderer's safety margin: on the SW live path the look-ahead pump holds it near `AudioLookaheadPolicy.targetLeadSeconds`; a collapse toward zero means the source or the feeder cannot keep real time (this is how the #107 audio-chopping report was diagnosed).
@@ -447,6 +484,22 @@ dovi_tool extract-rpu -i <printed output path> -o out.rpu
 dovi_tool info -i out.rpu -f 0   # expect dovi_profile 8, disable_residual_flag true
 ```
 
+## feltest
+
+Needs the `DualLayerDolbyVision` trait; without it the subcommand exits 64 and says so. Runs the Dolby Vision Profile 7 FEL dual-layer pipeline over a real clip: demuxes, splits each packet into the base layer, the enhancement layer (typically 1080p) and the RPU, decodes both layers in hardware `VTDecompressionSession`s, composes each frame with `DoviFelComposer` on Metal, and audits the output twice. The pixel audit reports mean and standard deviation of Y / Cb / Cr, so a black picture or collapsed chroma fails. The metadata audit checks that every delivered frame carries a `DolbyVisionRPUData` attachment, and warns (without failing) when the payload never changes, since a static-metadata clip is valid. The verdict also requires at least one frame the composer actually reconstructed: a bypassed frame comes out as its base layer and counts as output but not as composed. Exit codes: `0` verified, `1` probe error, `2` no frames output, `3` chroma collapsed to a flat 64, `4` frames emitted without per-frame Dolby Vision metadata, `5` no frame was composed. See [dolby-vision-fel.md](dolby-vision-fel.md).
+
+```bash
+swift run aetherctl feltest [--frames N] <p7-source>
+```
+
+## dvsurvey
+
+Walks a title's RPUs with no decoders and no GPU, converts each to Profile 8.1 exactly as the FEL path attaches it, and reports the L1 distribution (`min_pq`, `max_pq`, `avg_pq`), the scene cuts, and the frame whose L1 sits furthest from the title's median, together with the `aetherctl play --dv-pin` spec that pins it (a host app passes the same spec to `armDolbyVisionPinTest`) for the on-device consumption test. Candidates rank on distance from the median across all three L1 fields, not `max_pq` alone. `--frames N` bounds the scan (default 2000) and `--list K` also dumps the first K frames. Exit codes: `0` ok, `1` probe error, `2` no RPUs, `3` no pin candidate, `4` the title's L1 range is too flat for a pinned frame to be visible on a panel.
+
+```bash
+swift run aetherctl dvsurvey --frames 6000 <p7-source>
+```
+
 ## pktdump
 
 Opens the demuxer under a selectable open profile, optionally seeks, and dumps raw video packet timing exactly as the demuxer delivers it (before any producer-side dts repair and before muxing): per-packet dts / pts / duration / keyframe flag samples, NOPTS and non-monotonic dts counts, and dts-delta / duration histograms. Also prints the resolved stream fields that `find_stream_info` fills (`avg_frame_rate`, `codecpar.video_delay`).
@@ -486,6 +539,8 @@ Brings up the loopback session headless, decodes the audio tap (#95) as fast as 
 ## bgaudio
 
 Verifies SW-path background audio (iOS keepalive) headless on macOS, where the `UIApplication` background lifecycle that normally drives it does not exist. Loads a software-routed source through the full engine, plays a foreground baseline, toggles the SW host into background-audio-only (`--fg N` foreground seconds, `--bg N` background seconds; defaults 3 / 6), then returns to foreground. Reports per-tick the audio clock, the SW video-frame count, and the process memory footprint, and a verdict. A healthy run shows the clock advancing through the background phase (audio alive), the video-frame count flat (video dropped), the footprint roughly flat (the loop paces on the audio renderer rather than buffering the rest of the file), and the video-frame count rising again on foreground return (resync at the next keyframe). The flag and counters are exposed through DEBUG-only engine hooks, so this command is unavailable in a Release build. Generate a quick software-path clip with `ffmpeg -f lavfi -i testsrc2 -f lavfi -i sine -c:v libvpx-vp9 -c:a aac -shortest clip.mkv`.
+
+`--lose-session` (AE#739) reproduces what an iOS screen lock does to the SW host's VideoToolbox session: halfway through the foreground phase, and again right after entering background-audio-only, it invalidates the session in place, so the next decode returns `kVTInvalidSessionErr` (-12903) exactly as in a field log. It forces the software path and needs an HEVC source, since only HEVC reaches the hardware decoder there (`ffmpeg -f lavfi -i testsrc2=size=1920x1080:rate=24 -f lavfi -i sine -t 30 -c:v libx265 -x265-params keyint=48 -tag:v hvc1 -c:a aac clip.mp4`), and it prints the engine log so the loss, rebuild and reposition lines are visible. It fails unless video frames rise again after the foreground loss (the host rebuilds the session and repositions to the playhead) and after the foreground return (rebuilt unconditionally, resumes at the next keyframe). Before the fix both counts stayed at +0.
 
 ## customio
 
@@ -767,9 +822,9 @@ No run stalled in either arm. The extra segment on 6,4 is the short one, and the
 
 **Whether a join is spent is a fact, not arithmetic.** The seal may only be taken short once the join has nothing more to give, and "cut content plus one segment reaches the summed EXTINF" is not that fact: `--dur 6.3` over 6 s of media never adds up, and a first version built on the sum sealed the full value there and took the bounded start (2.23 s to first picture against 0.20 s). The reader states it instead: the whole join batch is committed, its FIFO is empty, and the cutter is parked waiting for the next delivery. Three runs per arm on each inflated shape with three segments listed: served at once in all six (0.000 to 0.034 s of hold), TD 5 on 6 s media and TD 9 on 10 s. Two more shapes belong to the same fact. A demuxed audio rendition (run the origin twice, video-only and audio-only segments behind a master) makes the cutter park on the AUDIO reader when the audio ends a little before the video, so the fact is stated for the cutter and not for the video reader: both join batches committed and either reader dry. Read off the video reader alone it never became true, 2.2 s to first picture under `.fastZap` and 10.4 s under `.standard`; now 0.18 to 0.21 s in all six cells (6 s and 10 s `.fastZap`, 10 s `.standard`, audio aligned and 0.2 s short, three runs each), as on 7.25.1. And a join slower than the `.fastZap` grace (`play --max-concurrent-requests 1` behind `--rate-kbps 4000`) is served by the bounded start before it is spent, seals the full 6 or 10 over a window under its holdback and draws a `-16832` warning at the start: first picture 5.05 to 6.08 s against 7.05 to 8.26 s on 7.25.1, which still pays the second grace there, and no `-12888` against 1 to 3.
 
-**The gate held the second playlist request too.** AVPlayer opens with two `/media.m3u8` requests, each re-enters `waitForFirstLiveSegment`, and on a bounded start each waited its own grace (`GET /media.m3u8` at 2.81 s, `GET /init.mp4` at 4.83 s). On an ingest the gate now opens for good once a manifest has gone out. On a source the engine cuts itself it does not: that second grace is the "+2.07 s at the picture" of the AE#594 table above, and removing it there also leaves the session up to 2 s closer to the producing edge, which is that issue's open question. The raw-TS control (`live --fast-zap --realtime --preroll 0`, two seeds, two runs per arm) reads the same in both arms: first manifest at 3.84 to 3.96 s, `init.mp4` at 6.11 to 6.33 s, first picture at 6.20 to 6.58 s, playhead 6.3 to 6.8 s behind the wall clock. The AE#594 table stands as printed.
+**The gate held the second playlist request too.** AVPlayer opens with two `/media.m3u8` requests, each re-enters `waitForFirstLiveSegment`, and on a bounded start each waited its own grace (`GET /media.m3u8` at 2.81 s, `GET /init.mp4` at 4.83 s). On an ingest the gate now opens for good once a manifest has gone out. On a source the engine cuts itself it did not until 7.28.2 (next paragraph): that second grace is the "+2.07 s at the picture" of the AE#594 table above, and removing it there also leaves the session up to 2 s closer to the producing edge, which is that issue's open question. The raw-TS control (`live --fast-zap --realtime --preroll 0`, two seeds, two runs per arm) reads the same in both arms: first manifest at 3.84 to 3.96 s, `init.mp4` at 6.11 to 6.33 s, first picture at 6.20 to 6.58 s, playhead 6.3 to 6.8 s behind the wall clock. The AE#594 table stands as printed.
 
-**AE#686 measures that second grace behind an arm.** `AETHER_FIRST_SERVE_LATCH_ALL=1` applies the same latch to a source the engine cuts itself. It is a measurement arm like `AETHER_BOUNDED_START_FLOOR`, read once per process and off by default, because what it may cost (a session closer to the producing edge for its whole life) needs a device that seeks to edge-minus-holdback, which this harness does not. Both arms now print how long AVPlayer's second plain request waited, once per session:
+**AE#686 applies the same latch to a source the engine cuts itself, by default since 7.28.2.** It started as a measurement arm (`AETHER_FIRST_SERVE_LATCH_ALL=1`, 7.26.3), because what it may cost (a session closer to the producing edge for its whole life) needs a device that seeks to edge-minus-holdback, which this harness does not. The reporter's Apple TV A/B answered that: on 1080p59.94 raw TS with 1.001 s segments, every bounded start reached its picture 1.003 to 1.039 s sooner with the latch, the session sat 0.5 to 1.5 s nearer the edge after 60 s, and 18 latched launches logged no stall, `-16832` or `-12888`. A rebuild from a backlog served a full cushion in both arms, so the latch had nothing to skip there. `AETHER_FIRST_SERVE_LATCH_ALL=0` restores the old gate, read once per process. Both arms print how long AVPlayer's second plain request waited, once per session:
 
 ```
 [HLSVideoEngine] repeat live manifest request held 2.003s, fastZap bounded start after 2.000s grace
@@ -785,7 +840,7 @@ No run stalled in either arm. The extra segment on 6,4 is the short one, and the
 | 1080p59.94, 1 s GOP | off | 1.22 to 1.23 s, 3 segments | 1.011 s | 2.43 s | 3.2 s | 38.30 to 38.40 s | 0 |
 | 1080p59.94, 1 s GOP | on | 1.24 s, 3 segments | 0.000 s | 1.41 to 1.44 s | 1.1 s | 39.19 to 39.30 s | 0 |
 
-The arm removes exactly the grace, and the session ends that much closer to the edge. Whether that costs a stall is the device half.
+The latch removes exactly the grace, and the session ends that much closer to the edge; on the device that cost no stall.
 
 The full matrix (6 s and 10 s segments, 3, 4 and 8 listed, both profiles, three runs per arm) is in `api.md` under the live join; `.standard` drops `--fast-zap` from the `play` line.
 

@@ -50,12 +50,6 @@ private final class CountingFileReader: IOReader, @unchecked Sendable {
     func close() { lock.withLock { _closes += 1 } }
 }
 
-private func waitUntil(_ timeout: TimeInterval = 5, _ condition: () -> Bool) -> Bool {
-    let deadline = Date().addingTimeInterval(timeout)
-    while Date() < deadline { if condition() { return true }; Thread.sleep(forTimeInterval: 0.02) }
-    return condition()
-}
-
 @Suite("I-frame rendition on a real session", .serialized)
 struct IFrameSessionTests {
     private static let fixture = "restart-witness-av.mp4"
@@ -72,6 +66,7 @@ struct IFrameSessionTests {
         #expect(playbackURL.lastPathComponent == "master.m3u8")
         let prov = try #require(engine.provider)
         #expect(prov.iFrameRenditionServed)
+        #expect(prov.iFrameRenditionFormat == .keyframes)
         try #require(prov.segmentCount >= 2)
 
         let initSegment = try #require(prov.iFrameInitSegment())
@@ -86,6 +81,72 @@ struct IFrameSessionTests {
         }
         #expect(prov.iFrameSegment(at: prov.segmentCount) == nil)
     }
+
+    private static let dolbyVisionFixture = "user/Patterns_Of_Nature_DoVi_24_P5_UHD_HEVC-10mbps_DD+JOC-768kbps_iOS.mp4"
+
+    // Profile 5 stills need the DolbyVisionStillReshaping trait (README, "Optional components").
+    #if DolbyVisionStillReshaping
+    @Test("a Dolby Vision session serves SDR JPEG stills on the plan's timeline",
+          .enabled(if: fixtureExists(dolbyVisionFixture)), .timeLimit(.minutes(2)))
+    func dolbyVisionServesJPEG() throws {
+        let engine = HLSVideoEngine(url: fixtureURL(Self.dolbyVisionFixture), dvModeAvailable: true)
+        engine.requestIFramePlaylist()
+        _ = try engine.start()
+        defer { engine.stop() }
+        try #require(engine.iFrameRenditionVerdict == .served)
+        let prov = try #require(engine.provider)
+        guard case .jpeg(let width, let height, _) = prov.iFrameRenditionFormat else {
+            Issue.record("expected a JPEG rendition, got \(String(describing: prov.iFrameRenditionFormat))")
+            return
+        }
+        #expect(width == 640 && height == 360)
+        let master = HLSLocalServer.buildMasterPlaylistText(provider: prov)
+        #expect(master.contains("CODECS=\"mjpg\",RESOLUTION=640x360,VIDEO-RANGE=SDR"))
+        let initSegment = try #require(prov.iFrameInitSegment())
+        let timescale = Double(try #require(IFrameTestBoxes.timescale(initSegment: initSegment)))
+        for index in [prov.segmentCount - 1, 2] {
+            let fragment = try #require(prov.iFrameSegment(at: index))
+            let tfdt = Double(try #require(IFrameTestBoxes.baseDecodeTime(fragment: fragment)))
+            #expect(abs(tfdt / timescale - engine.segmentPlan[index].startSeconds) < 0.002)
+            let mdat = try #require(IFrameTestBoxes.find(["mdat"], in: fragment))
+            #expect(fragment.subdata(in: mdat).prefix(2) == Data([0xFF, 0xD8]))
+        }
+    }
+
+    @Test("a JPEG I-frame playlist waits for the main variant and is withheld from a player that refused it",
+          .enabled(if: fixtureExists(dolbyVisionFixture)), .timeLimit(.minutes(2)))
+    func jpegPlaylistFollowsMainVariant() throws {
+        let engine = HLSVideoEngine(url: fixtureURL(Self.dolbyVisionFixture), dvModeAvailable: true)
+        engine.requestIFramePlaylist()
+        let playbackURL = try engine.start()
+        defer { engine.stop() }
+        let base = playbackURL.deletingLastPathComponent()
+        let playlistURL = base.appendingPathComponent("iframe.m3u8")
+
+        let started = Date()
+        #expect(!engine.iFrameRenditionWithheld)
+        #expect((try? String(contentsOf: playlistURL, encoding: .utf8)) == nil)
+        #expect(Date().timeIntervalSince(started) >= HLSLocalServer.iFrameMainVariantWaitSeconds - 0.1)
+        #expect(engine.iFrameRenditionWithheld)
+
+        _ = try Data(contentsOf: base.appendingPathComponent("init.mp4"))
+        let playlist = try String(contentsOf: playlistURL, encoding: .utf8)
+        #expect(playlist.contains("iframe1.mp4"))
+    }
+    #else
+    @Test("without the reshaping trait a Profile 5 session lists no I-frame rendition",
+          .enabled(if: fixtureExists(dolbyVisionFixture)), .timeLimit(.minutes(2)))
+    func dolbyVisionWithoutReshapingHasNoRendition() throws {
+        let engine = HLSVideoEngine(url: fixtureURL(Self.dolbyVisionFixture), dvModeAvailable: true)
+        engine.requestIFramePlaylist()
+        _ = try engine.start()
+        defer { engine.stop() }
+        #expect(engine.iFrameRenditionVerdict == .absent(.dolbyVisionStillsNotBuiltIn))
+        #expect(!engine.yieldsStills)
+        let prov = try #require(engine.provider)
+        #expect(!prov.iFrameRenditionServed)
+    }
+    #endif
 
     @Test("the loopback server answers the three new paths",
           .enabled(if: fixtureExists(fixture)), .timeLimit(.minutes(2)))
@@ -174,7 +235,7 @@ struct IFrameSessionTests {
 
     @Test("a custom source's clone feeds the side reader and is closed exactly once at stop",
           .enabled(if: fixtureExists(fixture)), .timeLimit(.minutes(2)))
-    func customCloneIsClosedAtStop() throws {
+    func customCloneIsClosedAtStop() async throws {
         let clone = try CountingFileReader(url: fixtureURL(Self.fixture))
         let engine = HLSVideoEngine(url: fixtureURL(Self.fixture), dvModeAvailable: false)
         engine.requestIFramePlaylist()
@@ -185,21 +246,21 @@ struct IFrameSessionTests {
         #expect(IFrameTestBoxes.sampleCount(fragment: fragment) == 1)
         #expect(clone.closes == 0)
         engine.stop()
-        #expect(waitUntil { clone.closes == 1 })
-        Thread.sleep(forTimeInterval: 0.2)
+        try await waitFor { clone.closes == 1 }
+        try await Task.sleep(for: .milliseconds(200))
         #expect(clone.closes == 1)
     }
 
     @Test("a clone nobody ever read from is still closed at stop",
           .enabled(if: fixtureExists(fixture)), .timeLimit(.minutes(2)))
-    func untouchedCloneIsClosedAtStop() throws {
+    func untouchedCloneIsClosedAtStop() async throws {
         let clone = try CountingFileReader(url: fixtureURL(Self.fixture))
         let engine = HLSVideoEngine(url: fixtureURL(Self.fixture), dvModeAvailable: false)
         engine.requestIFramePlaylist()
         engine.customIFrameReader = (reader: clone, formatHint: "mp4")
         _ = try engine.start()
         engine.stop()
-        #expect(waitUntil { clone.closes == 1 })
+        try await waitFor { clone.closes == 1 }
     }
 
     @Test("a clone handed to a session that cannot serve the rendition is closed at once",

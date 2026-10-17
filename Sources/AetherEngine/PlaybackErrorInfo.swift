@@ -21,7 +21,9 @@ public struct PlaybackErrorKind: RawRepresentable, Sendable, Equatable, Hashable
     /// a 404, a 5xx. `underlyingCode` is that status; `underlyingDomain` is nil, the sentence is the
     /// engine's. Before this kind existed both this and a corrupt file arrived as `sourceOpenFailed`
     /// carrying FFmpeg's "Invalid data found when processing input". A 429/503/509 arrives as
-    /// `sourceRateLimited` instead: same shape, different recovery.
+    /// `sourceRateLimited` instead: same shape, different recovery. Mid-session, a 401/403 that the
+    /// host did not answer with new headers in time arrives as this kind too (AE#792), where it used to
+    /// arrive as `vodSourceFailed`.
     public static let sourceRefused = PlaybackErrorKind(rawValue: "sourceRefused")
     /// The transport was refused over certificate trust before any media arrived: a self-signed or
     /// private-CA origin, an expired certificate, a client certificate the process cannot present.
@@ -83,6 +85,12 @@ public struct PlaybackErrorKind: RawRepresentable, Sendable, Equatable, Hashable
     /// neither gone nor unreadable, and a second player that decodes the track itself will play it.
     /// A host with a fallback ladder should DEMOTE on this one, not end the ladder.
     public static let audioBridgeProducedNoOutput = PlaybackErrorKind(rawValue: "audioBridgeProducedNoOutput")
+    /// The volume holding the loopback segment cache (the temporary directory) ran out of space, so
+    /// the session could not write its segments and the muxer revive budget ran out. Distinct from
+    /// `vodSourceFailed` and `audioBridgeProducedNoOutput`, which this used to arrive as: the source
+    /// and its audio are fine, and the same load succeeds once space is freed. A host should free
+    /// its own caches or ask the user to, not demote to another player.
+    public static let storageExhausted = PlaybackErrorKind(rawValue: "storageExhausted")
 }
 
 /// Machine-readable companion to the text inside `PlaybackState.error` (#376).

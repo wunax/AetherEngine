@@ -49,7 +49,7 @@ extension HLSVideoEngine {
     /// interleaver before its first flush, which on a 110 min Blu-ray climbed to ~13 GB of RAM and
     /// swapped until the device disk filled.
     ///
-    /// Two witnesses, both required:
+    /// Three witnesses, all required:
     ///
     /// - **Gap (#64)**: the largest gap between consecutive keyframes. A real index never gaps more than
     ///   a few GOPs (well under the cap); a clustered TS index gaps by thousands of seconds.
@@ -61,15 +61,22 @@ extension HLSVideoEngine {
     ///   whole-file segment, from which AVPlayer loads zero tracks. Below one segment of coverage the
     ///   keyframe planner cannot make even the first cut, so such an index is rejected here.
     ///
-    /// Coverage is the span between keyframes, never reaching to EOF, so a dense index that stops early
-    /// (the trailing-gap-not-counted case) is unaffected: its span already exceeds one segment.
-    /// An index failing either witness is routed to the uniform-stride fallback.
+    /// - **Tail (PR #703)**: the span must also reach to within `maxTrailingGapSeconds` of the source
+    ///   duration. An index that stops minutes short is not dense-but-short, it is a partial scan: an
+    ///   MKV whose Cues are missing or point past EOF (an incomplete download) leaves only what the
+    ///   capped prewarm walked, and the keyframe planner then cuts its last segment from the final
+    ///   scanned keyframe to the end of the title (measured on a device: 205 s to 5933 s), which the
+    ///   producer can never finish and AVPlayer waits on forever. The 60 s default leaves room for a
+    ///   long final GOP and for a container duration padded by a trailing audio or subtitle track.
+    ///
+    /// An index failing any witness is routed to the uniform-stride fallback.
     static func keyframeIndexIsTrustworthy(
         keyframes: [Int64],
         videoTimeBase: AVRational,
         sourceDurationSeconds: Double,
         maxTrustedGapSeconds: Double = Swift.max(HLSVideoEngine.targetSegmentDuration * 4, 30),
-        minCoverageSeconds: Double = HLSVideoEngine.targetSegmentDuration
+        minCoverageSeconds: Double = HLSVideoEngine.targetSegmentDuration,
+        maxTrailingGapSeconds: Double = 60
     ) -> Bool {
         guard keyframes.count >= 2,
               sourceDurationSeconds > 0,
@@ -79,6 +86,7 @@ extension HLSVideoEngine {
         // In Double: an index spanning both Int64 extremes overflows the integer difference (audit HLS-102).
         let coverageSeconds = (Double(sorted[sorted.count - 1]) - Double(sorted[0])) * tb
         guard coverageSeconds >= minCoverageSeconds else { return false }
+        guard sourceDurationSeconds - coverageSeconds <= maxTrailingGapSeconds else { return false }
         var largestGapSeconds = 0.0
         for i in 1..<sorted.count {
             let gapSeconds = (Double(sorted[i]) - Double(sorted[i - 1])) * tb
@@ -376,6 +384,27 @@ extension HLSVideoEngine {
         return plan
     }
 
+    /// AE#783: the highest source bitrate of any planned segment, from the byte positions the container
+    /// index records at the segment boundaries. Those bytes hold every interleaved track, including the
+    /// ones the session drops, so the figure errs high. Nil unless the positions rise across every
+    /// measurable boundary: two IRAPs in one Matroska Cluster share a position, a disc folds several
+    /// files onto one axis, and either one makes a byte span mean nothing. The final segment has no
+    /// indexed end and is not measured.
+    ///
+    /// Pure for offline testing.
+    static func peakSegmentBitrate(plan: [Segment], keyframeBytePositions: [Int64: Int64]) -> Int64? {
+        guard plan.count > 1 else { return nil }
+        var peak: Double = 0
+        for segment in plan.dropLast() {
+            guard let start = keyframeBytePositions[segment.startPts], start >= 0,
+                  let end = keyframeBytePositions[segment.endPts], end > start,
+                  segment.durationSeconds > 0
+            else { return nil }
+            peak = max(peak, Double(end - start) * 8 / segment.durationSeconds)
+        }
+        return peak > 0 && peak < Double(Int64.max) ? Int64(peak) : nil
+    }
+
     /// Segments shorter than this are folded into a neighbour by `collapseShortSegments`. A keyframe
     /// cluster (several IRAPs within a few frames) otherwise makes `buildKeyframeSegmentPlan` emit
     /// sub-frame segments whose narrow [start,end) window can miss every demuxed keyframe, so the producer
@@ -479,9 +508,7 @@ extension HLSVideoEngine {
         guard Self.configRecordNeedsInBandRebuild(extradata, size: extradataSize) else { return nil }
         let naluLengthSize = 4   // the predicate above already required it
 
-        var vps: [UInt8]?
-        var sps: [UInt8]?
-        var pps: [UInt8]?
+        var sets = VideoConfigRecord.HEVCParameterSets()
         // Counted in VIDEO packets: a film interleaves audio and dozens of subtitle tracks, which
         // would otherwise exhaust the budget before the first video packet.
         let packetBudget = 16
@@ -493,55 +520,19 @@ extension HLSVideoEngine {
             if pkt.pointee.stream_index != videoStreamIndex { return false }
             packetsScanned += 1
             guard let pktData = pkt.pointee.data else { return packetsScanned >= packetBudget }
-            let pktSize = Int(pkt.pointee.size)
-
-            var offset = 0
-            while offset + naluLengthSize <= pktSize {
-                var nalLen = 0
-                for i in 0..<naluLengthSize {
-                    nalLen = (nalLen << 8) | Int(pktData[offset + i])
-                }
-                offset += naluLengthSize
-                if nalLen == 0 || offset + nalLen > pktSize { break }
-                let nalType = (Int(pktData[offset]) >> 1) & 0x3F  // HEVC NAL type: bits 1..6 of byte 0
-                let nalBytes = Array(UnsafeBufferPointer(start: pktData + offset, count: nalLen))
-                switch nalType {
-                case 32: if vps == nil { vps = nalBytes }
-                case 33: if sps == nil { sps = nalBytes }
-                case 34: if pps == nil { pps = nalBytes }
-                default: break
-                }
-                offset += nalLen
-            }
-
-            return (vps != nil && sps != nil && pps != nil) || packetsScanned >= packetBudget
+            sets.collect(from: pktData, size: Int(pkt.pointee.size), naluLengthSize: naluLengthSize)
+            return sets.isComplete || packetsScanned >= packetBudget
         }
 
-        guard let vps, let sps, let pps else {
+        guard let vps = sets.vps, let sps = sets.sps, let pps = sets.pps else {
             EngineLog.emit(
                 "[HLSVideoEngine] in-band parameter-set scan found none: "
-                + "packets=\(packetsScanned) vps=\(vps != nil) sps=\(sps != nil) pps=\(pps != nil)",
+                + "packets=\(packetsScanned) vps=\(sets.vps != nil) sps=\(sets.sps != nil) pps=\(sets.pps != nil)",
                 category: .session
             )
             return nil
         }
-
-        // Assemble hvcC: keep source 22-byte header, set numOfArrays=3, append VPS/SPS/PPS arrays (1-byte type, 2-byte numNalus=1, 2-byte nalUnitLength, NAL bytes).
-        var hvcC: [UInt8] = []
-        hvcC.reserveCapacity(22 + 1 + 5 * 3 + vps.count + sps.count + pps.count)
-        for i in 0..<22 { hvcC.append(extradata[i]) }
-        hvcC.append(3)
-        func appendArray(nalUnitType: UInt8, nal: [UInt8]) {
-            hvcC.append(0x80 | (nalUnitType & 0x3F))
-            hvcC.append(0); hvcC.append(1)
-            let nl = UInt16(nal.count)
-            hvcC.append(UInt8(nl >> 8)); hvcC.append(UInt8(nl & 0xFF))
-            hvcC.append(contentsOf: nal)
-        }
-        appendArray(nalUnitType: 32, nal: vps)
-        appendArray(nalUnitType: 33, nal: sps)
-        appendArray(nalUnitType: 34, nal: pps)
-        return hvcC
+        return VideoConfigRecord.hevcRecord(header: extradata, vps: vps, sps: sps, pps: pps)
     }
 
     /// Shows the packets at the head of the source to `inspect`, which returns true once it has seen
@@ -591,6 +582,9 @@ extension HLSVideoEngine {
         /// never going to reformat this track anyway). Callers fall back to deriving it from the
         /// extradata, which is only safe while the two agree.
         let measuredFraming: VideoNALFraming?
+        /// The packets are Annex B and `extradataOverride` is a length-prefixed record: the muxer
+        /// converts every sample itself and keeps its in-band parameter sets (`AnnexBSampleConverter`).
+        var convertsAnnexBSamples = false
     }
 
     /// Measure the video NAL framing on packets, then decide what config record the muxer gets.
@@ -627,8 +621,8 @@ extension HLSVideoEngine {
 
         let framing = probeVideoNALFraming(demuxer: demuxer, videoStreamIndex: videoStreamIndex)
         guard case .lengthPrefixed = framing else {
-            // The record stays Annex B here: movenc reads it to decide whether to convert the samples,
-            // and these samples do need converting. What it must not keep is a prefix SEI, because the
+            // Except for HEVC on Annex-B packets (below) the record stays Annex B: movenc reads it to
+            // decide whether to convert the samples, and these samples do need converting. What it must not keep is a prefix SEI, because the
             // hvcC movenc then builds carries it as a fourth array (`ff_isom_write_hvcc` collects five
             // NAL types) and Apple TV's HEVC track builder rejects such a record (AE#187). That defense
             // sits on the record path and cannot see this one, so the SEI goes before the muxer runs.
@@ -637,6 +631,25 @@ extension HLSVideoEngine {
             } ?? []
             let canonical = codecID == AV_CODEC_ID_HEVC
                 ? VideoConfigRecord.canonicalizeAnnexBHEVCConfigRecord(source) : nil
+            // HEVC on conclusively Annex-B packets: movenc's own conversion drops every in-band
+            // parameter set under `hvc1`, which breaks a stream that sends a new PPS mid-title. Give
+            // it a length-prefixed record so it copies the samples, and convert them in the muxer
+            // instead, parameter sets kept. Built from the canonical record so the hvcC carries no
+            // SEI array (AE#187).
+            if codecID == AV_CODEC_ID_HEVC, case .annexB? = framing,
+               let record = VideoConfigRecord.fromAnnexB(
+                   canonical ?? source, codecID: codecID,
+                   width: codecpar.pointee.width, height: codecpar.pointee.height) {
+                EngineLog.emit(
+                    "[HLSVideoEngine] #365 HEVC on Annex-B packets: the muxer gets a length-prefixed "
+                    + "record (\(source.count) B → \(record.count) B) and converts the samples itself, "
+                    + "keeping their in-band parameter sets",
+                    category: .session
+                )
+                var result = VideoFramingNormalization(extradataOverride: record, measuredFraming: framing)
+                result.convertsAnnexBSamples = true
+                return result
+            }
             EngineLog.emit(
                 "[HLSVideoEngine] #365 the muxer will reformat this track's samples and the packets "
                 + "are \(framing == nil ? "not conclusively framed" : "Annex B"); the muxer builds the "

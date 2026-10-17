@@ -57,7 +57,7 @@ extension AetherEngine {
             confirmedAtmosSource = url
             confirmedAtmosStreamIndices = []
         }
-        applyConfirmedAtmos()
+        applyConfirmedTrackFlags()
         let candidates = Self.atmosConfirmationCandidates(in: audioTracks)
         guard !candidates.isEmpty else { return }
         if isCustomSource, !Self.canForkCustomReader(customReader) { return }
@@ -66,7 +66,7 @@ extension AetherEngine {
         let formatHint = customFormatHint
         let probesize = loadedOptions.probesize
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
-        atmosConfirmationTask = Task.detached(priority: .utility) { [weak self] in
+        atmosConfirmationTask = BlockingWork.detached(priority: .utility) { [weak self] in
             await self?.runAtmosConfirmation(
                 url: url, formatHint: formatHint, headers: headers,
                 callerProbesize: probesize, callerMaxAnalyzeDuration: maxAnalyzeDuration,
@@ -112,7 +112,7 @@ extension AetherEngine {
                 await MainActor.run { [weak self] in
                     guard let self, self.loadedURL == self.confirmedAtmosSource else { return }
                     self.confirmedAtmosStreamIndices.insert(index)
-                    self.applyConfirmedAtmos()
+                    self.applyConfirmedTrackFlags()
                 }
             }
         }

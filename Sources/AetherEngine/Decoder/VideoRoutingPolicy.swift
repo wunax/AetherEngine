@@ -12,8 +12,26 @@ enum VideoRoutingPolicy {
         AV_FIELD_TT, AV_FIELD_BB, AV_FIELD_TB, AV_FIELD_BT
     ]
 
+    /// Whether the Profile 7 dual-layer route is both requested and possible, which is everything that
+    /// decides it except the stream's `el_type`. `requiresSoftwarePath` adds the FEL condition; the load
+    /// asks this one first, so the `el_type` probe (a packet scan and a seek) only runs when its answer
+    /// can change the route. A nil `canHardwareDecode` assumes hardware decode.
+    static func dualLayerRouteIsWanted(
+        codecID: AVCodecID,
+        dvProfile: Int?,
+        dolbyVisionHandling: DolbyVisionHandling,
+        preferDualLayerDolbyVision: Bool,
+        canHardwareDecode: (() -> Bool)?
+    ) -> Bool {
+        guard codecID == AV_CODEC_ID_HEVC, dvProfile == 7,
+              preferDualLayerDolbyVision, DualLayerRouteDecision.isBuiltIn,
+              dolbyVisionHandling == .automatic else { return false }
+        return canHardwareDecode?() ?? true
+    }
+
     /// True when a video codec must use the software decode path (SoftwarePlaybackHost) instead of
     /// native AVPlayer. `av1Available` is `VTCapabilityProbe.av1Available` (HW AV1 decode support).
+    /// Evaluated only for AV1; registering its decoder must not delay unrelated formats.
     /// #150: `spsIndicatesInterlaced` (SPS frame_mbs_only_flag == 0) breaks the tie when the demuxer's
     /// field_order probe stays UNKNOWN; a concrete PROGRESSIVE probe analyzed actual frames and wins.
     /// A false positive costs an unnecessary SW decode (deint=interlaced passes progressive frames
@@ -30,15 +48,36 @@ enum VideoRoutingPolicy {
     static func requiresSoftwarePath(
         codecID: AVCodecID,
         fieldOrder: AVFieldOrder,
-        av1Available: Bool,
+        av1Available: @autoclosure () -> Bool,
         spsIndicatesInterlaced: Bool = false,
-        stereo3DType: AVStereo3DType? = nil
+        stereo3DType: AVStereo3DType? = nil,
+        dvProfile: Int? = nil,
+        dolbyVisionHandling: DolbyVisionHandling = .automatic,
+        preferDualLayerDolbyVision: Bool = false,
+        canHardwareDecode: (() -> Bool)? = nil,
+        elType: String? = nil
     ) -> Bool {
+        // Profile 7 FEL dual-layer Metal reconstruction routes to the software host pipeline
+        // when preferDualLayerDolbyVision is enabled, dolbyVisionHandling is .automatic, and hardware decode is confirmed (or assumed true if closure
+        // not provided).
+        // Only elType == "FEL" routes to software; MEL, nil, or unknown stay native
+        // (the 8.1 conversion where the display takes Dolby Vision, the HDR10 base layer where it does
+        // not; the conversion is lossless only for MEL).
+        // If dolbyVisionHandling is .baseLayerOnly, it also stays native (HDR10 base layer).
+        if codecID == AV_CODEC_ID_HEVC, dvProfile == 7 {
+            return elType == "FEL" && dualLayerRouteIsWanted(
+                codecID: codecID,
+                dvProfile: dvProfile,
+                dolbyVisionHandling: dolbyVisionHandling,
+                preferDualLayerDolbyVision: preferDualLayerDolbyVision,
+                canHardwareDecode: canHardwareDecode
+            )
+        }
         switch codecID {
         case AV_CODEC_ID_NONE, AV_CODEC_ID_HEVC:
             return false
         case AV_CODEC_ID_AV1:
-            return !av1Available
+            return !av1Available()
         case AV_CODEC_ID_H264:
             if routesSoftwareForMultiviewCarriage(codecID: codecID, stereo3DType: stereo3DType) {
                 return true

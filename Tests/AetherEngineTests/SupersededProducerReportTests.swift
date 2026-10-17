@@ -9,7 +9,7 @@ import AetherLibavutil
 /// superseded restart rewrote the epoch table, the delayed #377 revive re-anchored the producer that
 /// had replaced the dead one, and a re-cut lost its mark to the seek's 2 s wait while the restart it
 /// marked was still running.
-@Suite("A superseded producer leaves the current session alone", .serialized)
+@Suite("A superseded producer leaves the current session alone", .serialized, .offCooperativePool)
 struct SupersededProducerReportTests {
 
     private final class Session {
@@ -20,7 +20,7 @@ struct SupersededProducerReportTests {
         init() throws {
             engine = HLSVideoEngine(url: URL(fileURLWithPath: "/nonexistent/superseded.mkv"),
                                     dvModeAvailable: false)
-            codecpar = try #require(avcodec_parameters_alloc())
+            codecpar = avcodec_parameters_alloc()
             codecpar!.pointee.codec_id = AV_CODEC_ID_H264
             codecpar!.pointee.codec_type = AVMEDIA_TYPE_VIDEO
             let plan = (0..<10).map { i in
