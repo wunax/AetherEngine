@@ -17,7 +17,7 @@ struct ItemSwapStillTests {
     /// Four seconds of H.264 plus silent AAC, long enough to still be playing when the capture runs
     /// and with an audio stream for the audio-switch rebuild to name. The shared fixtures end after
     /// 0.2 s, before an output attached to them sees a frame.
-    private static func fixtureURL() async throws -> URL {
+    static func fixtureURL() async throws -> URL {
         let file = FileManager.default.temporaryDirectory
             .appendingPathComponent("ae711-still-\(UUID().uuidString).mp4")
         let writer = try AVAssetWriter(outputURL: file, fileType: .mp4)
@@ -61,10 +61,13 @@ struct ItemSwapStillTests {
         var audioDone = false
         // A stall deadline, not a total one: under load the writer can be slow and still moving
         // (`video 4/120 ready=true, audio 24/40 ready=true` after a fixed 20 s on CI), and only a
-        // writer that takes nothing for 20 s is the deadlock described above.
+        // writer that takes nothing for 20 s is the deadlock described above. Both tracks reading
+        // ready at the end of such a run says the loop itself had not run: a starved task sleeps
+        // through the deadline, so a stall also needs the polls to show it.
         var lastProgress = ContinuousClock.now
+        var idlePolls = 0
         while !(videoDone && audioDone), writer.status == .writing,
-              ContinuousClock.now - lastProgress < .seconds(20) {
+              ContinuousClock.now - lastProgress < .seconds(20) || idlePolls < 1_000 {
             var fed = false
             if !videoDone, video.isReadyForMoreMediaData {
                 // Our own buffer, not one from the adaptor's pool: that pool belongs to the
@@ -112,7 +115,13 @@ struct ItemSwapStillTests {
                     audioDone = true
                 }
             }
-            if fed { lastProgress = .now } else { try await Task.sleep(for: .milliseconds(5)) }
+            if fed {
+                lastProgress = .now
+                idlePolls = 0
+            } else {
+                idlePolls += 1
+                try await Task.sleep(for: .milliseconds(5))
+            }
         }
         guard videoDone, audioDone else {
             let state = "video \(frame)/120 ready=\(video.isReadyForMoreMediaData), "
@@ -383,13 +392,14 @@ struct ItemSwapStillTests {
         #expect(view.isHoldingStill)
     }
     #else
-    /// Without the reshaping a Profile 5 picture cannot be made from the segment, so where the hold
-    /// would need it (the output presents Dolby Vision) it is skipped with its reason rather than
-    /// showing the planes read as YCbCr. Where AVPlayer presents the source as HDR10 (a Mac without a
-    /// Dolby Vision display), the output's own picture is correct and is held as before.
-    @Test("without the reshaping trait a Profile 5 title never holds a reshaped still",
+    /// Without the reshaping a Profile 5 picture cannot be made into a still, so where the hold needs
+    /// one (the output presents Dolby Vision) the engine plays the frame out of the resident segment
+    /// through a player of the surface's own, and the system compositor colours it. Where AVPlayer
+    /// presents the source as HDR10 (a Mac without a Dolby Vision display), the output's own picture
+    /// is correct and is held as before.
+    @Test("without the reshaping trait a Profile 5 title holds its frame through the compositor",
           .enabled(if: FileManager.default.fileExists(atPath: ItemSwapStillTests.profile5URL.path)))
-    func profile5WithoutReshapingHoldsNothingReshaped() async throws {
+    func profile5WithoutReshapingHoldsThroughCompositor() async throws {
         let engine = try AetherEngine()
         defer { engine.stop() }
         let view = AetherPlayerView(frame: CGRect(x: 0, y: 0, width: 320, height: 180))
@@ -397,14 +407,18 @@ struct ItemSwapStillTests {
         _ = try await engine.load(url: Self.profile5URL)
         let host = try #require(engine.nativeHost)
         try await waitFor { host.isVideoReadyForDisplay }
+        try await Task.sleep(for: .seconds(1))
         engine.pause()
-        // No scrub still either, and the capability says so up front so a host hides the preview.
+        // No scrub still either; the compositor preview stands in, and the capabilities say so up front.
         #expect(!engine.supportsCacheBackedStills)
+        #expect(engine.scrubPreviewDrawsInView)
         #expect(await engine.scrubThumbnail(atSeconds: 0.5, maxWidth: 160) == nil)
+        let started = ContinuousClock.now
         await engine.holdPictureAcrossItemSwap()
+        #expect(ContinuousClock.now - started < .seconds(AetherEngine.heldPictureDolbyVisionBudgetSeconds + 0.5))
         if AetherEngine.heldPictureNeedsReshaping(videoFormat: engine.videoFormat, dolbyVisionProfile: engine.sourceDVProfile) {
-            #expect(engine.heldPictureLastSkip == "Dolby Vision still reshaping not built in")
-            #expect(!view.isHoldingStill)
+            #expect(engine.heldPictureLastRoute == "Dolby Vision compositor")
+            #expect(view.isHoldingStill)
         } else {
             #expect(engine.heldPictureLastRoute == "native output")
         }
@@ -429,7 +443,7 @@ struct ItemSwapStillTests {
         #expect(view.isHoldingStill)
     }
 
-    private static func centreGrey(_ image: CGImage) -> Int? {
+    static func centreGrey(_ image: CGImage) -> Int? {
         var pixel = [UInt8](repeating: 0, count: 4)
         guard let context = CGContext(
             data: &pixel, width: 1, height: 1, bitsPerComponent: 8, bytesPerRow: 4,
