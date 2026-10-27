@@ -371,6 +371,7 @@ player.setNativeVideoFrameTimeObserver { frame in
 // ASCENDING presentation order. `generation` moves on every renderer flush, i.e. on a seek, and
 // rises across a load() the same way `epoch` does.
 player.softwarePresentationTimebase               // the master clock, on the source axis
+player.presentedSourceTime                        // that clock read now, on any video route
 player.setSoftwareVideoFrameTimeObserver { frame in
     frame.presentation; frame.generation
 }

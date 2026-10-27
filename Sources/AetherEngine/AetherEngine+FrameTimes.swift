@@ -52,4 +52,46 @@ extension AetherEngine {
     public var softwarePresentationTimebase: CMTimebase? {
         softwareHost?.presentationTimebase
     }
+
+    /// Source-axis position of the picture on screen, read from the presenting clock at call time.
+    ///
+    /// `clock.sourceTime` follows the same picture but is published at 10 Hz on the AVPlayer routes
+    /// and 4 Hz on the software path, too coarse for an overlay redrawn every display frame (libass
+    /// subtitles end on a scene cut). This applies the same fold as `clock.sourceTime` on every route,
+    /// so the two agree between ticks. Nil on the audio path and without a session.
+    ///
+    /// Unlike `clock.sourceTime` it does not hold across a seek: while `sourceTimeFollowsPicture` is
+    /// false, or before the software clock arms, it can read the target or zero. Prefer
+    /// `clock.sourceTime` in those windows.
+    public var presentedSourceTime: Double? {
+        let seconds: Double
+        switch videoRoute {
+        case .software:
+            guard let timebase = softwarePresentationTimebase else { return nil }
+            seconds = CMTimebaseGetTime(timebase).seconds
+        case .loopback:
+            guard let item = currentAVPlayer?.currentTime().seconds, item.isFinite else { return nil }
+            let shift = presentationAxis.shiftSeconds(atItemSeconds: item) ?? playlistShiftSeconds
+            seconds = Self.loopbackSourceSeconds(renderedItemSeconds: item, shift: shift,
+                                                 displayAxisIsItemAxis: displayAxisIsItemAxis)
+        case .remoteBypass:
+            guard let item = currentAVPlayer?.currentTime().seconds, item.isFinite else { return nil }
+            seconds = Self.remoteHLSSourceSeconds(renderedItemSeconds: item, itemOffset: remoteHLSItemOffset)
+        case .audio, .none:
+            return nil
+        }
+        return seconds.isFinite ? seconds : nil
+    }
+
+    /// The loopback fold of an AVPlayer rendered position onto the source axis, shared by
+    /// `clock.sourceTime` and `presentedSourceTime`.
+    nonisolated static func loopbackSourceSeconds(renderedItemSeconds item: Double, shift: Double,
+                                      displayAxisIsItemAxis: Bool) -> Double {
+        displayAxisIsItemAxis ? item : item + shift
+    }
+
+    /// AE#616: item time, less what the injected renditions measured it leads the picture by.
+    nonisolated static func remoteHLSSourceSeconds(renderedItemSeconds item: Double, itemOffset: Double) -> Double {
+        max(0, item - itemOffset)
+    }
 }

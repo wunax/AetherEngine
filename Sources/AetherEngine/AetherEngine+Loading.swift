@@ -420,8 +420,8 @@ extension AetherEngine {
         host.$renderedTime
             .sink { [weak self] value in
                 guard let self else { return }
-                // AE#616: item time, less what the injected renditions measured it leads the picture by.
-                self.clock.sourceTime = max(0, value - self.remoteHLSItemOffset)
+                self.clock.sourceTime = Self.remoteHLSSourceSeconds(renderedItemSeconds: value,
+                                                                    itemOffset: self.remoteHLSItemOffset)
                 // Feed the playhead mirror the remote-HLS audio tap (#95) reads off its ingest task;
                 // shift 0 on this path, so the rendered position is the source-PTS playhead.
                 self.renderedPositionMirror.set(value)
@@ -1558,7 +1558,8 @@ extension AetherEngine {
                 // would break both the documented `sourceTime == currentTime in steady play` relation
                 // and host-rendered sidecar cues (whose times are relative to the archive start, i.e.
                 // the item axis). Every other source keeps true source PTS for cue alignment.
-                self.clock.sourceTime = self.displayAxisIsItemAxis ? value : value + shift
+                self.clock.sourceTime = Self.loopbackSourceSeconds(renderedItemSeconds: value, shift: shift,
+                                                                   displayAxisIsItemAxis: self.displayAxisIsItemAxis)
                 // bufferedPosition = the end of the contiguous safe range (origin -> disk), expressed on
                 // the display axis as the playhead plus contiguously available seconds ahead of it: the
                 // segments AVPlayer already fetched, plus the disk SegmentCache band above them, which is
