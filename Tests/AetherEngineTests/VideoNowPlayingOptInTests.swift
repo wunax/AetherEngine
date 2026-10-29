@@ -1,3 +1,4 @@
+import MediaPlayer
 import Testing
 @testable import AetherEngine
 
@@ -79,4 +80,30 @@ struct VideoNowPlayingOptInTests {
         #expect(engine.pendingVideoNowPlayingInfo.isEmpty)
     }
     #endif
+
+    // MARK: - Card held across the background teardown
+
+    @Test("The held card keeps the identity and shows a paused position")
+    func heldCardKeepsIdentity() {
+        let info = NativeAVPlayerHost.heldNowPlayingInfo(
+            identity: [MPMediaItemPropertyTitle: "Title"], elapsed: 1060.5, duration: 2862.9)
+        #expect(info[MPMediaItemPropertyTitle] as? String == "Title")
+        #expect(info[MPNowPlayingInfoPropertyElapsedPlaybackTime] as? Double == 1060.5)
+        #expect(info[MPNowPlayingInfoPropertyPlaybackRate] as? Double == 0)
+        #expect(info[MPMediaItemPropertyPlaybackDuration] as? Double == 2862.9)
+    }
+
+    @Test("A held card without a duration shows no progress bar")
+    func heldCardWithoutDuration() {
+        let info = NativeAVPlayerHost.heldNowPlayingInfo(identity: [:], elapsed: 12, duration: 0)
+        #expect(info[MPMediaItemPropertyPlaybackDuration] == nil)
+    }
+
+    @Test("A held card never publishes a non-finite or negative position")
+    func heldCardClampsPosition() {
+        #expect(NativeAVPlayerHost.heldNowPlayingInfo(identity: [:], elapsed: .nan, duration: 10)[
+            MPNowPlayingInfoPropertyElapsedPlaybackTime] as? Double == 0)
+        #expect(NativeAVPlayerHost.heldNowPlayingInfo(identity: [:], elapsed: -3, duration: 10)[
+            MPNowPlayingInfoPropertyElapsedPlaybackTime] as? Double == 0)
+    }
 }

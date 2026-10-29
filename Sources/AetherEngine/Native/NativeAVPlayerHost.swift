@@ -2,9 +2,7 @@ import Foundation
 import AVFoundation
 import AVKit
 import Combine
-#if os(tvOS) || os(iOS)
 import MediaPlayer
-#endif
 #if os(iOS) || os(tvOS) || os(visionOS)
 import UIKit
 #endif
@@ -363,6 +361,9 @@ final class NativeAVPlayerHost {
     /// Whether this host owns a Now-Playing session (see `nowPlayingSession`).
     let ownsNowPlayingSession: Bool
 
+    /// True while `holdNowPlayingCard` publishes the card by hand, until the next item is loaded.
+    private var holdsNowPlayingCard = false
+
     init(ownsNowPlayingSession: Bool = false,
          diagnosticPool: ItemDiagnosticReadPool = .shared,
          diagnosticRead: @escaping AVPlayerItemDiagnostics.Read = ItemDiagnosticSnapshot.read) {
@@ -405,6 +406,47 @@ final class NativeAVPlayerHost {
         guard ownsNowPlayingSession else { return }
         playerItem?.nowPlayingInfo = info.isEmpty ? nil : info
         #endif
+    }
+
+    /// Keep the system card while the host has no item, after the background teardown unloaded it.
+    ///
+    /// The session publishes from the player, so with no item it published an empty card in the
+    /// stopped state: no title, no artwork, no position, until a resume from that card rebuilt the
+    /// session. Auto-publish is suspended and the staged identity is written with the position the
+    /// session paused at; the next `load` hands publishing back to the player. No-op when no session
+    /// is owned.
+    func holdNowPlayingCard(elapsed: Double, duration: Double) {
+        #if os(tvOS) || os(iOS)
+        guard let session = nowPlayingSession else { return }
+        session.automaticallyPublishesNowPlayingInfo = false
+        session.nowPlayingInfoCenter.nowPlayingInfo = Self.heldNowPlayingInfo(
+            identity: pendingNowPlayingInfo, elapsed: elapsed, duration: duration)
+        session.nowPlayingInfoCenter.playbackState = .paused
+        holdsNowPlayingCard = true
+        #endif
+    }
+
+    private func releaseHeldNowPlayingCard() {
+        #if os(tvOS) || os(iOS)
+        guard holdsNowPlayingCard, let session = nowPlayingSession else { return }
+        holdsNowPlayingCard = false
+        session.automaticallyPublishesNowPlayingInfo = true
+        #endif
+    }
+
+    /// The held card: the staged identity plus a paused position. A duration of 0 (live, or not yet
+    /// known) is left out rather than shown as an empty bar.
+    nonisolated static func heldNowPlayingInfo(
+        identity: [String: Any], elapsed: Double, duration: Double
+    ) -> [String: Any] {
+        var info = identity
+        let position: Double = elapsed.isFinite ? max(0, elapsed) : 0
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = position
+        info[MPNowPlayingInfoPropertyPlaybackRate] = 0.0
+        if duration.isFinite, duration > 0 {
+            info[MPMediaItemPropertyPlaybackDuration] = duration
+        }
+        return info
     }
 
     // No deinit cleanup: under Swift 6 strict concurrency the deinit
@@ -623,6 +665,7 @@ final class NativeAVPlayerHost {
             item.nowPlayingInfo = pendingNowPlayingInfo.isEmpty ? nil : pendingNowPlayingInfo
         }
         #endif
+        releaseHeldNowPlayingCard()
         // #293: run the carriage probe alongside the mount. Nothing is serialized in front of first
         // frame; a healthy stream's watchdog disarms and cancels it, an unjudgeable one has its verdict
         // ready by the time the watchdog arms.

@@ -8476,7 +8476,9 @@ public final class AetherEngine: ObservableObject {
             + "(backend=\(playbackBackend), state=\(state))",
             category: .engine)
         let teardownStart = DispatchTime.now()
+        let card = nowPlayingCardBeforeBackgroundTeardown()
         stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
+        nativeHost?.holdNowPlayingCard(elapsed: card.elapsed, duration: card.duration)
         releaseSubtitleProxyForBackground()
         // Session torn down; host will reload + repause on foreground return.
         state = .paused
@@ -8487,6 +8489,12 @@ public final class AetherEngine: ObservableObject {
             + "\(String(format: "%.0f", teardownMs))ms; the audio session and the native host "
             + "shell stay",
             category: .engine)
+    }
+
+    /// What the held Now-Playing card shows once the background teardown has unloaded the item, read
+    /// before `stopInternal` resets it. A live session has no duration to show.
+    private func nowPlayingCardBeforeBackgroundTeardown() -> (elapsed: Double, duration: Double) {
+        (currentTime, isLive ? 0 : duration)
     }
 
     /// AE#597: `stopInternal` does not touch the proxy, so without this its loopback socket rides
@@ -8634,7 +8642,9 @@ public final class AetherEngine: ObservableObject {
         if isBackgrounded, currentBackgroundAction() == .teardownVideo {
             EngineLog.emit("[AetherEngine] background grace assertion expired early, synchronous teardown (#127)", category: .engine)
             captureBackgroundTeardownSelection()   // #357, as in teardownVideoForBackground
+            let card = nowPlayingCardBeforeBackgroundTeardown()
             stopInternal(resetDisplayCriteria: false, keepNativeHost: true, keepCustomReader: true)
+            nativeHost?.holdNowPlayingCard(elapsed: card.elapsed, duration: card.duration)
             releaseSubtitleProxyForBackground()
             state = .paused
         }

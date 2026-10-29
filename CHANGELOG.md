@@ -102,6 +102,13 @@ the public-API contract.
 
 ### Fixed
 
+- **The Now-Playing card keeps its title, artwork and position after the paused-background teardown.**
+  With `ownsVideoNowPlayingSession`, the session publishes from the player, and the teardown that
+  releases a paused session's video in the background (#127) leaves the player without an item: the
+  card in Control Center and on the lock screen went to a blank, stopped state until a resume from it
+  rebuilt the session. The host now publishes the staged identity with the paused position and
+  duration by hand while it has no item, and hands publishing back to the player on the next load.
+
 - **A pump that cannot keep up on the efficiency class stops dropping to it (#850, thanks @imbenjamin).**
   The AE#286 relaxation moved the segment pump to `.utility` once it was 16 s ahead, on the
   assumption that it still produces faster than real time there. A 4K Dolby Vision remux with
