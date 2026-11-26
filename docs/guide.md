@@ -740,6 +740,13 @@ It uses [SMBClient](https://github.com/kishikawakatsumi/SMBClient) (MIT, pure Sw
 - **Known limit:** SMBClient negotiates only SMB 2.0.2 and 2.1. There is no SMB3 transport encryption or AES-CMAC signing, so servers set to SMB3-only or `smb encrypt = required` do not connect. (libsmb2 spoke 3.1.1, but does not work on tvOS / iOS at all.)
 - **How it reads:** `SMBConnection` is a `ByteRangeSource`, and `SMBIOReader` adapts it to the engine's `IOReader`. Each synchronous read on the demux thread waits on a semaphore for SMBClient's async API, which gives a clean happens-before edge between the two. The connection is persistent (`SMBClient` plus a `FileReader`), and reads are serialised per connection. That comfortably keeps up with typical media bitrates.
 
+## Display sleep
+
+The engine keeps the display awake while a video plays, on every platform and on both paths, and lets it sleep again on pause, at the end and on `stop()`. Your app does not need its own power assertion or `isIdleTimerDisabled`.
+
+- **Native path:** the engine sets `preventsDisplaySleepDuringVideoPlayback` on its `AVPlayer`. iOS and tvOS default to it; macOS does not.
+- **Software path:** the display layer does the same.
+
 ## Now Playing
 
 ```swift
