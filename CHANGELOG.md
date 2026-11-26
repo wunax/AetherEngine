@@ -21,6 +21,12 @@ the public-API contract.
 
 ### Fixed
 
+- **The Mac display no longer sleeps during native playback.** On macOS, `AVPlayer` leaves
+  `preventsDisplaySleepDuringVideoPlayback` off by default, and the native host never set it, so no
+  display-sleep assertion was held and the screen dimmed and went dark after the idle delay mid-film. The
+  native player now sets it, as iOS and tvOS do by default. The software path already held one through its
+  display layer.
+
 - **Upscaled and tone-mapped frames keep their colour on the right spot.** The frame chain (line art,
   tone map), the MetalFX conversion and the Lanczos scaler treated every frame's chroma as centred.
   Most video has it on the left luma column (the H.264 and HEVC default), so at 2x a colour edge came out

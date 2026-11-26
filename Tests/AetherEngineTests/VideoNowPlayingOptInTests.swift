@@ -20,6 +20,11 @@ struct VideoNowPlayingOptInTests {
         #expect(!NativeAVPlayerHost().ownsNowPlayingSession)
     }
 
+    @Test("The native player keeps the display awake while it plays")
+    func nativePlayerPreventsDisplaySleep() {
+        #expect(NativeAVPlayerHost().avPlayer.preventsDisplaySleepDuringVideoPlayback)
+    }
+
     @Test("A host owns one only when asked")
     func hostOwnsWhenAsked() {
         #expect(NativeAVPlayerHost(ownsNowPlayingSession: true).ownsNowPlayingSession)

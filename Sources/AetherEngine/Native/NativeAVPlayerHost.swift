@@ -451,6 +451,10 @@ final class NativeAVPlayerHost {
         self.diagnosticPool = diagnosticPool
         self.diagnosticRead = diagnosticRead
         let player = AVPlayer()
+        #if os(macOS)
+        // iOS and tvOS default to true; macOS defaults to false, so the display slept mid-film.
+        player.preventsDisplaySleepDuringVideoPlayback = true
+        #endif
         // Keep automaticallyWaitsToMinimizeStalling at default true: false caused permanent startup stall on 4K HEVC (rate dropped to 0 after asset.load and never resumed).
         self.avPlayer = player
         self.playerLayer = AVPlayerLayer(player: player)
