@@ -4,8 +4,9 @@ import AetherLibavcodec
 import AetherLibavutil
 
 /// Demux-thread-only admission before software clock folding, recording, and DVR storage.
-/// Owns quarantined packets; the caller owns each returned packet.
-final class LiveReplayPacketReader {
+/// Owns quarantined packets; the caller owns each returned packet. A single source worker owns
+/// every operation; unchecked Sendable permits transferring that ownership to its read closure.
+final class LiveReplayPacketReader: @unchecked Sendable {
     enum Failure: LocalizedError {
         case interruptedReplay
         var errorDescription: String? { "Live source ended or diverged during verified replay." }
@@ -43,7 +44,7 @@ final class LiveReplayPacketReader {
     private func free(_ packets: [Pending]) {
         for entry in packets {
             var packet: UnsafeMutablePointer<AVPacket>? = entry.packet
-            av_packet_free(&packet)
+            trackedPacketFree(&packet)
         }
     }
 
@@ -120,7 +121,7 @@ final class LiveReplayPacketReader {
             }
             guard isCurrent() else {
                 var stale: UnsafeMutablePointer<AVPacket>? = packet
-                av_packet_free(&stale)
+                trackedPacketFree(&stale)
                 reset()
                 return nil
             }
@@ -142,7 +143,7 @@ final class LiveReplayPacketReader {
             }
             if decision?.drop == true, !guardState.isDroppingReplay, decision?.event == nil {
                 var duplicate: UnsafeMutablePointer<AVPacket>? = packet
-                av_packet_free(&duplicate)
+                trackedPacketFree(&duplicate)
                 continue
             }
             let untimedBoundaryVideo = guardState.isHoldingDamagedBoundary && signature == nil && index == videoIndex

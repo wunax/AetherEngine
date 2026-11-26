@@ -15,8 +15,10 @@ import AVFoundation
 /// player plays or waits to play an item `playsAPAC` accepts (and for a short grace after a pause,
 /// see #848), and is released otherwise, since a prerolled E-AC-3 stream would compete with other audio.
 ///
-/// It runs only for TrueHD Atmos rendered to APAC: a DTS:X programme is not Dolby Atmos, and the
-/// receiver must not say it is.
+/// It runs for every rendered bed, TrueHD Atmos and DTS:X alike. tvOS carries a bed with heights over
+/// HDMI only as Dolby MAT, so a DTS:X bed that reaches the receiver intact shows as Dolby Atmos either
+/// way; without the stream a Sonos with Continuous Audio off stayed on stereo PCM for a DTS:X
+/// programme rendered to PCM.
 ///
 /// #834: it runs only while every output port is HDMI. On an AirPlay route there is no sink indicator
 /// to light, and a second unmuted player restarting beside the programme on every resume left a
@@ -33,11 +35,16 @@ import AVFoundation
 /// `AVSampleBufferAudioRenderer`, and an Apple TV 4K (tvOS 26.6) whose receiver showed Atmos for the
 /// AVPlayer route's APAC did not show it for the same title's APAC on that renderer. There the activator
 /// follows the host's transport instead of a player (`attachRenderer`).
+///
+/// #1081: the player that loops the stream exists only while the stream is wanted. A paused, emptied
+/// player that had played it kept an Apple TV 4K's HDMI route (tvOS 27.3) in its 32-channel layout
+/// after `stop()`, and the next title's 5.1 PCM reached the receiver as Dolby Atmos for as long as the
+/// engine lived. A fresh engine for the same title played it as multichannel PCM.
 @MainActor
 final class AtmosOutputActivator {
     static let silentAtmosStream = Bundle.module.url(forResource: "silent-atmos", withExtension: "mp4")!
 
-    private let player = AVQueuePlayer()
+    private var player: AVQueuePlayer?
     private var looper: AVPlayerLooper?
     private weak var host: AVPlayer?
     private var playsAPAC: @MainActor (AVPlayerItem) -> Bool = { _ in false }
@@ -59,7 +66,6 @@ final class AtmosOutputActivator {
     ) {
         self.outputPortTypes = outputPortTypes
         self.pauseGrace = pauseGrace
-        player.automaticallyWaitsToMinimizeStalling = false
     }
 
     /// True only for a route whose every output is HDMI: the sink the stream exists for. An empty
@@ -181,14 +187,23 @@ final class AtmosOutputActivator {
         }
         pauseAfterGrace?.cancel()
         pauseAfterGrace = nil
-        if looper == nil {
-            looper = AVPlayerLooper(player: player, templateItem: AVPlayerItem(url: Self.silentAtmosStream))
-        }
+        let player = player ?? makePlayer()
         player.play()
     }
 
+    private func makePlayer() -> AVQueuePlayer {
+        let player = AVQueuePlayer()
+        player.automaticallyWaitsToMinimizeStalling = false
+        looper = AVPlayerLooper(player: player, templateItem: AVPlayerItem(url: Self.silentAtmosStream))
+        self.player = player
+        return player
+    }
+
     /// True while the silent stream is playing.
-    var isPlayingStream: Bool { player.rate != 0 }
+    var isPlayingStream: Bool { (player?.rate ?? 0) != 0 }
+
+    /// True while the activator holds a player for the stream, paused or not (#1081).
+    var holdsStreamPlayer: Bool { player != nil }
 
     private func holdThroughPause() {
         guard isPlayingStream, pauseAfterGrace == nil else { return }
@@ -196,18 +211,19 @@ final class AtmosOutputActivator {
             try? await Task.sleep(for: pauseGrace)
             guard !Task.isCancelled, let self else { return }
             self.pauseAfterGrace = nil
-            self.player.pause()
+            self.player?.pause()
         }
     }
 
     private func release() {
         pauseAfterGrace?.cancel()
         pauseAfterGrace = nil
-        guard let looper else { return }
+        guard let player else { return }
         player.pause()
-        looper.disableLooping()
-        self.looper = nil
+        looper?.disableLooping()
+        looper = nil
         player.removeAllItems()
+        self.player = nil
     }
 
     private nonisolated static func onMain(_ body: @escaping @MainActor @Sendable () -> Void) {
@@ -222,9 +238,9 @@ final class AtmosOutputActivator {
 extension AetherEngine {
     /// tvOS only: the switch is an HDMI one, and on iOS and macOS a second unmuted player beside the
     /// engine's would compete with it for Now Playing and the audio session for no gain. Follows the
-    /// engine's `AVPlayer` while it plays TrueHD Atmos as APAC, or else a software host whose renderer
-    /// receives Dolby Atmos (TrueHD Atmos as APAC, or compressed E-AC-3 JOC). DTS:X rendered to APAC is
-    /// not Dolby Atmos and the PCM decode has no Atmos, so neither brings the receiver to Dolby Atmos.
+    /// engine's `AVPlayer` while it plays a rendered bed (TrueHD Atmos or DTS:X, APAC or PCM), or else a
+    /// software host whose renderer receives a rendered bed or compressed E-AC-3 JOC. The PCM decode of
+    /// a source has no heights to bring across and never runs it.
     func followAtmosOutput() {
         #if os(tvOS)
         if let player = currentAVPlayer {
@@ -232,9 +248,9 @@ extension AetherEngine {
             atmosOutputActivator = activator
             activator.attach(to: player) { [weak self] _ in
                 guard let session = self?.nativeVideoSession else { return false }
-                return session.audioIsRenderedBed && session.audioBedIsFromDolbyAtmos
+                return session.audioIsRenderedBed
             }
-        } else if let host = softwareHost, host.audioRouteCarriesDolbyAtmos {
+        } else if let host = softwareHost, host.audioRouteTakesAtmosActivator {
             let activator = atmosOutputActivator ?? AtmosOutputActivator()
             atmosOutputActivator = activator
             activator.attachRenderer { [weak self, weak host] in

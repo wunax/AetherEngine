@@ -273,7 +273,14 @@ struct TrickleWatchdogTests {
 
         try await waitFor { reader.trickleEndCountForTesting > 0 || progress.done }
         try #require(reader.trickleEndCountForTesting > 0, "the read finished without a trickle end")
-        let detectedAfter = Date().timeIntervalSince(dripStartedAt)
+        // Timed by the origin, which stamps the replacement on its own thread as it arrives. Reading
+        // the clock here measured this task's wait for a turn instead: on the one-thread pool it saw
+        // the end 31 s late against a 25.7 s bound (ci-extended, 2026-11-25).
+        let isReplacement: (Int64) -> Bool = { $0 > dripOffset && $0 < dripOffset + 1024 * 1024 }
+        try await waitFor { origin.requests.contains { isReplacement($0.start) } || progress.done }
+        let replacedAt = try #require(origin.requests.first { isReplacement($0.start) }?.at,
+                                      "no replacement request after the trickle end")
+        let detectedAfter = replacedAt.timeIntervalSince(dripStartedAt)
         // Nominally two thresholds (one starved period, then the next tick). The bound is what the
         // drip would need to finish the read on its own, halved: a multiple of the threshold was
         // a wall-clock budget, and a runner that froze every test for a second spent it (10.97 s
@@ -295,14 +302,17 @@ struct TrickleWatchdogTests {
           .timeLimit(.minutes(3)))
     func healthyStreamIsLeftAlone() async throws {
         let dripOffset = Self.dripOffset
-        // 64 KB every 20 ms, about 3 MB/s: well above the floor, and slow enough that one 4 MB read
-        // waits several stall periods, which is the state the verdict is evaluated in.
+        // A 2 s period instead of the suite's 0.5 s: a loaded runner froze the origin past 0.5 s, the
+        // delivery-gap watchdog rightly replaced the connection, and this test read that as a false
+        // trickle verdict (CI, 2026-11-16). The floor scales with the period (about 100 KB/s here).
+        // 64 KB every 50 ms, about 1.3 MB/s: well above that floor, and slow enough that each 4 MB
+        // read waits past a full period, which is the state the verdict is evaluated in.
         let originMaybe = PacedOrigin(totalSize: Self.totalSize, pace: { start, _ in
-            start == dripOffset ? .drip(bytes: 64 * 1024, everyUs: 20_000) : .fast
+            start == dripOffset ? .drip(bytes: 64 * 1024, everyUs: 50_000) : .fast
         })
         let origin = try #require(originMaybe)
         defer { origin.stop() }
-        let reader = Self.makeReader(origin)
+        let reader = Self.makeReader(origin, stallTimeout: 2)
         defer { reader.markClosed(); reader.close() }
         try reader.open()
         try await waitFor { !reader.hasLiveConnectionForTesting }
@@ -335,11 +345,16 @@ struct TrickleWatchdogTests {
         #expect(drawn == 64 * 1024)
         try await waitFor { origin.requests.contains { $0.start == dripOffset } }
 
-        let ended = try await waitFor(upTo: .seconds(8 * Self.stallTimeout)) {
-            reader.trickleEndCountForTesting > 0 || !reader.hasLiveConnectionForTesting
+        // The trickle verdict is under test. A drip a starved runner delivers more than the 0.5 s
+        // threshold late ends the connection through the gap watchdog instead, so that path gets a
+        // tolerance rather than a zero (same reasoning as the live case below).
+        let judged = try await waitFor(upTo: .seconds(8 * Self.stallTimeout)) {
+            reader.trickleEndCountForTesting > 0
         }
-        #expect(!ended, "a drip nobody was waiting on was ended")
+        #expect(!judged, "a drip nobody was waiting on was ended as a trickle")
         #expect(reader.trickleEndCountForTesting == 0)
+        #expect(reader.deliveryGapEndCountForTesting <= 2,
+                "the drip was ended \(reader.deliveryGapEndCountForTesting) times by the gap watchdog")
     }
 
     /// A raw live source arrives at its own bitrate, so a read waits on forward data almost all the
@@ -359,14 +374,25 @@ struct TrickleWatchdogTests {
         defer { reader.markClosed(); reader.close() }
         try reader.open()
 
-        // One AVIO-sized read takes about 13 s at this rate, so it stays blocked on forward data for
-        // the whole observation, which is the state the verdict is evaluated in.
+        // 256 KB takes about 13 s at this rate, and the loop reads again as soon as a read returns
+        // (live reads return short since AE#1076), so a read waits on forward data for the whole
+        // observation, which is the state the verdict is evaluated in.
         _ = Self.startReading(reader, bytes: 256 * 1024)
-        let ended = try await waitFor(upTo: .seconds(8 * Self.stallTimeout)) {
-            reader.trickleEndCountForTesting > 0 || origin.requests.count > 1
+        // The trickle verdict is under test. A drip that lands more than the 0.5 s stall threshold
+        // late (a starved runner) ends the connection through the gap watchdog, which is that
+        // watchdog doing its job, so one replacement proves nothing (CI, 2026-11-24: requests
+        // [0, 4096] after 0.8 s, no trickle verdict). A gap path that ended a healthy drip as a
+        // rule would do it about eight times in this window, which the bound below still catches.
+        let judged = try await waitFor(upTo: .seconds(8 * Self.stallTimeout)) {
+            reader.trickleEndCountForTesting > 0
         }
-        #expect(!ended, "a low-bitrate live connection was replaced: \(origin.requests.map(\.start))")
+        #expect(!judged, """
+            a low-bitrate live connection was ended as a trickle: requests \
+            \(origin.requests.map(\.start)), gap ends \(reader.deliveryGapEndCountForTesting)
+            """)
         #expect(reader.trickleEndCountForTesting == 0)
+        #expect(reader.deliveryGapEndCountForTesting <= 2,
+                "the live drip was ended \(reader.deliveryGapEndCountForTesting) times by the gap watchdog")
     }
 
     @Test("a held connection parked on a full window with zero delivery is not judged",
@@ -439,6 +465,10 @@ struct TrickleWatchdogTests {
     @Test("an origin that trickles on every connection is replaced like a silent one",
           .timeLimit(.minutes(3)))
     func perpetualTrickleMatchesTheGapPath() async throws {
+        // A 2 s period, as in the tests above: on a loaded runner the origin stamped one request
+        // late, the reader timed its threshold from its own clock, and two replacements read 0.38 s
+        // apart against 0.5 s (CI, 2026-11-23). A real pacing defect shows gaps near zero.
+        let stallTimeout: TimeInterval = 2
         let dripOffset = Self.dripOffset
         let totalSize = Self.totalSize
         let region: (Int64) -> Bool = { $0 >= dripOffset && $0 < dripOffset + 8 * 1024 * 1024 }
@@ -449,14 +479,14 @@ struct TrickleWatchdogTests {
             })
             let origin = try #require(originMaybe)
             defer { origin.stop() }
-            let reader = Self.makeReader(origin)
+            let reader = Self.makeReader(origin, stallTimeout: stallTimeout)
             defer { reader.markClosed(); reader.close() }
             try reader.open()
             try await waitFor { !reader.hasLiveConnectionForTesting }
             let progress = Self.startReading(reader, bytes: Int(Self.firstRange) + 4 * 1024 * 1024)
             try await waitFor { origin.requests.contains { region($0.start) } }
             // Ten thresholds: room for several replacements, and for any backoff or give-up to show.
-            _ = try await waitFor(upTo: .seconds(10 * Self.stallTimeout)) { progress.done }
+            _ = try await waitFor(upTo: .seconds(10 * stallTimeout)) { progress.done }
             return (origin.requests.filter { region($0.start) }.map(\.at),
                     progress.done, reader.trickleEndCountForTesting)
         }
@@ -473,9 +503,9 @@ struct TrickleWatchdogTests {
         // same way, which is the point of the comparison.
         #expect(trickle.starts.count >= 2 && silent.starts.count >= 2)
         // Not faster than the reference: each replacement waits out a full threshold.
-        #expect(minGap(trickle.starts) >= 0.8 * Self.stallTimeout,
+        #expect(minGap(trickle.starts) >= 0.8 * stallTimeout,
                 "trickle replacements \(minGap(trickle.starts))s apart, under the threshold")
-        #expect(minGap(silent.starts) >= 0.8 * Self.stallTimeout)
+        #expect(minGap(silent.starts) >= 0.8 * stallTimeout)
         #expect(trickle.starts.count <= silent.starts.count + 2,
                 "trickle: \(trickle.starts.count) requests, silent: \(silent.starts.count)")
         // Same give-up as the silent origin.

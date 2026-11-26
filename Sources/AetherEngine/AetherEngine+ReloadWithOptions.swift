@@ -46,9 +46,10 @@ extension AetherEngine {
     /// rebuild, so the internal reopens that follow (audio switch, background reload) replay the
     /// correction rather than reverting to the load-time value.
     ///
-    /// Unlike `reloadAtCurrentPosition()`, which returns silently when there is nothing to rebuild,
-    /// this one throws `AetherEngineError.sessionNotReloadable`: a host correcting a session needs
-    /// to tell "corrected" from "did nothing" to decide whether to fall through to a fresh load.
+    /// Unlike `reloadAtCurrentPosition()`, which returns silently when a URL source has no session
+    /// to rebuild (it throws only for a custom source, AE#526), this one always throws
+    /// `AetherEngineError.sessionNotReloadable`: a host correcting a session needs to tell
+    /// "corrected" from "did nothing" to decide whether to fall through to a fresh load.
     ///
     /// A correction whose every changed field is the session's own (`autoplay`) is answered without
     /// a rebuild: there is nothing for one to carry, and the teardown it used to spend was a visible
@@ -127,7 +128,7 @@ extension AetherEngine {
                 record: sourceDVProfile, rpu: sourceDolbyVisionRPUProfile) ?? sourceDVProfile
         ) {
             EngineLog.emit(
-                "[AetherEngine] DV P7 dual-layer: preferDualLayerDolbyVision / dolbyVisionHandling correction refused, "
+                "[AetherEngine] DV P7 dual-layer: preferDualLayerDolbyVision / dualLayerRoute / dolbyVisionHandling correction refused, "
                 + "\(refusal.rawValue): a custom source keeps the route it was loaded with; load() it "
                 + "again with the new option",
                 category: .engine
@@ -140,8 +141,32 @@ extension AetherEngine {
             isCustomSource: isCustomSource, current: loadedOptions, proposed: proposed
         ) {
             EngineLog.emit(
-                "[AetherEngine] upscalesLowResolutionVideo correction refused, \(refusal.rawValue): a custom "
+                "[AetherEngine] upscalesLowResolutionVideo / upscaleScaler / upscalesFullHDVideo correction refused, \(refusal.rawValue): a custom "
                 + "source keeps the route it was loaded with; load() it again with the new option",
+                category: .engine
+            )
+            throw AetherEngineError.sessionNotReloadable(refusal)
+        }
+
+        // #957: the same shape for the picture processing.
+        if let refusal = SessionOptionCorrection.videoProcessingRouteRefusal(
+            isCustomSource: isCustomSource, current: loadedOptions, proposed: proposed
+        ) {
+            EngineLog.emit(
+                "[AetherEngine] videoProcessing correction refused, \(refusal.rawValue): a custom source keeps "
+                + "the route it was loaded with; load() it again with the new option",
+                category: .engine
+            )
+            throw AetherEngineError.sessionNotReloadable(refusal)
+        }
+
+        // AE#1103: the same shape for the untagged colour reading.
+        if let refusal = SessionOptionCorrection.untaggedVideoColorRefusal(
+            isCustomSource: isCustomSource, current: loadedOptions, proposed: proposed
+        ) {
+            EngineLog.emit(
+                "[AetherEngine] untaggedVideoColor correction refused, \(refusal.rawValue): a custom source keeps "
+                + "the route it was loaded with; load() it again with the new option",
                 category: .engine
             )
             throw AetherEngineError.sessionNotReloadable(refusal)
@@ -155,9 +180,10 @@ extension AetherEngine {
         // naming it in the applied line was the last way left for a correction to read as done when
         // it was not. The transport is the session's own unless a background teardown left it none
         // to read, which is the condition `reloadAtCurrentPosition` makes the same call on.
-        let (applied, sessionOwned) = SessionOptionCorrection.partitionChanges(
-            changed, sessionOwnsTransport: backgroundTeardownSelection == nil)
-        if !applied.isEmpty || sessionOwned.isEmpty {
+        let resumesTornDownSession = backgroundTeardownSelection != nil
+        let (applied, sessionOwned, loadDecided) = SessionOptionCorrection.partitionChanges(
+            changed, sessionOwnsTransport: !resumesTornDownSession)
+        if !applied.isEmpty || (sessionOwned.isEmpty && (loadDecided.isEmpty || resumesTornDownSession)) {
             EngineLog.emit(
                 applied.isEmpty
                     ? "[AetherEngine] #460: reload applying no option change (session already on these options)"
@@ -170,6 +196,14 @@ extension AetherEngine {
                 "[AetherEngine] #460: \(sessionOwned.joined(separator: ", ")) not applied, the session "
                 + "owns it: the rebuild comes back in the transport state the session is in, not the one "
                 + "a mount was given (AE#464 round 2). Call play() / pause() to change it",
+                category: .engine
+            )
+        }
+        if !loadDecided.isEmpty {
+            EngineLog.emit(
+                "[AetherEngine] #460: \(loadDecided.joined(separator: ", ")) not applied to this session: the "
+                + "load decided it together with the display rate it asked for, and a rebuild keeps that "
+                + "decision (#853). It takes effect at the next load",
                 category: .engine
             )
         }
@@ -188,14 +222,19 @@ extension AetherEngine {
         // (#357), and there the field is `applied` rather than session-owned, so it never arrives
         // here. `changed.isEmpty` is NOT this case and keeps rebuilding: a correction that changed
         // nothing is a documented way to ask for the rebuild itself.
-        if applied.isEmpty, !sessionOwned.isEmpty {
+        // #853: a load-decided field skips the rebuild only while a session is up. After a background
+        // teardown this call IS the restore, and returning here left the host with no picture.
+        if applied.isEmpty, !sessionOwned.isEmpty || (!loadDecided.isEmpty && !resumesTornDownSession) {
             EngineLog.emit(
                 "[AetherEngine] #460: correction complete without a rebuild, every field it changed "
                 + "is the session's own (AE#464 round 4)",
                 category: .engine
             )
+            // #853: a load-decided field is not applied to this session, but the loads the engine makes
+            // from `loadedOptions` later (a title switch, the ingest reroute) must see the correction.
+            if loadDecided.contains("inverseTelecine") { setLoadedInverseTelecine(proposed.inverseTelecine) }
             return SessionOptionCorrectionOutcome(
-                applied: applied, sessionOwned: sessionOwned, rebuilt: false)
+                applied: applied, sessionOwned: sessionOwned + loadDecided, rebuilt: false)
         }
 
         // Install BEFORE the rebuild, not through it: the URL branch carries these options into
@@ -215,14 +254,15 @@ extension AetherEngine {
         endRecordingIfRunning(reason: .sourceReset)
         try await reloadAtCurrentPosition()
         return SessionOptionCorrectionOutcome(
-            applied: applied, sessionOwned: sessionOwned, rebuilt: true)
+            applied: applied, sessionOwned: sessionOwned + loadDecided, rebuilt: true)
     }
 
     /// Why `reloadAtCurrentPosition` would rebuild nothing for this session, or nil when it can
     /// rebuild it (#460).
     ///
-    /// `reloadAtCurrentPosition()` returns silently in both of these cases. Read this to tell that
-    /// silence apart from a rebuild that ran, without having to time one out.
+    /// `reloadAtCurrentPosition()` returns silently for `.noActiveSession` on a URL source and throws
+    /// `sessionNotReloadable` on a custom source (AE#526). Read this to know beforehand, without
+    /// having to time a rebuild out.
     public var sessionReloadRefusal: SessionReloadRefusal? {
         guard loadedURL != nil else { return .noActiveSession }
         if isCustomSource, !customSourceIsSeekable { return .customSourceNotSeekable }
@@ -278,16 +318,29 @@ public enum SessionReloadRefusal: String, Sendable, Equatable, CustomStringConve
     /// side-audio merge lives in the native path's segment producer, so the session would play
     /// silent. Same reachability as `softwarePathCannotRepresentSource`.
     case demuxedAudioLiveIsNativeOnly
-    /// A correction of `preferDualLayerDolbyVision`, or of `dolbyVisionHandling` while the preference is on, on a Profile 7 session that plays from a custom
+    /// A correction of `preferDualLayerDolbyVision`, of `dualLayerRoute` while the preference is on, or of `dolbyVisionHandling` while the preference is on, on a Profile 7 session that plays from a custom
     /// `IOReader` source. The route is decided by `load()`'s probe, which a custom source's in-place
     /// rebuild does not re-run, so the change could not take effect. Call `load()` again with the
     /// new option. URL sources are not affected: their correction re-runs `load()`.
     case dualLayerRouteNeedsFreshLoad
-    /// #846: a correction that turns `upscalesLowResolutionVideo` on for a session that plays from a custom
-    /// `IOReader` source. The route is decided by `load()`, which a custom source's in-place rebuild does
-    /// not re-run, so the change could not take effect. Call `load()` again with the new option. Turning
-    /// it off is honoured in place, and URL sources are not affected: their correction re-runs `load()`.
+    /// #846: a correction that turns `upscalesLowResolutionVideo` or `upscalesFullHDVideo` on, or changes
+    /// `upscaleScaler` while the former is on (AE#1039), for a session that plays from a custom `IOReader` source. The route is decided by
+    /// `load()`, which a custom source's in-place rebuild does not re-run, so the change could not take
+    /// effect. Call `load()` again with the new option. Turning it off is honoured in place, and URL
+    /// sources are not affected: their correction re-runs `load()`.
     case upscaleRouteNeedsFreshLoad
+    /// #957: a correction that turns `videoProcessing` on, or changes its target while it is on, for a
+    /// session that plays from a custom `IOReader` source. The route and the curve are decided by
+    /// `load()`, which a custom source's in-place rebuild does not re-run. Call `load()` again with the new
+    /// option. Turning it off is honoured in place, and URL sources are not affected: their correction
+    /// re-runs `load()`.
+    case videoProcessingRouteNeedsFreshLoad
+    /// AE#1103: a correction that changes `untaggedVideoColor` for a session that plays from a custom
+    /// `IOReader` source. The new description reaches the reopened stream, but the route and the display
+    /// criteria are decided by `load()`, which a custom source's in-place rebuild does not re-run, so the
+    /// panel would not follow. Call `load()` again with the new option. URL sources are not affected:
+    /// their correction re-runs `load()`.
+    case untaggedVideoColorNeedsFreshLoad
 
     public var description: String {
         switch self {
@@ -301,6 +354,10 @@ public enum SessionReloadRefusal: String, Sendable, Equatable, CustomStringConve
             return "the dual-layer Dolby Vision route of a custom source is decided by load(), not by a rebuild"
         case .upscaleRouteNeedsFreshLoad:
             return "the low-resolution upscale route of a custom source is decided by load(), not by a rebuild"
+        case .videoProcessingRouteNeedsFreshLoad:
+            return "the picture processing route of a custom source is decided by load(), not by a rebuild"
+        case .untaggedVideoColorNeedsFreshLoad:
+            return "the colour route of a custom source's untagged stream is decided by load(), not by a rebuild"
         }
     }
 }
@@ -334,17 +391,26 @@ enum SessionOptionCorrection {
     /// which is the half that a host actually reads while its correction is happening.
     static let sessionOwnedFields: [String] = ["autoplay"]
 
-    /// Split what the correction changed into what the reload applies and what the session decides.
+    /// #853: fields the LOAD decides together with the display rate it asks for. Every rebuild keeps the
+    /// session's decision (a session-preserving reload must not move the panel's refresh rate), so a
+    /// correction of one is reported and takes effect at the next load, with or without a transport.
+    static let loadDecidedFields: [String] = ["inverseTelecine"]
+
+    /// Split what the correction changed into what the reload applies, what the session decides, and
+    /// what only the next load decides.
     ///
     /// The transport is the session's own only where the rebuild has one to read. A resume after a
     /// background teardown (#357) has none, so there the mount flag still decides and the field is
     /// applied like any other, which is the same condition `reloadAtCurrentPosition` replays on.
     static func partitionChanges(
         _ changed: [String], sessionOwnsTransport: Bool
-    ) -> (applied: [String], sessionOwned: [String]) {
-        guard sessionOwnsTransport else { return (changed, []) }
-        return (changed.filter { !sessionOwnedFields.contains($0) },
-                changed.filter { sessionOwnedFields.contains($0) })
+    ) -> (applied: [String], sessionOwned: [String], loadDecided: [String]) {
+        let loadDecided = changed.filter { loadDecidedFields.contains($0) }
+        let rest = changed.filter { !loadDecidedFields.contains($0) }
+        guard sessionOwnsTransport else { return (rest, [], loadDecided) }
+        return (rest.filter { !sessionOwnedFields.contains($0) },
+                rest.filter { sessionOwnedFields.contains($0) },
+                loadDecided)
     }
 
     /// Identity fields the proposal changed, in `loadIdentityFields` order. Empty means the
@@ -364,6 +430,11 @@ enum SessionOptionCorrection {
         // accepted and then not happen until something else reopened the source.
         if proposed.heldSourceConnection != current.heldSourceConnection {
             refused.append("heldSourceConnection")
+        }
+        // The role decides which process-wide outputs the session claimed at load (panel, Now
+        // Playing); a rebuild cannot hand them over or give them back.
+        if proposed.sharedOutputRole != current.sharedOutputRole {
+            refused.append("sharedOutputRole")
         }
         return refused
     }
@@ -438,19 +509,45 @@ enum SessionOptionCorrection {
         let preferenceChanged = proposed.preferDualLayerDolbyVision != current.preferDualLayerDolbyVision
         let handlingMovesRoute = proposed.dolbyVisionHandling != current.dolbyVisionHandling
             && proposed.preferDualLayerDolbyVision
-        guard preferenceChanged || handlingMovesRoute else { return nil }
+        let routeMoves = proposed.dualLayerRoute != current.dualLayerRoute && proposed.preferDualLayerDolbyVision
+        guard preferenceChanged || handlingMovesRoute || routeMoves else { return nil }
         return .dualLayerRouteNeedsFreshLoad
     }
 
-    /// Why a correction of `upscalesLowResolutionVideo` cannot be honoured, or nil when it can (#846). A
-    /// custom source's rebuild keeps the session's route, so only turning the option ON is refused there;
-    /// turning it off is honoured, because the next host simply gets no plan.
+    /// Why a correction of `upscalesLowResolutionVideo`, `upscaleScaler` or `upscalesFullHDVideo` cannot be
+    /// honoured, or nil when it can (#846, AE#1039). A custom source's rebuild keeps the session's route and
+    /// plan, so turning either option ON, or switching the scaler while the low-resolution one stays on, is
+    /// refused there; turning one off is honoured, because the next host simply gets no plan.
     static func upscaleRouteRefusal(
         isCustomSource: Bool, current: LoadOptions, proposed: LoadOptions
     ) -> SessionReloadRefusal? {
-        guard isCustomSource, !current.upscalesLowResolutionVideo, proposed.upscalesLowResolutionVideo
-        else { return nil }
+        guard isCustomSource else { return nil }
+        let turnsOn = (proposed.upscalesLowResolutionVideo && !current.upscalesLowResolutionVideo)
+            || (proposed.upscalesFullHDVideo && !current.upscalesFullHDVideo)
+        let switchesScaler = current.upscalesLowResolutionVideo && proposed.upscalesLowResolutionVideo
+            && current.upscaleScaler != proposed.upscaleScaler
+        guard turnsOn || switchesScaler else { return nil }
         return .upscaleRouteNeedsFreshLoad
+    }
+
+    /// Why a correction of `videoProcessing` cannot be honoured, or nil when it can (#957). Same rule as
+    /// `upscaleRouteRefusal`: on a custom source turning it on, or changing the target while it stays on,
+    /// is refused; turning it off is honoured, because the next host simply gets no plan.
+    static func videoProcessingRouteRefusal(
+        isCustomSource: Bool, current: LoadOptions, proposed: LoadOptions
+    ) -> SessionReloadRefusal? {
+        guard isCustomSource, let next = proposed.videoProcessing, next != current.videoProcessing else { return nil }
+        return .videoProcessingRouteNeedsFreshLoad
+    }
+
+    /// Why a correction of `untaggedVideoColor` cannot be honoured, or nil when it can (AE#1103). Any
+    /// change on a custom source is refused, off included: the route and the display criteria the
+    /// session keeps were chosen for the old description, in either direction.
+    static func untaggedVideoColorRefusal(
+        isCustomSource: Bool, current: LoadOptions, proposed: LoadOptions
+    ) -> SessionReloadRefusal? {
+        guard isCustomSource, proposed.untaggedVideoColor != current.untaggedVideoColor else { return nil }
+        return .untaggedVideoColorNeedsFreshLoad
     }
 
     /// Every field the proposal changed, for the log line. Reflection is right here and wrong
@@ -484,18 +581,19 @@ enum SessionOptionCorrection {
     static let knownFields: [String] = [
         "sourceDiagnosticsContext",
         "omitCriteriaColorExtensions", "suppressDisplayCriteria", "displayCriteriaOwner", "httpHeaders", "nativeVideoFrameDiagnostics", "nativeVideoFrameRecovery", "hostRetriesExhaustedLiveReplay",
-        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "dolbyVisionHandling", "preferDualLayerDolbyVision", "upscalesLowResolutionVideo", "matchContentEnabled",
+        "keepDvh1TagWithoutDV", "forceDolbyVisionOnNonDVDisplay", "preferHDR10PlusOverForcedDolbyVision", "dolbyVisionHandling", "untaggedVideoColor", "preferDualLayerDolbyVision", "dualLayerRoute", "foldsDolbyVisionFEL", "upscalesLowResolutionVideo", "upscaleScaler", "upscalesFullHDVideo", "videoProcessing", "matchContentEnabled",
         "panelIsInHDRMode", "attemptsHDRMasterOnUnprovenPanel", "panelPresentsDolbyVision",
-        "audioBridgeMode", "objectAudioRendering", "stereoPresentation", "isLive", "audioOnly",
+        "audioBridgeMode", "objectAudioRendering", "rendersDTSXObjectAudio", "stereoPresentation", "isLive", "audioOnly",
         "dvrWindowSeconds",
-        "softwareDVRRetention",
-        "liveBlockingReload", "liveJoinProfile", "sourceOpenPolicy", "liveStartupGraceSeconds", "liveStartupSingleSegmentMinimumSeconds", "liveEdgeCushionSeconds", "liveJoinStartsImmediately",
-        "clampsLiveResumeToWindow", "nativeRemoteHLS", "nativeRemoteHLSIngestFallback",
-        "preserveASSMarkup", "prepareNativeSubtitles", "eagerNativeSubtitleReaders", "serveIFramePlaylist", "confirmAtmos",
+        "softwareDVRRetention", "liveDVRByteBudget",
+        "liveBlockingReload", "liveJoinProfile", "sourceOpenPolicy", "liveStartupGraceSeconds", "liveStartupSingleSegmentMinimumSeconds", "liveEdgeCushionSeconds", "liveJoinStartsImmediately", "liveJoinsAtPlaylistStart",
+        "clampsLiveResumeToWindow", "nativeRemoteHLS", "nativeRemoteHLSIngestFallback", "nativeRemoteHLSReadinessBudgetSeconds",
+        "preserveASSMarkup", "prepareNativeSubtitles", "recognizesBitmapSubtitleText", "eagerNativeSubtitleReaders", "nativeAudioTrackMenu", "serveIFramePlaylist", "generatesBackgroundScrubPreviews", "confirmAtmos",
         "nativeSubtitlePreferredLanguages", "sequentialOrigin", "maxConcurrentSourceRequests", "heldSourceConnection",
-        "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "skipsContainerAttachments", "preferredAudioLanguages",
-        "preferredSubtitleLanguages", "externalSubtitles", "initialSubtitleTrackID", "forwardBufferSegments", "sessionCacheByteBudget", "softwarePacketCacheStorage", "progressiveSegmentDelivery", "autoplay",
-        "audioDelaySeconds", "audioShaping", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "preferredDecodePath",
-        "escalatesToSoftwarePath", "sharedOutputRole", "isLiveRejoin", "subtitleSessionCarryover",
+        "declaredDurationSeconds", "probesize", "maxAnalyzeDuration", "skipsContainerAttachments", "readsContainerAttachmentsAtOpen", "preferredAudioLanguages",
+        "preferredSubtitleLanguages", "externalSubtitles", "initialSubtitleTrackID", "forwardBufferSegments", "sessionCacheByteBudget", "sessionCacheHardLimitBytes", "sessionCacheFreeReserveBytes", "softwarePacketCacheStorage", "retainsSessionCacheAfterStop", "progressiveSegmentDelivery", "autoplay",
+        "audioDelaySeconds", "audioShaping", "normalizationGainDB", "teletextPage", "deinterlaceMode", "deinterlaceFieldRate", "inverseTelecine", "preferredDecodePath",
+        "escalatesToSoftwarePath", "sharedOutputRole", "isLiveRejoin", "subtitleSessionCarryover", "hlsPlaylistProvenByBody",
+        "inverseTelecineCarryover",
     ]
 }

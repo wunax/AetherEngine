@@ -38,12 +38,8 @@ public struct VideoStreamFormat: Sendable, Equatable {
          codecID: AVCodecID,
          profile: Int32) {
         let pixName = pixelFormat == AV_PIX_FMT_NONE ? nil : av_get_pix_fmt_name(pixelFormat).map { String(cString: $0) }
-        var depth: Int? = nil
-        if pixelFormat != AV_PIX_FMT_NONE, let desc = av_pix_fmt_desc_get(pixelFormat), desc.pointee.nb_components > 0 {
-            depth = Int(desc.pointee.comp.0.depth)
-        } else if declaredBitDepth > 0 {
-            depth = Int(declaredBitDepth)
-        }
+        let resolvedDepth = ColorDescription.bitDepth(pixelFormat: pixelFormat.rawValue, bitsPerRawSample: declaredBitDepth)
+        let depth: Int? = resolvedDepth > 0 ? resolvedDepth : nil
         self.init(
             pixelFormat: pixName,
             bitDepth: depth,
@@ -135,10 +131,15 @@ public struct DecodedVideoFormat: Sendable, Equatable {
     /// The CoreVideo buffer the frame was converted into for display, as its four-character code
     /// (`420v` = NV12, `x420` = P010).
     public let pixelBufferFormat: String
+    /// AE#983: the deinterlace graph the frame passed through, nil when frames go out as decoded.
+    /// The graph engages on the first frame flagged interlaced and stays in the path until a seek
+    /// (`deint=interlaced` passes progressive frames through it untouched).
+    public let deinterlace: VideoDeinterlace?
 
-    public init(frame: VideoStreamFormat, pixelBufferFormat: String) {
+    public init(frame: VideoStreamFormat, pixelBufferFormat: String, deinterlace: VideoDeinterlace? = nil) {
         self.frame = frame
         self.pixelBufferFormat = pixelBufferFormat
+        self.deinterlace = deinterlace
     }
 
     /// The display buffer in the names a viewer reads, "P010 (x420)".

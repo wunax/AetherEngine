@@ -7,6 +7,14 @@ import AetherLibavutil
 /// (bwdif) can deinterlace it. tvOS AVPlayer does not deinterlace, so 1080i broadcast otherwise combs.
 enum VideoRoutingPolicy {
 
+    /// HEVC Dolby Vision profiles whose base layer is IPT-PQ-c2 and has no colour of its own: Profile 5,
+    /// and Profile 20, Dolby Vision on MV-HEVC (3D). Profile 20's base view is a Profile 5 base view
+    /// with a Profile 5 RPU (`dovi_tool` reads the RPU of a real sample as 5), and its second view
+    /// travels in NAL units of its own layer, so everything that holds for 5 holds for 20.
+    static func hevcDolbyVisionHasIPTBase(_ dvProfile: Int?) -> Bool {
+        dvProfile == 5 || dvProfile == 20
+    }
+
     /// Field orders that indicate interlaced content warranting software deinterlacing.
     static let interlacedFieldOrders: Set<AVFieldOrder> = [
         AV_FIELD_TT, AV_FIELD_BB, AV_FIELD_TB, AV_FIELD_BT
@@ -127,6 +135,17 @@ enum VideoRoutingPolicy {
         return fieldOrder == AV_FIELD_UNKNOWN && spsIndicatesInterlaced
     }
 
+    /// AE#1070: true when interlaced H.264 that the declared-interlace rule alone sends to software
+    /// should take the native route instead, because a wireless AirPlay receiver that shows video holds
+    /// the route. The software host's layer stays on the device, so the receiver would get sound only;
+    /// native hands it the stream, at the cost of this device's deinterlacer.
+    static func declaredInterlaceYieldsToAirPlayReceiver(
+        declaredInterlaceRoutesSoftware: Bool,
+        airPlayVideoReceiver: Bool
+    ) -> Bool {
+        declaredInterlaceRoutesSoftware && airPlayVideoReceiver
+    }
+
     /// Hardware deinterlace setup is unrelated to progressive software codecs such as VP8/VP9/AV1.
     /// Start that relatively expensive Metal/VideoToolbox warm-up only when probe metadata says the
     /// source can actually enter the deinterlacer.
@@ -191,7 +210,7 @@ enum VideoRoutingPolicy {
         canHardwareDecode: () -> Bool
     ) -> Bool {
         switch codecID {
-        case AV_CODEC_ID_HEVC where dvProfile == 5:
+        case AV_CODEC_ID_HEVC where hevcDolbyVisionHasIPTBase(dvProfile):
             return false
         case AV_CODEC_ID_H264, AV_CODEC_ID_HEVC, AV_CODEC_ID_AV1:
             return !canHardwareDecode()
@@ -245,7 +264,7 @@ enum VideoRoutingPolicy {
 
     /// A URL source that turned out forward-only (the origin ignores `Range` and names no length, so
     /// the reader could only stream it front to back) is served the way a declared sequential origin
-    /// is, when its container states a duration: native path, one linear pass, seeks unavailable.
+    /// is, when its container states a duration: native path, one linear pass, seeks only inside the resident tail (AE#958).
     /// The software path it used to take cannot seek on such a source either, so the promotion costs
     /// nothing it had, and it buys what only the native path has: hardware decode, AVPlayer's
     /// buffering, and a picture on an AirPlay receiver (the software host renders on the device,
@@ -288,7 +307,7 @@ enum VideoRoutingPolicy {
         if presentsDolbyVisionBaseLayer { return false }
         switch codecID {
         case AV_CODEC_ID_HEVC:
-            return dvProfile == 5
+            return hevcDolbyVisionHasIPTBase(dvProfile)
         case AV_CODEC_ID_AV1:
             return dvProfile == 10 && dvBlCompatID == 0
         default:

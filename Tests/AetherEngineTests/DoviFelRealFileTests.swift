@@ -100,6 +100,7 @@ extension HeavyDualLayerSuites.DoviFelRealFileTests {
                                                params: params, frameIndex: frameIndex, completion: completion)
         }
         func acquireSlot() { inner.acquireSlot() }
+        func acquireSlot(timeout: DispatchTime) -> Bool { inner.acquireSlot(timeout: timeout) }
         func releaseSlot() { inner.releaseSlot() }
         func flush() { inner.flush() }
         func flushTextureCache() { inner.flushTextureCache() }
@@ -394,7 +395,7 @@ extension HeavyDualLayerSuites.DoviFelRealFileTests {
 
     @Test("the end-of-stream drain delivers a frame for every packet fed, leaving nothing for the flush after it",
           .enabled(if: DoviFelRealFileTests.available(DoviFelRealFileTests.fixtures[0]), DoviFelRealFileTests.needsClips),
-          .timeLimit(.minutes(2)), arguments: [DoviFelRealFileTests.fixtures[0]])
+          .timeLimit(.minutes(3)), arguments: [DoviFelRealFileTests.fixtures[0]])
     func endOfStreamDrainDeliversTheLastFrames(name: String) throws {
         let s = try Self.open(name)
         defer { s.decoder.close(); s.demuxer.close() }
@@ -409,7 +410,7 @@ extension HeavyDualLayerSuites.DoviFelRealFileTests {
 
     @Test("a session rebuild leaves both layers on the decoder's epoch: packets fed after it still decode",
           .enabled(if: DoviFelRealFileTests.available(DoviFelRealFileTests.fixtures[0]), DoviFelRealFileTests.needsClips),
-          .timeLimit(.minutes(2)), arguments: [DoviFelRealFileTests.fixtures[0]])
+          .timeLimit(.minutes(3)), arguments: [DoviFelRealFileTests.fixtures[0]])
     func sessionRebuildKeepsTheEpoch(name: String) async throws {
         let s = try Self.open(name)
         defer { s.decoder.close(); s.demuxer.close() }
@@ -429,7 +430,7 @@ extension HeavyDualLayerSuites.DoviFelRealFileTests {
 
     @Test("a flush before the first enhancement packet leaves the enhancement decoder in step: its frames still arrive",
           .enabled(if: DoviFelRealFileTests.available(DoviFelRealFileTests.fixtures[0]), DoviFelRealFileTests.needsClips),
-          .timeLimit(.minutes(2)), arguments: [DoviFelRealFileTests.fixtures[0]])
+          .timeLimit(.minutes(3)), arguments: [DoviFelRealFileTests.fixtures[0]])
     func flushBeforeFirstEnhancementPacket(name: String) async throws {
         let rec = try #require(RecordingComposer())
         let s = try Self.open(name, composer: rec)

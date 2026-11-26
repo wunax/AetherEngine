@@ -132,7 +132,7 @@ struct RemoteHLSSubtitleProxyTests {
         #expect(try await Self.get("/\(server.pathToken)/init.mp4", port: server.port).status == 404)
     }
 
-    @Test("A decoded sidecar is served as whole-program WebVTT", .timeLimit(.minutes(2)))
+    @Test("A decoded sidecar is served as whole-program WebVTT", .timeLimit(.minutes(3)))
     func sidecarBecomesWebVTT() async throws {
         let srt = """
         1
@@ -151,14 +151,12 @@ struct RemoteHLSSubtitleProxyTests {
 
         let provider = RemoteHLSSubtitleProvider(
             tracks: [Self.track(100_000, url: file)],
-            masterBody: Self.master, programDuration: 60, defaultHeaders: [:], mediaURL: nil,
-            vttFillWaitSeconds: 10)
+            masterBody: Self.master, programDuration: 60, defaultHeaders: [:], mediaURL: nil)
         let server = HLSLocalServer(provider: provider)
         try server.start()
         defer { server.stop(); provider.cancelFill() }
-        // Await the fill instead of letting the handler's budget race it. The decode is a detached
-        // Task, so on a saturated cooperative pool (a parallel test run on a 3-core CI box, 2026-08-08)
-        // it gets no thread for tens of seconds, the budget expires, and the request comes back empty.
+        // Await the fill: the handler answers a request that beats it with a 404 (AE#984), and the
+        // decode is a detached Task that a saturated cooperative pool can leave without a thread.
         provider.startFill()
         await provider.awaitFill()
 

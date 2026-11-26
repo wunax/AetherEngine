@@ -14,6 +14,8 @@ enum SubtitleDecoderError: Error, CustomStringConvertible, LocalizedError {
     case textLimitExceeded
     case unsupportedTextCodec
     case codecOpenFailed(code: Int32)
+    /// AE#984: the whole-body fetch of a text sidecar was answered with this status.
+    case httpStatus(Int)
 
     var description: String {
         switch self {
@@ -24,6 +26,7 @@ enum SubtitleDecoderError: Error, CustomStringConvertible, LocalizedError {
         case .textLimitExceeded: "SubtitleDecoder: text resource limit"
         case .unsupportedTextCodec: "SubtitleDecoder: unsupported text codec"
         case .codecOpenFailed(let code): "SubtitleDecoder: decoder open failed (\(FFmpegErr.text(for: code)))"
+        case .httpStatus(let status): "SubtitleDecoder: the sidecar was answered with HTTP \(status)"
         }
     }
 
@@ -70,12 +73,13 @@ enum SubtitleDecoder {
         preserveASSMarkup: Bool = false,
         sourceStreamIndex: Int32? = nil,
         preparationPolicy: ExternalSubtitlePreparationPolicy? = nil,
-        keepsBitmapPackets: Bool = false
+        keepsBitmapPackets: Bool = false,
+        formatHint: String? = nil
     ) async throws -> SidecarDecodeResult {
         let results = try await decode(
             url: url, httpHeaders: httpHeaders, preserveASSMarkup: preserveASSMarkup,
             requested: sourceStreamIndex.map { [$0] }, preparationPolicy: preparationPolicy,
-            keepsBitmapPackets: keepsBitmapPackets
+            keepsBitmapPackets: keepsBitmapPackets, formatHint: formatHint
         )
         guard let only = results.first else { throw SubtitleDecoderError.noSubtitleStream }
         return only
@@ -90,12 +94,13 @@ enum SubtitleDecoder {
         url: URL,
         httpHeaders: [String: String] = [:],
         preserveASSMarkup: Bool = false,
-        sourceStreamIndices: [Int32?]
+        sourceStreamIndices: [Int32?],
+        formatHint: String? = nil
     ) async throws -> [SidecarDecodeResult] {
         guard !sourceStreamIndices.isEmpty else { return [] }
         return try await decode(
             url: url, httpHeaders: httpHeaders, preserveASSMarkup: preserveASSMarkup,
-            requested: sourceStreamIndices
+            requested: sourceStreamIndices, formatHint: formatHint
         )
     }
 
@@ -105,8 +110,16 @@ enum SubtitleDecoder {
         httpHeaders: [String: String],
         preserveASSMarkup: Bool,
         requested: [Int32?]?, preparationPolicy: ExternalSubtitlePreparationPolicy? = nil,
-        keepsBitmapPackets: Bool = false
+        keepsBitmapPackets: Bool = false, formatHint: String? = nil
     ) async throws -> [SidecarDecodeResult] {
+        // AE#984: a text sidecar over HTTP is one whole-body GET, then a local decode.
+        if preparationPolicy == nil, SidecarTextFetch.appliesTo(url, formatHint: formatHint) {
+            let local = try await SidecarTextFetch.download(url, headers: httpHeaders, formatHint: formatHint)
+            defer { try? FileManager.default.removeItem(at: local) }
+            return try await decode(
+                url: local, httpHeaders: [:], preserveASSMarkup: preserveASSMarkup,
+                requested: requested, keepsBitmapPackets: keepsBitmapPackets)
+        }
         // Task.cancel() does NOT propagate into detached tasks (isCancelled inside always false).
         // Bridge cancellation explicitly via CancelFlag so the decode loop + AVIO reader abort promptly.
         let token = CancelFlag()
@@ -162,6 +175,8 @@ enum SubtitleDecoder {
         let keepMarkup: Bool
         let assPlayRes: CGSize
         let assHeader: String?
+        /// AE#1127: events the muxer left in the header; decoded like packets after the read loop.
+        let headerEvents: [ASSHeaderEvent]
         let codedWidth: Int
         let codedHeight: Int
 
@@ -190,12 +205,16 @@ enum SubtitleDecoder {
             let isASS = codecID == AV_CODEC_ID_ASS || codecID == AV_CODEC_ID_SSA
             let keepMarkup = preserveASSMarkup && isASS
             var assHeader: String? = nil
+            var headerEvents: [ASSHeaderEvent] = []
             var assPlayRes = SubtitleRectText.defaultASSPlayRes
             if let extradata = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 {
                 let bytes = Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))
                 // Strip NUL bytes: extradata is often NUL-terminated; libass parses C-string-style and a NUL hides everything after it.
-                let header = String(data: bytes, encoding: .utf8)?
+                var header = String(data: bytes, encoding: .utf8)?
                     .replacingOccurrences(of: "\0", with: "")
+                if isASS, let text = header {
+                    (header, headerEvents) = ASSHeaderEvents.split(text)
+                }
                 if keepMarkup { assHeader = header }
                 // #233: a real ASS script declares the space its \pos coordinates live in; without one
                 // the line came from libavcodec's own conversion and uses the 384x288 default.
@@ -207,20 +226,16 @@ enum SubtitleDecoder {
             guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
                 throw SubtitleDecoderError.noDecoder
             }
-            guard let ctx = avcodec_alloc_context3(codec) else {
+            let ctx: UnsafeMutablePointer<AVCodecContext>
+            do {
+                ctx = try FFmpegDecoderContext.open(
+                    codec: codec, codecpar: codecpar, maxPixels: FFmpegDecoderContext.maxSubtitlePixels)
+            } catch FFmpegDecoderContext.Failure.allocation {
                 throw SubtitleDecoderError.codecOpenFailed(code: -1)
-            }
-            // Throwing before `codecCtx` is assigned skips deinit, so unwind the context by hand.
-            var local: UnsafeMutablePointer<AVCodecContext>? = ctx
-            let paramsRet = avcodec_parameters_to_context(ctx, codecpar)
-            guard paramsRet >= 0 else {
-                avcodec_free_context(&local)
-                throw SubtitleDecoderError.codecOpenFailed(code: paramsRet)
-            }
-            let openRet = avcodec_open2(ctx, codec, nil)
-            guard openRet >= 0 else {
-                avcodec_free_context(&local)
-                throw SubtitleDecoderError.codecOpenFailed(code: openRet)
+            } catch FFmpegDecoderContext.Failure.parameters(let code) {
+                throw SubtitleDecoderError.codecOpenFailed(code: code)
+            } catch FFmpegDecoderContext.Failure.open(let code) {
+                throw SubtitleDecoderError.codecOpenFailed(code: code)
             }
 
             self.streamIndex = streamIndex
@@ -230,6 +245,7 @@ enum SubtitleDecoder {
             self.keepMarkup = keepMarkup
             self.assPlayRes = assPlayRes
             self.assHeader = assHeader
+            self.headerEvents = headerEvents
             self.codedWidth = Int(codecpar.pointee.width)
             self.codedHeight = Int(codecpar.pointee.height)
         }
@@ -242,6 +258,30 @@ enum SubtitleDecoder {
         // Under preserveASSMarkup: keep raw ASS event line (ASSScriptBuilder re-stamps timing); otherwise plain text.
         private func line(for rect: UnsafeMutablePointer<AVSubtitleRect>) -> String? {
             keepMarkup ? SubtitleRectText.rawASSLine(for: rect) : SubtitleRectText.plainText(for: rect)
+        }
+
+        /// AE#1127: the header's events as packets on the stream's own time base.
+        func decodeHeaderEvents(cancel: CancelFlag) {
+            guard !headerEvents.isEmpty, tbSec > 0, let pkt = av_packet_alloc() else { return }
+            defer {
+                var p: UnsafeMutablePointer<AVPacket>? = pkt
+                av_packet_free(&p)
+            }
+            for event in headerEvents {
+                if limitExceeded || decodeFailed || cancel.isCancelled { return }
+                guard let pts = SourceTimestampBounds.roundedTicks(event.startSeconds / tbSec),
+                      av_new_packet(pkt, Int32(event.payload.count)) >= 0 else { continue }
+                event.payload.withUnsafeBytes { raw in
+                    if let base = raw.baseAddress, let dst = pkt.pointee.data {
+                        memcpy(dst, base, event.payload.count)
+                    }
+                }
+                pkt.pointee.pts = pts
+                pkt.pointee.dts = pts
+                pkt.pointee.duration = max(0, SourceTimestampBounds.roundedTicks(event.durationSeconds / tbSec) ?? 0)
+                decode(packet: pkt)
+                av_packet_unref(pkt)
+            }
         }
 
         func decode(packet pkt: UnsafeMutablePointer<AVPacket>) {
@@ -554,6 +594,7 @@ enum SubtitleDecoder {
         }
 
         for decoder in decodersByStream.values {
+            decoder.decodeHeaderEvents(cancel: cancel)
             decoder.flush(cancel: cancel)
             if decoder.limitExceeded { throw SubtitleDecoderError.textLimitExceeded }
             if preparationPolicy != nil && decoder.decodeFailed { throw SubtitleDecoderError.openFailed(code: -1) }

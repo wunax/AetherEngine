@@ -10,26 +10,31 @@ import AetherLibavutil
 /// and the device once per load; the published status follows the stage's own events.
 extension AetherEngine {
 
+    /// `outputFrameRate` overrides the stream's rate where the frames come out at another one: under
+    /// inverse telecine (#853) they arrive at 4/5 of it, and that is the per-frame budget the stage has.
     func upscaleRouteDecision(
         options: LoadOptions, videoStream: UnsafeMutablePointer<AVStream>?, dvProfile: Int?,
-        wirelessAirPlayRoute: Bool, demuxedAudioLive: Bool
+        wirelessAirPlayRoute: Bool, demuxedAudioLive: Bool, outputFrameRate: Double? = nil
     ) -> UpscaleRouteDecision {
         // Spares the off case the Metal device and the display read below.
-        guard options.upscalesLowResolutionVideo else { return .notTaken(.preferenceOff) }
+        guard options.upscalesLowResolutionVideo || options.upscalesFullHDVideo else { return .notTaken(.preferenceOff) }
 
         var source = SourceGeometry(width: 0, height: 0, sarNum: 0, sarDen: 0)
         var frameRate: Double?
         var isSDR = true
         var isEightBit420 = true
+        var isTenBit420 = false
         if let stream = videoStream, let cp = stream.pointee.codecpar {
             let sar = PixelAspectPolicy.declaredPixelAspect(
                 bitstream: cp.pointee.sample_aspect_ratio, container: stream.pointee.sample_aspect_ratio,
                 width: cp.pointee.width, height: cp.pointee.height)
             source = SourceGeometry(width: Int(cp.pointee.width), height: Int(cp.pointee.height),
                                     sarNum: Int(sar?.num ?? 0), sarDen: Int(sar?.den ?? 0))
-            frameRate = Self.detectFrameRate(stream: stream)
+            frameRate = outputFrameRate ?? Self.detectFrameRate(stream: stream)
             isSDR = UpscaleRouteDecision.isSDR(colorTransfer: cp.pointee.color_trc)
             isEightBit420 = UpscaleRouteDecision.isEightBit420(
+                pixelFormat: cp.pointee.format, bitsPerRawSample: cp.pointee.bits_per_raw_sample)
+            isTenBit420 = UpscaleRouteDecision.isTenBit420(
                 pixelFormat: cp.pointee.format, bitsPerRawSample: cp.pointee.bits_per_raw_sample)
         }
 
@@ -49,13 +54,33 @@ extension AetherEngine {
         }
 
         sourceUpscaleFrameRate = frameRate
-        return UpscaleRouteDecision.decide(
-            preference: true, osSupportsStage: osSupportsStage, metalFXSupported: metalFXSupported,
-            source: source, isSDR: isSDR, isDolbyVision: dvProfile != nil, isEightBit420: isEightBit420,
-            display: DisplayPixelSize.current() ?? .zero,
-            wirelessAirPlayRoute: wirelessAirPlayRoute, demuxedAudioLive: demuxedAudioLive,
-            mlScaleFactors: mlScaleFactors,
-            stageFailedEarlier: { UpscaleFailureMemory.contains($0, frameRate: frameRate) })
+        let display = DisplayPixelSize.current() ?? .zero
+        func decide(_ scaler: UpscaleScaler, preference: Bool = options.upscalesLowResolutionVideo,
+                    fullHD: Bool = options.upscalesFullHDVideo) -> UpscaleRouteDecision {
+            UpscaleRouteDecision.decide(
+                preference: preference, osSupportsStage: osSupportsStage, metalFXSupported: metalFXSupported,
+                source: source, isSDR: isSDR, isDolbyVision: dvProfile != nil, isEightBit420: isEightBit420,
+                display: display,
+                wirelessAirPlayRoute: wirelessAirPlayRoute, demuxedAudioLive: demuxedAudioLive,
+                mlScaleFactors: mlScaleFactors, scaler: scaler, isTenBit420: isTenBit420, fullHD: fullHD,
+                stageFailedEarlier: { UpscaleFailureMemory.contains($0, frameRate: frameRate) })
+        }
+        let decision = decide(options.upscaleScaler)
+        // AE#1039: line art that overran here before starts on the rung it fell back to.
+        if let plan = decision.plan, plan.scaler == .lineArt,
+           let overrun = LineArtCostMemory.overrun(covering: plan, frameInterval: frameRate.map { 1 / $0 }, rung: .upscale) {
+            // The fallback's own scaler, decided as if asked for: a 1080p source falls to Lanczos.
+            let next = UpscaleRouteDecision.lineArtFallback(for: plan, eightBit: isEightBit420,
+                                                            mlScaleFactors: mlScaleFactors)?.scaler
+            let fallback = next.map { decide($0, preference: true, fullHD: false) } ?? .notTaken(.stageFailedEarlier)
+            EngineLog.emit(String(format: "[Upscale] line art overran on this device earlier (%.1f ms at %.1f ms), %@",
+                                  overrun.meanMs, overrun.frameInterval * 1000,
+                                  fallback.plan.map { $0.scaler == .lanczos ? "using Lanczos" : "using the automatic scaler" }
+                                    ?? "not upscaling"),
+                           category: .engine)
+            return fallback
+        }
+        return decision
     }
 
     /// Connects the stage `host`'s load built to `activeUpscale`. The host's load can already have run it
@@ -101,6 +126,7 @@ extension AetherEngine {
         else { return }
         guard upscaleNativeReturnOwed != loadGeneration else { return }
         upscaleNativeReturnOwed = loadGeneration
+        nativeReturnOwedBy = "[Upscale] stage"
         settleOwedUpscaleNativeReturn()
     }
 
@@ -121,14 +147,15 @@ extension AetherEngine {
         guard owed == loadGeneration else { upscaleNativeReturnOwed = nil; return }
         guard !loadInFlight, state == .playing || state == .paused else { return }
         upscaleNativeReturnOwed = nil
-        EngineLog.emit("[Upscale] stage disabled on a session it alone put on the software path: "
+        let by = nativeReturnOwedBy
+        EngineLog.emit("\(by) disabled on a session it alone put on the software path: "
                        + "reloading at the current position on the native path", category: .engine)
         Task { @MainActor [weak self] in
             guard let self, self.loadGeneration == owed else { return }
             do {
                 try await self.reloadAtCurrentPosition()
             } catch {
-                EngineLog.emit("[Upscale] native return failed: \(error)", category: .engine)
+                EngineLog.emit("\(by) native return failed: \(error)", category: .engine)
             }
         }
     }

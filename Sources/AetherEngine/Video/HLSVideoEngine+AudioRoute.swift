@@ -48,7 +48,8 @@ extension HLSVideoEngine {
             case AV_CODEC_ID_TRUEHD: return .truehd
             case AV_CODEC_ID_DTS:    return .dts
             case AV_CODEC_ID_VORBIS: return .vorbis
-            case AV_CODEC_ID_MP2:    return .mp2
+            // MP1 is Layer I of the same MPEG audio family and bridges the same way.
+            case AV_CODEC_ID_MP2, AV_CODEC_ID_MP1: return .mp2
             case AV_CODEC_ID_WMAV1,
                  AV_CODEC_ID_WMAV2,
                  AV_CODEC_ID_WMAPRO,
@@ -73,8 +74,14 @@ extension HLSVideoEngine {
                  AV_CODEC_ID_PCM_S24LE,
                  AV_CODEC_ID_PCM_F32LE,
                  AV_CODEC_ID_PCM_S16BE,
+                 AV_CODEC_ID_PCM_S24BE,
                  AV_CODEC_ID_PCM_S32LE,
+                 AV_CODEC_ID_PCM_S32BE,
+                 AV_CODEC_ID_PCM_F32BE,
+                 AV_CODEC_ID_PCM_F64LE,
+                 AV_CODEC_ID_PCM_F64BE,
                  AV_CODEC_ID_PCM_U8,
+                 AV_CODEC_ID_PCM_S8,
                  AV_CODEC_ID_PCM_ALAW,
                  AV_CODEC_ID_PCM_MULAW,
                  AV_CODEC_ID_PCM_DVD:
@@ -106,6 +113,12 @@ extension HLSVideoEngine {
             default: return false
             }
         }
+    }
+
+    /// AE#1120: a FLAC track whose layout CoreMedia would misread from the fMP4 (see `FLACChannelLabels`),
+    /// so it cannot be stream-copied and goes out as PCM instead.
+    static func flacNeedsRelabel(_ codecpar: UnsafeMutablePointer<AVCodecParameters>) -> Bool {
+        codecpar.pointee.codec_id == AV_CODEC_ID_FLAC && !FLACChannelLabels.carries(&codecpar.pointee.ch_layout)
     }
 
     /// #165: ordered bridge-encoder cascade. The configured mode's encoder for this source is attempted
@@ -330,7 +343,9 @@ extension HLSVideoEngine {
             let sourceChannels = audioStream.pointee.codecpar.pointee.ch_layout.nb_channels
             let firstAttempt = AudioBridge.bridgeEncoder(
                 for: audioBridgeMode,
-                sourceChannels: shapes ? audioShaping.outputChannels(forSource: sourceChannels) : sourceChannels)
+                sourceChannels: shapes ? audioShaping.outputChannels(forSource: sourceChannels) : sourceChannels,
+                flacCarriesLayout: shapes || FLACChannelLabels.carries(&audioStream.pointee.codecpar.pointee.ch_layout),
+                sourceIsFLAC: audioStream.pointee.codecpar.pointee.codec_id == AV_CODEC_ID_FLAC)
             let cascade = Self.bridgeEncoderCascade(firstAttempt: firstAttempt)
             attempts: for (attemptIndex, encoderAttempt) in cascade.enumerated() {
                 let isLastAttempt = attemptIndex == cascade.count - 1
@@ -350,6 +365,13 @@ extension HLSVideoEngine {
                         Self.encoderAbsentMessage(
                             missing: missing,
                             cascadingTo: AudioBridge.alternateEncoder(to: missing)),
+                        category: .session
+                    )
+                    continue attempts
+                } catch where encoderAttempt == AudioBridge.pcmOutputCodecID && !isLastAttempt {
+                    // AE#1120: PCM is there for the labels; FLAC still plays every channel.
+                    EngineLog.emit(
+                        "[HLSVideoEngine] PCM bridge init failed (\(error)), falling back to FLAC in the default layout",
                         category: .session
                     )
                     continue attempts
@@ -389,8 +411,9 @@ extension HLSVideoEngine {
                     // not from the mode: `.surroundCompat` on a stereo source produces fLaC, and a master
                     // playlist that advertises ec-3 for a FLAC track is a load failure, not a cosmetic slip.
                     let isEAC3Out = bridge.outputCodecID == AV_CODEC_ID_EAC3
-                    let hlsCodec = isEAC3Out ? "ec-3" : "fLaC"
-                    let pipelineLabel = "\(sourceCodecLabel) → \(isEAC3Out ? "EAC3" : "FLAC") bridge"
+                    let isPCMOut = bridge.outputCodecID == AudioBridge.pcmOutputCodecID
+                    let hlsCodec = isEAC3Out ? "ec-3" : isPCMOut ? AudioBridge.pcmHLSCodecs : "fLaC"
+                    let pipelineLabel = "\(sourceCodecLabel) → \(isEAC3Out ? "EAC3" : isPCMOut ? "PCM" : "FLAC") bridge"
                     audioHLSCodecs = hlsCodec
                     self.audioPipelineDescription = shapes ? pipelineLabel + " (shaped)" : pipelineLabel
                     self.audioDelivery = .bridged
@@ -407,12 +430,16 @@ extension HLSVideoEngine {
                 } catch {
                     EngineLog.emit(
                         "[HLSVideoEngine] \(Self.encoderLabel(bridge.outputCodecID)) bridge header write failed "
-                        + "(\(error)), falling back to video-only",
+                        + "(\(error)), falling back to "
+                        + (bridge.outputCodecID == AudioBridge.pcmOutputCodecID && !isLastAttempt
+                           ? "FLAC in the default layout" : "video-only"),
                         category: .session
                     )
                     self.savedAudioConfig = nil
                     self.audioBridge = nil
                     bridge.close()
+                    // AE#1120: a PCM header movenc refused still has FLAC to fall back to.
+                    if bridge.outputCodecID == AudioBridge.pcmOutputCodecID && !isLastAttempt { continue attempts }
                     break attempts
                 }
             }

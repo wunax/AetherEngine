@@ -25,13 +25,15 @@ struct VideoNowPlayingOptInTests {
         #expect(NativeAVPlayerHost(ownsNowPlayingSession: true).ownsNowPlayingSession)
     }
 
-    #if os(tvOS) || os(iOS)
     @Test("The engine defaults to leaving Now-Playing to the host's UI layer")
     func engineDefaultsToOff() throws {
         let engine = try AetherEngine()
         #expect(!engine.ownsVideoNowPlayingSession)
+        #expect(!engine.ownsVideoNowPlayingCommands)
+        #expect(!engine.ownsAudioNowPlaying)
     }
 
+    #if os(iOS) || os(tvOS) || os(visionOS)
     @Test("The engine builds hosts carrying its current ownership choice")
     func engineThreadsTheChoiceIntoHosts() throws {
         let engine = try AetherEngine()
@@ -46,6 +48,7 @@ struct VideoNowPlayingOptInTests {
         engine.ownsVideoNowPlayingSession = true
         #expect(engine.videoNowPlayingSession == nil)
     }
+    #endif
 
     // MARK: - Staging semantics
 
@@ -79,7 +82,6 @@ struct VideoNowPlayingOptInTests {
         engine.stop()
         #expect(engine.pendingVideoNowPlayingInfo.isEmpty)
     }
-    #endif
 
     // MARK: - Card held across the background teardown
 

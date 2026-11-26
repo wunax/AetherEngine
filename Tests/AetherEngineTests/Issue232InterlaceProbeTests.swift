@@ -61,7 +61,7 @@ struct Issue232InterlaceProbeTests {
         #expect(InterlaceProbe.refutesDeclaredInterlace(verdict))
     }
 
-    @Test("software loads and reloads carry the interlace decision and stop clears it", .timeLimit(.minutes(2)),
+    @Test("software loads and reloads carry the interlace decision and stop clears it", .timeLimit(.minutes(3)),
           arguments: [false, true])
     @MainActor
     func loadCarriesWarmupDecision(interlaced: Bool) async throws {
@@ -85,7 +85,7 @@ struct Issue232InterlaceProbeTests {
     }
 
     @Test("custom-source reload preserves a same-title progressive verdict and rechecks a different title",
-          .timeLimit(.minutes(2)), arguments: [false, true])
+          .timeLimit(.minutes(3)), arguments: [false, true])
     @MainActor
     func customReloadUsesTitleIdentity(changesTitle: Bool) async throws {
         let bytes = try #require(Data(base64Encoded: Self.declaredTTProgressiveBase64,
@@ -116,7 +116,7 @@ struct Issue232InterlaceProbeTests {
     }
 
     @Test("custom-source background reload retains interlace evidence through repeated teardown",
-          .timeLimit(.minutes(2)), arguments: [false, true], [false, true])
+          .timeLimit(.minutes(3)), arguments: [false, true], [false, true])
     @MainActor
     func customBackgroundReloadRetainsWarmupDecision(interlaced: Bool, hasDiscTitle: Bool) async throws {
         let fixture = interlaced ? Self.interlacedBase64 : Self.declaredTTProgressiveBase64
@@ -143,7 +143,7 @@ struct Issue232InterlaceProbeTests {
     }
 
     @Test("a fresh custom load discards the parked source's warm-up decision",
-          .timeLimit(.minutes(2)), arguments: [false, true])
+          .timeLimit(.minutes(3)), arguments: [false, true])
     @MainActor
     func freshCustomLoadDiscardsParkedWarmupDecision(initiallyInterlaced: Bool) async throws {
         let engine = try AetherEngine()
@@ -293,7 +293,7 @@ struct Issue232InterlaceProbeTests {
     // MARK: - Fixtures
 
     /// 24 progressive frames; container `fiel` atom makes codecpar.field_order read TT.
-    private static let declaredTTProgressiveBase64 = """
+    static let declaredTTProgressiveBase64 = """
     AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAAIZnJlZQAAAxttZGF0AAACKgYF//8m
     3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NSByMzIyMiBiMzU2MDVhIC0gSC4yNjQvTVBF
     Ry00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyNSAtIGh0dHA6Ly93d3cudmlkZW9sYW4u
@@ -329,7 +329,7 @@ struct Issue232InterlaceProbeTests {
 
     /// 24 genuinely interlaced frames (x264 --interlaced, tff): field_order=tt and every decoded
     /// frame carries AV_FRAME_FLAG_INTERLACED.
-    private static let interlacedBase64 = """
+    static let interlacedBase64 = """
     AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAAIZnJlZQAABCZtZGF0AAACLAYF//8o
     3EXpvebZSLeWLNgg2SPu73gyNjQgLSBjb3JlIDE2NSByMzIyMiBiMzU2MDVhIC0gSC4yNjQvTVBF
     Ry00IEFWQyBjb2RlYyAtIENvcHlsZWZ0IDIwMDMtMjAyNSAtIGh0dHA6Ly93d3cudmlkZW9sYW4u

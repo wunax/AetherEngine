@@ -2,9 +2,11 @@ import Foundation
 
 /// #316: serves the sidecar renditions the remote-HLS subtitle proxy injects into the origin master.
 ///
-/// It is an `HLSSegmentProvider` that owns no media at all. The A/V variants in the rewritten master
-/// point straight at the origin, so AVPlayer never asks this server for a segment; only `/master.m3u8`
-/// (verbatim, via `staticMasterPlaylistBody`), `/subs_{n}.m3u8` and `/subs_{n}_0.vtt` are ever fetched.
+/// It is an `HLSSegmentProvider` that owns no media at all. Every segment, init and key URI points
+/// straight at the origin, so AVPlayer never asks this server for media. It fetches `/master.m3u8`
+/// (verbatim, via `staticMasterPlaylistBody`), `/subs_{n}.m3u8` and `/subs_{n}_0.vtt`, and with
+/// AE#1122 also the origin's variant at `/origin_variant.m3u8` (`servedVariantPlaylist`), whose answer
+/// can wait up to `RemoteHLSResumeWarm.waitSeconds` for the resume segment.
 /// The single reported segment exists so `buildSubtitleMediaPlaylistText`'s whole-program shape can read
 /// the program duration off the usual `segmentDuration(at:)` path (Sodalite#32) without a special case.
 final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
@@ -22,27 +24,22 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     /// the server has answered anything.
     private(set) var staticMasterPlaylistBody: String?
 
+    /// AE#1122: the origin variant the proxy already fetched, served at
+    /// `RemoteHLSMasterRewrite.servedVariantURI` so AVPlayer does not fetch it again. Nil when the
+    /// master still points at the origin's own copy. Written once during build, like the master.
+    private(set) var staticVariantPlaylistBody: String?
+
     /// Total program seconds, summed from the origin's own variant playlist. TARGETDURATION and the
     /// single EXTINF of every subtitle rendition are built from it.
     private let programDuration: Double
     private let stores: [NativeSubtitleCueStore]
     private let defaultHeaders: [String: String]
     private let mediaURL: URL?
-    /// Guards `fillTask` alone: the fill is started from the proxy's build (off the main actor) and
-    /// cancelled from the engine's teardown (on it), so the handle is genuinely shared.
-    private let fillLock = NSLock()
-    private var fillTask: Task<Void, Never>?
-
-    /// How long a `.vtt` fetch waits for its store to finish. AVPlayer fetches a whole-program VOD
-    /// subtitle segment ONCE and never re-fetches it, so serving early means serving truncated for the
-    /// rest of the session; the fill normally completes long before the rendition is ever selected.
-    /// Mirrors the loopback path's budget.
-    static let defaultVTTFillWaitSeconds: TimeInterval = 30
-    private let vttFillWaitSeconds: TimeInterval
+    /// AE#984: the sidecar decodes, one at a time, the picked track first.
+    private let fillQueue = ExternalSubtitleFillQueue()
 
     init(tracks: [Track], masterBody: String, programDuration: Double,
-         defaultHeaders: [String: String], mediaURL: URL?,
-         vttFillWaitSeconds: TimeInterval = defaultVTTFillWaitSeconds) {
+         defaultHeaders: [String: String], mediaURL: URL?) {
         self.tracks = tracks
         self.staticMasterPlaylistBody = masterBody
         // `RemoteHLSSubtitleProxy.sumSegmentDurations` already refuses a non-finite, negative or
@@ -54,7 +51,6 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
         self.programDuration = min(max(1, finiteDuration), RemoteHLSSubtitleProxy.maxProgramDurationSeconds)
         self.defaultHeaders = defaultHeaders
         self.mediaURL = mediaURL
-        self.vttFillWaitSeconds = vttFillWaitSeconds
         self.stores = tracks.map { _ in NativeSubtitleCueStore() }
     }
 
@@ -62,6 +58,24 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     /// through the engine once the server's address is known.
     func setMasterPlaylistBody(_ body: String) {
         staticMasterPlaylistBody = body
+    }
+
+    /// AE#1122: held by the first variant answer on a resume. Written once during build.
+    private var resumeWarm: RemoteHLSResumeWarm.Gate?
+
+    func setVariantPlaylistBody(_ body: String) {
+        staticVariantPlaylistBody = body
+    }
+
+    func setResumeWarm(_ gate: RemoteHLSResumeWarm.Gate) {
+        resumeWarm = gate
+    }
+
+    /// The served variant, once the resume segment has been asked for with the player's own agent.
+    func servedVariantPlaylist(userAgent: String?) -> String? {
+        guard let body = staticVariantPlaylistBody else { return nil }
+        resumeWarm?.passThrough(userAgent: userAgent)
+        return body
     }
 
     /// The renditions as the rewriter needs to declare them, in `subs_{ordinal}` order.
@@ -76,39 +90,54 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
         }
     }
 
-    /// Decode every sidecar into its store up front, off the main actor. Same one-pass-per-container
-    /// machinery the loopback path uses (#266), so a container holding several subtitle streams is read
-    /// once and a single bad stream index cannot blank its siblings.
-    func startFill() {
-        cancelFill()
-        let jobs = Self.fillJobs(tracks: tracks, stores: stores, defaultHeaders: defaultHeaders, mediaURL: mediaURL)
-        guard !jobs.isEmpty else { return }
-        let task = BlockingWork.detached(priority: .utility) { [jobs] in
-            for job in jobs {
-                if Task.isCancelled { return }
-                await AetherEngine.runExternalSubtitleFill(job: job)
-            }
-        }
-        fillLock.lock()
-        fillTask = task
-        fillLock.unlock()
+    /// Decode every sidecar into its store, off the main actor. Same one-pass-per-container machinery
+    /// the loopback path uses (#266), so a container holding several subtitle streams is read once and
+    /// a single bad stream index cannot blank its siblings.
+    ///
+    /// AE#984: with `holdingUnpicked` only a picked rendition fills (`prioritizeFill`) until the engine
+    /// lifts the hold (`releaseHeldFills`) at `readyToPlay`, so the other extractions do not compete
+    /// with the origin's start.
+    func startFill(holdingUnpicked: Bool = false) {
+        fillQueue.start(
+            Self.fillJobs(tracks: tracks, stores: stores, defaultHeaders: defaultHeaders, mediaURL: mediaURL),
+            holdingUnpicked: holdingUnpicked)
     }
 
     func cancelFill() {
-        fillLock.lock()
-        let task = fillTask
-        fillTask = nil
-        fillLock.unlock()
-        task?.cancel()
+        fillQueue.cancel()
+        resumeWarm?.cancel()
     }
 
-    /// Wait for the started fill to finish. Nothing in the session waits for it, the `.vtt` handler
-    /// polls the store instead; this exists so a test can assert on a finished store without racing
-    /// the wall clock. `nativeSubtitleVTT`'s wait is a budget, and a budget loses under a saturated
-    /// cooperative pool, where the detached decode does not get a thread at all.
-    func awaitFill() async {
-        await currentFillTask()?.value
+    /// AE#984: the host picked `ordinal`; its sidecar fills next (see `ExternalSubtitleFillQueue.prioritize`).
+    func prioritizeFill(ordinal: Int) {
+        guard ordinal >= 0, ordinal < stores.count else { return }
+        fillQueue.prioritize(stores[ordinal])
     }
+
+    /// AE#984: the item is ready to play; the renditions nobody picked may fill now.
+    func releaseHeldFills() { fillQueue.releaseHeld() }
+
+    /// AE#984: the ordinal of the rendition registered under the host's external track id.
+    func ordinal(forExternalID id: Int) -> Int? {
+        tracks.firstIndex { $0.externalID == id }
+    }
+
+    /// AE#984: whether AVPlayer's last request for this rendition was answered "not yet".
+    func renditionWasRefused(ordinal: Int) -> Bool {
+        guard ordinal >= 0, ordinal < stores.count else { return false }
+        return stores[ordinal].wasRefusedWhilePending
+    }
+
+    /// AE#984: what a `.vtt` request for this rendition would get right now.
+    func renditionServe(ordinal: Int) -> NativeSubtitleCueStore.WholeProgramServe? {
+        guard ordinal >= 0, ordinal < stores.count else { return nil }
+        return stores[ordinal].wholeProgramServe
+    }
+
+    /// Wait for every fill that can run to finish. Nothing in the session waits for it, the `.vtt`
+    /// handler reads the store's state instead; this exists so a test can assert on a finished store
+    /// without racing the wall clock. Fills held for a pick are not waited for.
+    func awaitFill() async { await fillQueue.awaitIdle() }
 
     /// AE#616: every sidecar's decode has finished, so `allCueStarts()` is the whole program.
     var isFillFinished: Bool { stores.allSatisfy(\.isFinished) }
@@ -116,13 +145,6 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     /// AE#616: cue starts and texts across every injected rendition, on the axis the `.vtt` serves.
     func allCueStarts() -> [(start: Double, text: String)] {
         stores.flatMap { $0.allCues().map { (start: $0.start, text: $0.text) } }
-    }
-
-    /// Reading the handle stays synchronous: `NSLock` is unavailable from an async context.
-    private func currentFillTask() -> Task<Void, Never>? {
-        fillLock.lock()
-        defer { fillLock.unlock() }
-        return fillTask
     }
 
     /// One job per (url, headers) pair, in first-appearance order. Mirrors
@@ -136,6 +158,7 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
         }
         var order: [Key] = []
         var targetsByKey: [Key: [AetherEngine.ExternalSubtitleFillJob.Target]] = [:]
+        var hintByKey: [Key: String] = [:]
         for (ordinal, track) in tracks.enumerated() where ordinal < stores.count {
             let key = Key(url: track.source.url, headers: AetherEngine.resolvedSubtitleHeaders(
                 for: track.source.url, explicit: track.source.httpHeaders, mediaURL: mediaURL,
@@ -143,10 +166,12 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
             if targetsByKey[key] == nil { order.append(key) }
             targetsByKey[key, default: []].append(
                 .init(streamIndex: track.source.sourceStreamIndex, store: stores[ordinal]))
+            if hintByKey[key] == nil, let hint = track.source.formatHint { hintByKey[key] = hint }
         }
         return order.map {
             AetherEngine.ExternalSubtitleFillJob(url: $0.url, headers: $0.headers,
-                                                 targets: targetsByKey[$0] ?? [])
+                                                 targets: targetsByKey[$0] ?? [],
+                                                 formatHint: hintByKey[$0])
         }
     }
 
@@ -180,19 +205,30 @@ final class RemoteHLSSubtitleProvider: HLSSegmentProvider, @unchecked Sendable {
     /// producer and therefore no playlist shift, and AVPlayer places the cues by media timestamp, so
     /// the sidecar's own absolute seconds line up with the frames. They do NOT line up with item time
     /// where an origin's segments start before their playlist slot; AE#616 measures that gap off them.
+    ///
+    /// AE#984: never held. A request held for the fill also held AVPlayer's media loading, so a slow
+    /// sidecar froze the picture of a healthy stream. While the fill runs the answer is a 404, which
+    /// AVPlayer retries every few seconds while A/V keeps loading; a failed fill is served empty at once.
     func nativeSubtitleVTT(ordinal: Int, segmentIndex: Int) -> String? {
         guard ordinal >= 0, ordinal < stores.count else { return nil }
         let store = stores[ordinal]
-        let deadline = Date().addingTimeInterval(vttFillWaitSeconds)
-        while !store.isFinished, Date() < deadline {
-            usleep(100_000)
+        let serve = store.wholeProgramServe
+        if serve == .retryLater {
+            // The engine selects a rendition only once its sidecar is in, so a request for a pending one
+            // means something else selected it (AVKit's own menu). Its sidecar goes next.
+            store.noteRefusedWhilePending()
+            EngineLog.emit(
+                "[AetherEngine] AE#984: subtitle rendition ord=\(ordinal) requested before its sidecar is "
+                + "decoded; answering 404 so AVPlayer asks again, and fetching it next", category: .hlsServer)
+            return nil
         }
         let cues = store.allCues()
-        if !store.isFinished {
+        store.noteServed()
+        if serve != .complete {
+            let why = serve == .failedFill ? "could not be read" : "has no decode running"
             EngineLog.emit(
-                "[AetherEngine] #316: serving subtitle rendition ord=\(ordinal) before its decode finished "
-                + "(\(cues.count) cue(s)); AVPlayer does not re-fetch a whole-program .vtt",
-                category: .hlsServer)
+                "[AetherEngine] AE#984: the sidecar for subtitle rendition ord=\(ordinal) \(why); "
+                + "serving it as it stands so the A/V session is not held for it", category: .hlsServer)
         } else {
             EngineLog.emit(
                 "[AetherEngine] #316: whole-program rendition ord=\(ordinal) cues=\(cues.count)",

@@ -144,6 +144,9 @@ struct DoviFelInPlaceComposeTests {
             (320, 180, DoviDither.bayer8x8, true, ChromaCurves.mmrTwoPieces),
             (256, 128, DoviDither.fullPrecision, true, ChromaCurves.mmrTwoPieces),
             (1920, 1080, DoviDither.bayer8x8, true, ChromaCurves.mmrTwoPieces),
+            // The test-only raw-VDR output takes the other store branch of the shared kernel body.
+            (256, 128, DoviDither.debugRawVDR, true, ChromaCurves.polynomial),
+            (320, 180, DoviDither.debugRawVDR, false, ChromaCurves.mmrOnePiece),
           ])
     func inPlaceMatchesPool(width: Int, height: Int, dither: DoviDither, residual: Bool, chroma: ChromaCurves) async throws {
         let composer = try #require(DoviFelComposer())
@@ -251,6 +254,13 @@ struct DoviFelInPlaceComposeTests {
         var mmr = params
         mmr.flags.insert(.lumaMmr)
         #expect(composer.inPlaceDecision(baseBuffer: good, params: mmr) == .lumaMmr)
+
+        // The in-place kernels bind each plane as read_write: tier 2 only, so anything below it is the pool path.
+        #expect(DoviFelComposer.inPlaceRefusal(baseBuffer: good, params: params, readWriteSupported: false) == .readWriteUnsupported)
+        #expect(DoviFelComposer.inPlaceRefusal(baseBuffer: good, params: params, readWriteSupported: true) == nil)
+        #expect(DoviFelComposer.supportsInPlaceReadWrite(.tier2))
+        #expect(!DoviFelComposer.supportsInPlaceReadWrite(.tier1))
+        #expect(!DoviFelComposer.supportsInPlaceReadWrite(.tierNone))
 
         composer.inPlaceComposeEnabled = false
         #expect(composer.inPlaceDecision(baseBuffer: good, params: params) == .switchedOff)
@@ -389,6 +399,7 @@ struct DoviFelInPlaceComposeTests {
         private(set) var poolCalls = 0
         init(_ results: [DoviFelComposer.InPlaceResult]) { self.results = results }
         func acquireSlot() {}
+        func acquireSlot(timeout: DispatchTime) -> Bool { true }
         func releaseSlot() {}
         func flush() {}
         func canComposeInPlace(baseBuffer: CVPixelBuffer, params: DoviMetalParams) -> Bool { true }
@@ -418,23 +429,59 @@ struct DoviFelInPlaceComposeTests {
     func decoderDropsCorruptFrame() async throws {
         let ticks: Int64 = 3754
         func pts(_ i: Int64) -> CMTime { CMTime(value: i * ticks, timescale: 90000) }
-        let composer = ScriptedInPlaceComposer([.composed, .baseCorrupted, .baseIntact, .composed])
+        let composer = ScriptedInPlaceComposer([.composed, .baseIntact, .baseCorrupted])
         let decoder = DualLayerVideoDecoder(composer: composer)
         defer { decoder.close() }
         let delivered = Delivered()
         decoder.onFrame = { _, p, _ in delivered.add(p) }
         decoder.primeForTesting(enhancementLayer: true)
-        for i in 0..<4 { decoder.seedRPUForTesting(pts: pts(Int64(i)), params: DoviMetalParams(), displayMetadataNAL: nil) }
-        for i in 0..<4 {
+        for i in 0..<3 { decoder.seedRPUForTesting(pts: pts(Int64(i)), params: DoviMetalParams(), displayMetadataNAL: nil) }
+        for i in 0..<3 {
             let f = try #require(Self.makeBaseAndEnhancement(width: 64, height: 64, seed: i))
             decoder.handleEnhancementLayerFrame(elBuffer: f.el, pts: pts(Int64(i)))
             decoder.handleBaseLayerFrame(baseBuffer: f.bl, pts: pts(Int64(i)), hdr10Data: nil)
         }
         decoder.quiesceForTesting()
-        // Frame 1 (corrupt) is gone; frame 2 (set-up failure, base layer intact) is delivered as its base layer.
-        #expect(delivered.values == [0, 2 * ticks, 3 * ticks])
-        #expect(decoder.composedFrameCount == 2)
+        // Frame 1 (set-up failure, base layer intact) goes out as its base layer; frame 2 (corrupt) is gone.
+        #expect(delivered.values == [0, ticks])
+        #expect(decoder.composedFrameCount == 1)
         #expect(composer.poolCalls == 0, "an in-place frame went through the pool path")
+    }
+
+    /// AE#1055: on an Apple TV 4K (A12) one GPU fault was followed by tvOS refusing the process's GPU work, so
+    /// every later in-place command buffer failed and every frame was dropped while the sound played on. After
+    /// the first corrupt frame the decoder composes into the pool, whose failure shows the base layer.
+    @Test("after a failed in-place frame the decoder takes the pool path, so a later failure still shows the base layer")
+    func corruptFrameTurnsInPlaceOff() async throws {
+        let ticks: Int64 = 3754
+        func pts(_ i: Int64) -> CMTime { CMTime(value: i * ticks, timescale: 90000) }
+        let composer = ScriptedInPlaceComposer([.composed, .baseCorrupted, .composed, .composed])
+        let decoder = DualLayerVideoDecoder(composer: composer)
+        defer { decoder.close() }
+        let delivered = Delivered()
+        decoder.onFrame = { _, p, _ in delivered.add(p) }
+        decoder.primeForTesting(enhancementLayer: true)
+        for i in 0..<2 { decoder.seedRPUForTesting(pts: pts(Int64(i)), params: DoviMetalParams(), displayMetadataNAL: nil) }
+        for i in 0..<2 {
+            let f = try #require(Self.makeBaseAndEnhancement(width: 64, height: 64, seed: i))
+            decoder.handleEnhancementLayerFrame(elBuffer: f.el, pts: pts(Int64(i)))
+            decoder.handleBaseLayerFrame(baseBuffer: f.bl, pts: pts(Int64(i)), hdr10Data: nil)
+        }
+        decoder.quiesceForTesting()
+        #expect(decoder.isInPlaceOffAfterFaultForTesting)
+        decoder.flush()
+        #expect(decoder.isInPlaceOffAfterFaultForTesting, "a seek turned in-place back on for the GPU that faulted")
+        for i in 2..<5 { decoder.seedRPUForTesting(pts: pts(Int64(i)), params: DoviMetalParams(), displayMetadataNAL: nil) }
+        for i in 2..<5 {
+            let f = try #require(Self.makeBaseAndEnhancement(width: 64, height: 64, seed: i))
+            decoder.handleEnhancementLayerFrame(elBuffer: f.el, pts: pts(Int64(i)))
+            decoder.handleBaseLayerFrame(baseBuffer: f.bl, pts: pts(Int64(i)), hdr10Data: nil)
+        }
+        decoder.quiesceForTesting()
+        // Frames 2 to 4 took the pool, which the scripted composer fails: each goes out as its base layer.
+        #expect(composer.poolCalls == 3)
+        #expect(delivered.values == [0, 2 * ticks, 3 * ticks, 4 * ticks])
+        #expect(decoder.composedFrameCount == 1)
     }
 }
 #endif
